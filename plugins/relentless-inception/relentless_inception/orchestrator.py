@@ -117,7 +117,44 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
             return int(value)
         return None
 
-    def inspect_text(value: str) -> None:
+    def reports_problem(value: Any) -> bool:
+        if value is None or value is False:
+            return False
+        if value is True:
+            return True
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalized_value = value.strip().lower()
+            if normalized_value in {
+                "",
+                "0",
+                "false",
+                "n/a",
+                "na",
+                "no error",
+                "no errors",
+                "none",
+                "not applicable",
+                "null",
+                "ok",
+                "success",
+            }:
+                return False
+            if re.fullmatch(
+                r"(?:0|no|zero)\s+(?:tests?\s+)?(?:errors?|failed|failures?)",
+                normalized_value,
+            ):
+                return False
+            numeric_value = integer_value(value)
+            return numeric_value != 0 if numeric_value is not None else True
+        if isinstance(value, Mapping):
+            return any(reports_problem(child) for child in value.values())
+        if isinstance(value, list):
+            return any(reports_problem(child) for child in value)
+        return True
+
+    def inspect_text(value: str, *, inspect_terminal_failures: bool = True) -> None:
         for match in re.finditer(
             r"\b(?:exit(?:ed)?|return(?:ed)?)\s*(?:with\s+)?(?:status|code)?\s*[:=]?\s*(-?\d+)\b"
             r"|\b(?:exit_code|exit_status|returncode|return_code)\s*[:=]\s*[\"']?(-?\d+)\b",
@@ -129,7 +166,8 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
                 failures.append(match.group(0))
 
         counted_failure_pattern = re.compile(
-            r"\b(\d+)\s+(?:tests?\s+)?failed\b|\b(?:tests?_?)?fail(?:ed|ures?)\s*[:=]\s*(\d+)\b",
+            r"\b(\d+)\s+(?:(?:tests?|examples?)\s+)?(?:failed|failures?)\b"
+            r"|\b(?:tests?_?)?fail(?:ed|ures?)\s*[:=]\s*(\d+)\b",
             flags=re.IGNORECASE,
         )
         for match in counted_failure_pattern.finditer(value):
@@ -138,22 +176,69 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
                 failures.append(match.group(0))
 
         residual = counted_failure_pattern.sub("", value)
+        counted_error_pattern = re.compile(
+            r"\b(\d+)\s+(?:tests?\s+)?errors?\b"
+            r"|\b(?:tests?_?)?errors?\s*[:=]\s*(\d+)\b",
+            flags=re.IGNORECASE,
+        )
+        for match in counted_error_pattern.finditer(residual):
+            rendered_count = match.group(1) or match.group(2)
+            if rendered_count is not None and int(rendered_count) > 0:
+                failures.append(match.group(0))
+        residual = counted_error_pattern.sub("", residual)
+        line_failure_count_pattern = re.compile(
+            r"(?:^|\n)\s*(?:ℹ\s*)?fail\s+(\d+)\b[^\n]*",
+            flags=re.IGNORECASE,
+        )
+        for match in line_failure_count_pattern.finditer(residual):
+            if int(match.group(1)) > 0:
+                failures.append(match.group(0).strip())
+        residual = line_failure_count_pattern.sub("", residual)
         residual = re.sub(
-            r"\b(?:no|zero)\s+(?:tests?\s+)?failed\b",
+            r"\b(?:no|zero)\s+(?:tests?\s+)?(?:failed|errors?)\b",
             "",
             residual,
             flags=re.IGNORECASE,
         )
         explicit_failure = re.search(
-            r"\b(?:assertionerror|assertion\s+failure|tests?\s+(?:failed|failing)|pytest\s+(?:failed|failing)|build\s+failed|command\s+failed)\b"
-            r"|(?:^|\n)\s*FAILED\s+\S+(?:::|\s|$)"
-            r"|(?:^|\n)\s*make(?:\[\d+\])?:\s+\*{3}.*\bError\s+\d+\b"
-            r"|traceback \(most recent call last\)",
+            r"\b(?:assertion\s+failure|tests?\s+(?:failed|failing)|pytest\s+(?:failed|failing)|build\s+(?:failed|failure)|command\s+failed)\b"
+            r"|\btest result:\s*FAILED\b"
+            r"|(?:^|\n)\s*FAIL(?:ED)?(?:\b|:)"
+            r"|(?:^|\n)\s*-{3}\s+FAIL:\s+\S+"
+            r"|\bERROR\s+collecting\s+\S+"
+            r"|\bERROR\s+at\s+(?:setup|teardown)\b"
+            r"|(?:^|\n)\s*=+\s*ERRORS?\s*=+"
+            r"|(?:^|\n)\s*\[(?:ERROR|FATAL)\]"
+            r"|(?:^|\n)\s*##\[(?:error|fatal)\]"
+            r"|(?:^|\n)\s*INTERNALERROR(?:>|:)"
+            r"|(?:^|\n)\s*!*\s*Interrupted:"
+            r"|(?:^|\n)\s*(?:g?make)(?:\[\d+\])?:\s+\*{3}"
+            r"|(?:^|\n)\s*npm\s+(?:ERR!|error)\b"
+            r"|(?:^|\n)\s*not ok\b"
+            r"|(?:^|\n)\s*Bail out!"
+            r"|(?:^|\n)\s*(?:fatal\s+)?error(?:\[[^\]\n]+\])?:"
+            r"|(?:^|\n)[^\n]+(?:\(\d+,\d+\)|:\d+(?::\d+)?)\s*:\s*(?:fatal\s+)?error(?:\s+[A-Z]+\d+)?\s*:"
+            r"|(?:^|\n)\s*CMake Error(?: at [^:\n]+)?:"
+            r"|(?:^|\n)\s*fatal:",
             residual,
             flags=re.IGNORECASE,
         )
         if explicit_failure:
             failures.append(explicit_failure.group(0))
+        if inspect_terminal_failures:
+            terminal_failure_pattern = re.compile(
+                r"(?:^|\n)\s*(?:[A-Za-z_][\w.]*(?:Error|Exception)|Error|Exception)(?:\s*\[[^\]\n]+\])?:\s*\S+"
+                r"|(?:^|\n)\s*(?:KeyboardInterrupt|SystemExit)(?::\s*\S+|(?=\s*(?:\n|$)))"
+                r"|(?:^|\n)\s*Exception in thread\s+['\"][^'\"]+['\"]\s+[\w.$]*(?:Error|Exception)(?::\s*\S+|(?=\s*(?:\n|$)))"
+                r"|(?:^|\n)\s*(?:UnhandledPromiseRejection(?:Warning|Error)?|ERR_UNHANDLED_REJECTION)(?:\b|:)"
+                r"|(?:^|\n)\s*panic:\s*\S+"
+                r"|(?:^|\n)\s*thread\s+['\"][^'\"]+['\"]\s+panicked\s+at\b"
+                r"|(?:^|\n)\s*(?:Aborted|Bus error|Segmentation fault)(?::\s*\d+)?(?:\s+\(core dumped\))?(?=\s|$)",
+                flags=re.IGNORECASE,
+            )
+            terminal_failure = terminal_failure_pattern.search(value)
+            if terminal_failure:
+                failures.append(terminal_failure.group(0).strip())
 
     try:
         structured_evidence = json.loads(stripped)
@@ -163,6 +248,10 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
     def inspect(value: Any, path: str) -> None:
         if isinstance(value, Mapping):
             normalized = {str(key).lower(): child for key, child in value.items()}
+            compact_normalized = {
+                re.sub(r"[-_]", "", str(key).lower()): child
+                for key, child in value.items()
+            }
             for boolean_key in ("passed", "success", "ok"):
                 boolean_value = normalized.get(boolean_key)
                 if boolean_value is False or (
@@ -170,27 +259,76 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
                     and boolean_value.strip().lower() == "false"
                 ):
                     failures.append(f"{path}.{boolean_key}=false")
+            failed_value = normalized.get("failed")
+            if failed_value is True or (
+                isinstance(failed_value, str)
+                and failed_value.strip().lower() == "true"
+            ):
+                failures.append(f"{path}.failed=true")
             for numeric_key in ("exit_code", "exit_status", "returncode", "return_code"):
                 numeric_value = integer_value(normalized.get(numeric_key))
                 if numeric_value is not None and numeric_value != 0:
                     failures.append(f"{path}.{numeric_key}={numeric_value}")
             status = normalized.get("status")
-            if isinstance(status, str) and status.strip().lower() in {"error", "failed", "failure"}:
+            if isinstance(status, str) and status.strip().lower() in {
+                "error",
+                "failed",
+                "failure",
+                "fatal",
+            }:
                 failures.append(f"{path}.status={status.strip()}")
-            reported_failures = normalized.get("failures")
-            if isinstance(reported_failures, list) and reported_failures:
-                failures.append(f"{path}.failures contains {len(reported_failures)} item(s)")
-            for count_key in ("failed", "failure_count", "failures_count", "tests_failed"):
-                failure_count = integer_value(normalized.get(count_key))
+            for result_key in ("action", "conclusion", "event", "outcome", "result", "state"):
+                result_value = normalized.get(result_key)
+                if isinstance(result_value, str) and result_value.strip().lower() in {
+                    "action_required",
+                    "cancelled",
+                    "error",
+                    "fail",
+                    "failed",
+                    "failure",
+                    "fatal",
+                    "startup_failure",
+                    "timed_out",
+                }:
+                    failures.append(f"{path}.{result_key}={result_value.strip()}")
+            for problem_key in ("failures", "errors"):
+                reported_problems = normalized.get(problem_key)
+                if (
+                    integer_value(reported_problems) is None
+                    and reports_problem(reported_problems)
+                ):
+                    failures.append(
+                        f"{path}.{problem_key} reports one or more problems"
+                    )
+            for problem_key in ("error", "exception"):
+                reported_problem = normalized.get(problem_key)
+                if reports_problem(reported_problem):
+                    failures.append(f"{path}.{problem_key} reports a problem")
+            for compact_count_key in (
+                "errorcount",
+                "errors",
+                "errorscount",
+                "failed",
+                "failurecount",
+                "failures",
+                "failurescount",
+                "fatalerrorcount",
+                "numfailedtests",
+                "numfailedtestsuites",
+                "numruntimeerrortestsuites",
+                "testserrors",
+                "testsfailed",
+            ):
+                failure_count = integer_value(compact_normalized.get(compact_count_key))
                 if failure_count is not None and failure_count > 0:
-                    failures.append(f"{path}.{count_key}={failure_count}")
+                    failures.append(f"{path}.{compact_count_key}={failure_count}")
             for key, child in value.items():
                 inspect(child, f"{path}.{key}")
         elif isinstance(value, list):
             for index, child in enumerate(value):
                 inspect(child, f"{path}[{index}]")
         elif isinstance(value, str):
-            inspect_text(value)
+            inspect_text(value, inspect_terminal_failures=False)
 
     if structured_evidence is not None:
         inspect(structured_evidence, "evidence")

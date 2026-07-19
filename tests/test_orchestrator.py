@@ -1404,18 +1404,61 @@ class OrchestrationTests(unittest.TestCase):
     def test_mechanical_evidence_parses_exit_codes_without_zero_failure_false_positives(self) -> None:
         passing_evidence = (
             "0 tests failed",
+            "0 errors",
+            "no errors",
             "23 passed, 0 failed; exit status 0",
             "pytest exited with code 0",
+            "test result: ok. 23 passed; 0 failed",
+            "make: Nothing to be done for 'test'.",
+            "23 passed\nERROR app: expected rejection",
+            "23 passed\nTraceback (most recent call last): expected test fixture output",
             '{"passed": true, "exit_code": 0, "tests_failed": 0, "failures": []}',
+            '{"failed": false, "errors": [], "error": null, "errors_count": 0}',
+            '{"passed": true, "error": "none"}',
+            '{"status": "success", "exception": "N/A"}',
+            '{"passed": true, "errors": "0 errors", "failures": "no failures"}',
+            '{"status": "completed", "conclusion": "success", "errorCount": 0}',
         )
         failing_evidence = (
             "pytest exited with code 1",
             "pytest failed",
             "FAILED tests/test_x.py::test_y",
+            "ERROR collecting tests/test_bad.py\n1 error in 0.12s",
+            "INTERNALERROR> RuntimeError: plugin crashed",
+            "!!!!!!!! Interrupted: 1 error during collection !!!!!!!!",
             "make: *** [test] Error 2",
+            "make: *** No rule to make target 'test'. Stop.",
+            "gmake[2]: *** [target] Error 1",
+            "Traceback (most recent call last):\nRuntimeError: boom",
+            "SyntaxError: invalid syntax",
+            "RuntimeError: migration failed\npytest: 1 passed",
+            'Exception in thread "main" java.lang.RuntimeException: boom',
+            "AssertionError [ERR_ASSERTION]: expected true",
+            "KeyboardInterrupt",
+            "--- FAIL: TestName (0.00s)",
+            "1 example, 1 failure",
+            "test result: FAILED. 22 passed; 1 failed",
+            "npm ERR! Test failed",
+            "npm error code 1",
+            "ℹ fail 1",
+            "not ok 3 - rejects malformed input",
+            "Bail out! child process crashed",
+            "##[error]Process completed with exit code 1.",
             "command returned exit code 2",
             "1 test failed",
             '{"passed": "false", "exit_code": "1"}',
+            '{"failed": true}',
+            '{"failed": "true"}',
+            '{"errors": ["collection failed"]}',
+            '{"error": "compiler crashed"}',
+            '{"error": {"message": "compiler crashed"}}',
+            '{"errors_count": 1}',
+            '{"summary": {"failures": 1, "errors": 1}}',
+            '{"status": "completed", "conclusion": "failure"}',
+            '{"results": [{"errorCount": 1}]}',
+            '{"Action": "fail"}',
+            '{"numFailedTests": 1}',
+            "src/index.ts(3,7): error TS2322: Type 'string' is not assignable",
         )
 
         for index, evidence in enumerate(passing_evidence):
@@ -1448,6 +1491,30 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertTrue(result["gate"]["mechanical_blocked"])
                 self.assertTrue(result["gate"]["mechanical_failures"])
                 self.assertEqual(result["gate"]["pass_count"], 2)
+
+    def test_standard_tool_failures_block_fusion_handoff(self) -> None:
+        failing_evidence = (
+            "ERROR collecting tests/test_bad.py\n1 error in 0.12s",
+            "make: *** No rule to make target 'test'. Stop.",
+            "gmake[2]: *** [target] Error 1",
+        )
+
+        for index, evidence in enumerate(failing_evidence):
+            with self.subTest(evidence=evidence):
+                result = FusionOrchestrator(
+                    orchestration_config(),
+                    FakeProviderRegistry(),
+                ).fuse(
+                    "Release only when explicit deterministic checks pass.",
+                    mechanical_evidence=evidence,
+                    run_id=f"mechanical-handoff-block-{index}",
+                )
+                self.assertEqual(result.status, "rejected")
+                self.assertTrue(result.gate["mechanical_blocked"])
+                self.assertFalse(result.gate["passed"])
+                self.assertFalse(result.execution_handoff["ready_for_host_workflow"])
+                self.assertFalse(result.execution_handoff["ready"])
+                self.assertFalse(result.execution_handoff["mutation_authorized"])
 
     def test_invalid_structured_verdict_blocks_even_when_transport_failures_may_degrade(self) -> None:
         config = orchestration_config()
