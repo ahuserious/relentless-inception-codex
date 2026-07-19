@@ -25,6 +25,10 @@
     "longDescription": "A provider-neutral, cost-bounded deliberation control plane for Codex. It runs independent model seats, structured comparison, minority-preserving synthesis, and adversarial verification while keeping filesystem execution under Codex control.",
     "developerName": "ahuserious",
     "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
     "websiteURL": "https://github.com/ahuserious/relentless-inception-codex",
     "defaultPrompt": [
       "Use Relentless Inception to solve this with maximum intelligence",

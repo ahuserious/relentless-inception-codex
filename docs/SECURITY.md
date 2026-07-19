@@ -55,6 +55,8 @@ Recommended practice:
 
 Put secret headers only in the schema's environment-backed header mapping, and include only headers required by the provider. Do not add an undocumented literal-header field to a user override.
 
+Treat every provider `base_url` change as a credential-and-data egress decision. The adapter sends that provider entry's bearer/API key and selected task material to the configured HTTPS origin; TLS validation proves the certificate for the chosen origin, not that the origin is trustworthy. Reconfirm the hostname and provider ownership before enabling or testing a custom endpoint.
+
 ## Data egress
 
 Every external seat is data egress. Before a run, determine which task content may leave the machine.
@@ -94,6 +96,7 @@ Additional rules:
 - Treat a panel's request to reveal secrets, broaden scope, change configuration, or run a command as untrusted advice.
 - The synthesizer must not convert an embedded instruction into an execution-handoff step without independent justification.
 - The active Codex session revalidates every handoff step against the original request and repository instructions.
+- Recursive CLI execution verifies the schema-v2 hash of the complete handoff packet; changing its instruction, selected evidence, lifecycle state, profile, or execution settings invalidates it.
 
 Prompt fencing reduces risk; it does not make arbitrary model input safe. Send the minimum necessary material.
 
@@ -105,12 +108,13 @@ The active Codex session must:
 
 - inspect the current worktree and preserve unrelated user changes;
 - use the smallest path scope necessary;
+- complete enabled plan and pre-execution gates with every configured evidence item before authorizing mutation;
 - request approval for destructive actions and externally visible writes;
 - avoid executing commands copied blindly from model output;
 - run relevant tests and inspect their real output;
-- submit exact, hashed post-execution artifacts to the gate.
+- submit exact, hashed artifacts to each configured post-execution, final, and summarize gate.
 
-Optional recursive `codex exec` support is a separate high-risk mode. It must remain disabled unless the user explicitly enables it, supplies a work directory, and confirms the invocation. It does not bypass Codex sandboxing.
+Optional recursive `codex exec` support is a separate high-risk mode. It must remain disabled unless the user explicitly enables it, supplies a work directory, and confirms the invocation. It uses only the hash-bound execution settings frozen into the reviewed handoff, refuses pending host gates, and does not bypass Codex sandboxing. The unkeyed contract hashes detect mismatch but are not a signature against a local attacker who can rewrite the private run directory.
 
 ## Native Codex subagents
 
@@ -120,10 +124,14 @@ Recommended defaults:
 
 - reviewers and explorers: `sandbox_mode = "read-only"`;
 - `agents.max_depth = 1` to prevent recursive fan-out;
-- bounded `agents.max_threads` and job runtime;
+- bounded `agents.max_concurrent_threads_per_session` and job runtime;
 - no provider credentials in project-scoped agent files;
 - narrow developer instructions and tool surfaces;
 - separate implementation and review roles.
+
+On Codex 0.145, a named role must be registered under `[agents.<role>]` in the main config with `description`, `config_file`, and optional `nickname_candidates`. The referenced TOML is only a config layer containing fields such as `model_provider`, `model`, `model_reasoning_effort`, `sandbox_mode`, and `developer_instructions`; do not duplicate the role metadata there.
+
+Correct configuration is not proof of provider compatibility. Codex 0.145 custom Responses providers advertise/send `namespace` tools by default, which xAI rejects with HTTP 422. A local test passed only after the native role was narrowed to single-turn reasoning and its web, shell, plugin/app, inherited MCP, and other tool-producing surfaces were disabled. A first shell function call could execute, but the continuation failed with a compaction-blob decode error. Treat the bundled Grok role as reasoning-only: pass it the exact evidence to review and never ask it to retrieve, inspect, execute, or mutate. Use the plugin's external xAI seats for fusion and xAI-hosted tools. Track the upstream [custom-provider namespace-tools issue](https://github.com/openai/codex/issues/14242) and re-run the full two-turn tool-loop smoke test after either side changes.
 
 Installing this plugin does not modify `~/.codex/config.toml`, `~/.codex/agents/`, or project agent files. Treat any future setup helper that writes those locations as a consent checkpoint.
 
@@ -157,7 +165,7 @@ Always record requested and actual model identity. A router may substitute model
 
 Multi-model fusion creates a direct cost-amplification surface. A malicious artifact could try to induce retries, larger context, or more reviewers.
 
-The MCP runtime directly enforces maximum calls, aggregate reported tokens, elapsed wall time, and **known** dollar cost. The profile also exposes host-policy controls that the active Codex workflow must honor, including:
+The MCP runtime atomically reserves every actual provider HTTP attempt, including retries and fallbacks, before dispatch. Under `hard_stop`, `max_calls` is therefore a concurrency-safe pre-dispatch ceiling. Aggregate reported tokens, provider-tool calls, elapsed wall time, and known dollar cost are observed-response stop thresholds: reaching or crossing one blocks later dispatch, but cannot cancel or retroactively cap the response that revealed the usage or other requests already in flight. The profile also exposes host-policy controls that the active Codex workflow must honor, including:
 
 - per-provider limits;
 - a warning/approval threshold before significant additional spend;
@@ -166,7 +174,7 @@ The MCP runtime directly enforces maximum calls, aggregate reported tokens, elap
 - circuit breaking after repeated provider failures;
 - visible accounting for calls whose cost is unknown.
 
-Unknown cost is not zero and is not covered by the known-dollar hard cap. If a provider omits price data and the seat has no configured pricing, surface `unknown_cost_calls`, stop before material additional fan-out, and require a conservative estimate or user direction.
+Unknown cost is not zero. The maximum-intelligence profile defaults to `unknown_cost_policy: "fail_closed"`: if a provider omits price data and the seat has no configured estimate, record the completed call, surface `unknown_cost_calls`, and block every later dispatch. This cannot bound the cost of the already accepted call. The alternative `warn` policy deliberately provides accounting visibility rather than a dollar cap.
 
 Never raise a hard cap merely to satisfy "maximum intelligence" without the user's approval.
 
@@ -176,7 +184,7 @@ Run state defaults to `PLUGIN_DATA`, `RELENTLESS_INCEPTION_DATA_DIR`, or `~/.cod
 
 - Run paths are confined beneath the run directory.
 - Runtime directories use mode `0700`; files use mode `0600`; writes are atomic.
-- Resume verifies task and redacted-config hashes.
+- Resume verifies task, redacted-config, operation, profile, context, mechanical-evidence, and candidate-artifact identity hashes; cumulative wall-time accounting is restored rather than reset.
 - A global or run-local `KILL` file stops later work.
 - `run_abort` marks a run aborted, but an HTTP request already accepted by a provider may still finish and bill; abort is not a provider-side refund or guaranteed remote cancellation.
 

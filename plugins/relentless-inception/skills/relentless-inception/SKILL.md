@@ -41,6 +41,7 @@ Before calling a paid provider:
 3. Identify the repository or artifact in scope and name anything explicitly out of scope.
 4. State whether the request authorizes implementation or only analysis/review.
 5. Confirm the selected profile's provider mix, hard budgets, and data-egress implications when they are not already clear from the user's request.
+6. Apply the selected profile's `privacy`, `evidence`, `execution`, and `native_codex` policies before egress or delegation: enforce path allow/deny rules and approval checkpoints, collect the required evidence, and treat native model preferences as host instructions rather than MCP authority.
 
 Do not hide a material assumption inside a panel prompt. Ask the user when different interpretations would produce different work.
 
@@ -78,9 +79,26 @@ Treat the result as a structured proposal:
 - lone-correct minority findings remain visible until disproved;
 - the run ledger records requested and actual models, route metadata, token usage, estimated cost when available, and failures.
 
-A confident synthesis is not proof. Inspect its gate result, dissent, assumptions, and `execution_handoff` before changing anything.
+A confident synthesis is not proof. Inspect its gate result, dissent, assumptions, and `execution_handoff` before changing anything. The MCP runtime gate in `fuse` applies only to the synthesis candidate; it does not silently satisfy the named plan or pre-execution lifecycle gates.
 
-### 5. Active-Codex execution handoff
+### 5. Complete the host-owned pre-mutation gates
+
+Treat `execution_handoff` as a persisted workflow packet. Its readiness fields have exact meanings:
+
+- `ready_for_host_workflow: true` means the synthesis gate passed and the packet contains the required plan; Codex may start host-side review.
+- `ready: false` or `mutation_authorized: false` means an enabled `plan` or `pre_execution` gate is still pending. Do not edit files or mutate external state.
+- `lifecycle.pending_gates` names the stages that must pass first. `artifacts.required_checks.lifecycle_gates` supplies each stage's configured `required_evidence`.
+
+For each enabled pending stage, in order:
+
+1. Assemble an immutable stage manifest containing the exact fused plan, the original acceptance criteria, and every named evidence item. For `plan`, this normally includes the requirements trace and risk analysis. For `pre_execution`, it normally includes the approved fused plan and explicit workspace/scope boundaries.
+2. Refuse to treat the stage as runnable if any configured `required_evidence` item is absent. Confirm that each reviewer seat's effective provider tools are no broader than the stage's host-owned `tool_policy`; the stage setting does not dynamically rewrite seat configuration. Do not let a reviewer vote compensate for missing evidence.
+3. Call `adversarial_gate` over that exact manifest and its mechanical evidence. Enforce the stage's host `timeout_seconds`; if it expires, abort/stop the run and record a failed receipt rather than treating the timeout as a pass.
+4. Retain a host-side receipt containing the stage name, manifest SHA-256, gate run id, pass/fail, reviewer quorum, evidence names, effective tool policy, and elapsed time.
+
+Only after every pending plan/pre-execution receipt passes may the active Codex task authorize mutation in its own visible task state. The persisted handoff remains the historical pre-authorization packet; do not rewrite it to pretend it was originally ready.
+
+### 6. Active-Codex execution
 
 The active Codex session executes the returned handoff itself:
 
@@ -91,30 +109,33 @@ The active Codex session executes the returned handoff itself:
 5. Run proportionate tests, static checks, and a realistic usage path.
 6. Save or report exact evidence, including failures and skipped checks.
 
-If the original `fuse` response is no longer in context, use `execution_handoff` for the run id rather than reconstructing it from memory. Use `run_status` to inspect an active run and `run_abort` when the user requests a stop or a hard safety/budget condition fires.
+If the original `fuse` response is no longer in context, use `execution_handoff` for the run id rather than reconstructing it from memory. Its `selected_profile`, hashed `execution_contract`, included artifacts, and budget remainder are frozen with the run; never substitute settings from whichever profile happens to be active later. Use `run_status` to inspect an active run and `run_abort` when the user requests a stop or a hard safety/budget condition fires.
 
 External panelists never execute this step. A native Codex worker may assist only through normal Codex delegation and remains subject to the parent sandbox and approvals.
 
-### 6. Gate the implemented artifact
+When `native_codex.enabled` is true, resolve configured `reviewer_roles` as named Codex agents before treating them as available. Their separate agent TOML is authoritative for provider/model selection. Never use a role listed in `reasoning_only_roles` to inspect the workspace, retrieve evidence, call tools, execute, or mutate; give it one complete immutable evidence packet for single-turn review. If a named role is absent or its current compatibility probe has not passed, report that fact and use only an available configured `reviewer_models` fallback.
 
-After execution, invoke the `relentless-inception-review` skill and `adversarial_gate` over an immutable artifact manifest:
+### 7. Complete the post-mutation lifecycle gates
 
-- the exact diff or output paths;
-- a hash for every reviewed artifact;
-- acceptance criteria;
-- test commands and captured results;
-- known limitations and unresolved questions.
+After execution, invoke the `relentless-inception-review` skill and the enabled later gates in `lifecycle.later_gates`. Each stage is a separate `adversarial_gate` call over an immutable manifest with all of that stage's configured evidence:
+
+- `post_execution`: the exact diff or output paths, hashes, test commands/results, and requirement coverage;
+- `final`: the current gate verdicts, cost ledger, provider/model provenance, known limitations, and unresolved dissent;
+- `summarize`: the decisions, open risks, and verification state that must survive the final handoff or any context compaction.
+
+Include the acceptance criteria and a hash for every reviewed artifact at every stage. Refuse a pass when a named evidence item is missing.
 
 All reviewers in a gate must review the same snapshot. `required_passes` is the number of independent reviewer seats that must each return `PASS` for that one SHA-256. A changed artifact invalidates the quorum. A reproducible mechanical failure overrides the pass count. A missing criterion is a blind spot, not a pass.
 
 When the gate fails and the user authorized implementation, repair only the blocking issue, rerun relevant verification, produce a new artifact hash, and gate again. When the user requested review only, report findings without modifying files.
 
-### 7. Finish with evidence
+### 8. Finish with evidence
 
 Do not claim completion merely because the synthesis sounded strong. Finish only when:
 
 - every acceptance criterion has evidence;
 - the configured independent-review quorum holds on the current artifact hash;
+- every enabled plan, pre-execution, post-execution, final, and summarize stage has a retained host receipt with its required evidence;
 - no blocking minority finding remains unresolved;
 - actual provider/model provenance and known cost uncertainty are reported;
 - the active Codex session has re-read the original request and checked for scope drift.

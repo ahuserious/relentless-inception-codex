@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "relentless-inception": {
+      "command": "python3",
+      "args": ["./mcp_server.py"],
+      "cwd": "."
+    }
+  }
+}

@@ -1,10 +1,25 @@
-# OPT-IN GLOBAL SUBAGENT LIMITS — merge into user-level ~/.codex/config.toml or
-# an appropriate trusted project configuration after reviewing existing values.
-# Keep max_depth = 1 unless recursive delegation is deliberately required; deeper
-# fan-out increases cost, latency, and the chance of uncontrolled task expansion.
+# OPT-IN NATIVE-AGENT REGISTRATION — merge into user-level
+# ~/.codex/config.toml after reviewing existing values. This shape matches Codex
+# 0.145. Keep max_depth = 1 unless recursive delegation is deliberately required;
+# deeper fan-out increases cost, latency, and the chance of uncontrolled task
+# expansion.
 
 [agents]
-max_threads = 4
+max_concurrent_threads_per_session = 4
 max_depth = 1
 job_max_runtime_seconds = 1800
 interrupt_message = true
+
+# A role is registered in the main config. The referenced file is a Codex config
+# layer and must not repeat role metadata such as description or nicknames.
+# Replace this placeholder with the absolute path to the copied agent file.
+[agents.grok45_reviewer]
+description = "Independent reasoning-only Grok 4.5 reviewer. It receives complete evidence from its parent, never calls tools, and never implements changes."
+config_file = "/absolute/path/to/.codex/agents/grok45_reviewer.toml"
+nickname_candidates = ["Axiom", "Kepler", "Turing"]
+
+# IMPORTANT: this role is reasoning-only on Codex 0.145. The hardened agent
+# layer disables known tool-producing features; every MCP server inherited from
+# the user's main config must also be overridden with enabled = false in that
+# layer. A local text-only Grok 4.5 smoke test passed, but function-result
+# continuation failed. Use external plugin seats for tool use or implementation.

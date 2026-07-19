@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import string
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -42,18 +43,173 @@ JUDGE_FIELDS = tuple(JUDGE_SCHEMA["required"])
 VERDICT_FIELDS = tuple(VERDICT_SCHEMA["required"])
 
 
+def _native_openrouter_judgment() -> Dict[str, Any]:
+    return {
+        "consensus": [],
+        "contradictions": [],
+        "partial_coverage": [],
+        "unique_insights": [],
+        "minority_findings": [],
+        "blind_spots": ["Native OpenRouter Fusion does not expose raw inner-seat artifacts."],
+        "verification_priorities": ["Apply an independent external adversarial gate."],
+        "final_guidance": [],
+    }
+
+
+def _mechanical_failures(mechanical_evidence: str) -> List[str]:
+    """Extract only explicit deterministic failures; ambiguous prose is left to reviewers."""
+
+    failures: List[str] = []
+    stripped = mechanical_evidence.strip()
+    if not stripped:
+        return failures
+
+    try:
+        structured_evidence = json.loads(stripped)
+    except json.JSONDecodeError:
+        structured_evidence = None
+
+    def inspect(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            normalized = {str(key).lower(): child for key, child in value.items()}
+            for boolean_key in ("passed", "success", "ok"):
+                if normalized.get(boolean_key) is False:
+                    failures.append(f"{path}.{boolean_key}=false")
+            for numeric_key in ("exit_code", "exit_status", "returncode", "return_code"):
+                numeric_value = normalized.get(numeric_key)
+                if isinstance(numeric_value, int) and not isinstance(numeric_value, bool) and numeric_value != 0:
+                    failures.append(f"{path}.{numeric_key}={numeric_value}")
+            status = normalized.get("status")
+            if isinstance(status, str) and status.strip().lower() in {"error", "failed", "failure"}:
+                failures.append(f"{path}.status={status.strip()}")
+            reported_failures = normalized.get("failures")
+            if isinstance(reported_failures, list) and reported_failures:
+                failures.append(f"{path}.failures contains {len(reported_failures)} item(s)")
+            for key, child in value.items():
+                inspect(child, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                inspect(child, f"{path}[{index}]")
+
+    if structured_evidence is not None:
+        inspect(structured_evidence, "evidence")
+
+    normalized_text = re.sub(r"\b0\s+failed\b", "", stripped, flags=re.IGNORECASE)
+    for match in re.finditer(
+        r"\b(?:exit(?:ed)?(?:\s+(?:status|code))?|return(?:\s+code|code))\s*[:=]?\s*(-?\d+)\b",
+        normalized_text,
+        flags=re.IGNORECASE,
+    ):
+        if int(match.group(1)) != 0:
+            failures.append(match.group(0))
+    for match in re.finditer(r"\b([1-9]\d*)\s+(?:tests?\s+)?failed\b", normalized_text, flags=re.IGNORECASE):
+        failures.append(match.group(0))
+    explicit_failure = re.search(
+        r"\b(?:assertionerror|assertion\s+failure|tests?\s+(?:failed|failing)|build\s+failed|command\s+failed)\b"
+        r"|traceback \(most recent call last\)",
+        normalized_text,
+        flags=re.IGNORECASE,
+    )
+    if explicit_failure:
+        failures.append(explicit_failure.group(0))
+    return list(dict.fromkeys(failures))
+
+
+def _panel_context_bundle(
+    context: str,
+    mechanical_evidence: str,
+    bundle_name: str,
+    partition_context: bool,
+) -> str:
+    shared_context = context.strip() or "(none supplied)"
+    shared_evidence = mechanical_evidence.strip() or "(none supplied)"
+    if not partition_context:
+        return f"Shared context:\n{shared_context}\n\nMechanical evidence:\n{shared_evidence}"
+
+    lens_by_bundle = {
+        "full_task_and_evidence": "Use the complete supplied context and evidence; seek a self-contained solution.",
+        "requirements_risks_and_counterexamples": "Extract requirements, risks, counterexamples, and unsafe assumptions.",
+        "requirements_and_mechanical_evidence": "Trace each requirement to the supplied deterministic evidence and flag gaps.",
+    }
+    lens = lens_by_bundle.get(
+        bundle_name,
+        f"Apply the explicitly configured context bundle named {bundle_name!r}.",
+    )
+    return (
+        f"Context partition: {bundle_name}\n"
+        f"Assigned lens: {lens}\n\n"
+        f"Supplied context:\n{shared_context}\n\n"
+        f"Mechanical evidence:\n{shared_evidence}"
+    )
+
+
+def _contains_substantive_claim(text: str) -> bool:
+    """Reject heading-only or fragment-only output without pretending to fact-check it."""
+
+    for line in text.splitlines():
+        candidate = re.sub(r"^\s*(?:#{1,6}\s*|[-*+]\s+|\d+[.)]\s+)", "", line).strip()
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_'’-]*", candidate)
+        if len(words) >= 6:
+            return True
+    return False
+
+
+def _validate_quality_floor(text: str, quality_floor: Mapping[str, Any], label: str) -> None:
+    minimum_characters = int(quality_floor.get("minimum_characters", 1))
+    if len(text.strip()) < minimum_characters:
+        raise ProviderError(
+            f"{label} response was below the profile quality floor of {minimum_characters} characters"
+        )
+    if quality_floor.get("require_nonempty_claims", False) and not _contains_substantive_claim(text):
+        raise ProviderError(f"{label} returned no substantive claim or recommendation")
+    if quality_floor.get("reject_tool_markup", False):
+        lowered = text.lower()
+        if "<tool_call>" in lowered or "<function_call>" in lowered:
+            raise ProviderError(f"{label} leaked tool-call markup")
+    if quality_floor.get("reject_refusal_without_policy_reason", False):
+        normalized = text.strip().lower()
+        refusal_prefixes = (
+            "i can't assist",
+            "i cannot assist",
+            "i'm unable to help",
+            "i am unable to help",
+            "sorry, but i can't",
+        )
+        if normalized.startswith(refusal_prefixes) and "policy" not in normalized:
+            raise ProviderError(f"{label} returned an ungrounded refusal")
+
+
 def _validate_string_list(value: Any, field: str) -> List[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ProviderError(f"Structured response field {field!r} must be an array of strings")
     return value
 
 
-def validate_judgment(value: Mapping[str, Any]) -> Dict[str, Any]:
-    unexpected = set(value) - set(JUDGE_FIELDS)
-    missing = set(JUDGE_FIELDS) - set(value)
+def validate_judgment(value: Mapping[str, Any], required_fields: Sequence[str] = JUDGE_FIELDS) -> Dict[str, Any]:
+    expected_fields = tuple(str(field) for field in required_fields)
+    unexpected = set(value) - set(expected_fields)
+    missing = set(expected_fields) - set(value)
     if unexpected or missing:
         raise ProviderError(f"Judge schema mismatch; missing={sorted(missing)}, unexpected={sorted(unexpected)}")
-    return {field: _validate_string_list(value[field], field) for field in JUDGE_FIELDS}
+    return {field: _validate_string_list(value[field], field) for field in expected_fields}
+
+
+def _judge_contract(profile: Mapping[str, Any]) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
+    fusion = profile.get("fusion", {})
+    configured_fields = fusion.get("judge_required_fields", list(JUDGE_FIELDS)) if isinstance(fusion, Mapping) else list(JUDGE_FIELDS)
+    if not isinstance(configured_fields, list) or not configured_fields:
+        raise ConfigError("fusion.judge_required_fields must be a non-empty array")
+    required_fields = tuple(str(field) for field in configured_fields)
+    unsupported = set(required_fields) - set(JUDGE_FIELDS)
+    if unsupported:
+        raise ConfigError(f"fusion.judge_required_fields contains unsupported fields: {sorted(unsupported)}")
+    contract = dict(JUDGE_SCHEMA)
+    contract["required"] = list(required_fields)
+    contract["properties"] = {
+        field: JUDGE_SCHEMA["properties"][field]
+        for field in required_fields
+    }
+    return contract, required_fields
 
 
 def validate_verdict(value: Mapping[str, Any], artifact_hash: str) -> Dict[str, Any]:
@@ -70,21 +226,43 @@ def validate_verdict(value: Mapping[str, Any], artifact_hash: str) -> Dict[str, 
     if not isinstance(summary, str):
         raise ProviderError("Verdict summary must be a string")
     validated = {"verdict": verdict, "artifact_sha256": artifact_hash, "summary": summary}
-    for field in ("blocking_findings", "non_blocking_findings", "evidence", "required_actions"):
+    for field in (
+        "criteria_reviewed",
+        "blind_spots",
+        "blocking_findings",
+        "non_blocking_findings",
+        "evidence",
+        "required_actions",
+    ):
         validated[field] = _validate_string_list(value[field], field)
+    if not validated["criteria_reviewed"]:
+        raise ProviderError("Verdict criteria_reviewed must identify at least one checked criterion")
     return validated
 
 
 class FusionOrchestrator:
     def __init__(self, config: Optional[Mapping[str, Any]] = None, registry: Optional[ProviderRegistry] = None) -> None:
         self.config = dict(config) if config is not None else load_config()
+        self._registry_injected = registry is not None
         self.registry = registry or ProviderRegistry(self.config)
+
+    def _bind_selected_profile(self, profile_name: str) -> None:
+        if not self._registry_injected:
+            self.registry = ProviderRegistry(self.config, profile_name=profile_name)
 
     def _seat_config(self, seat_name: str) -> Mapping[str, Any]:
         seat = self.config.get("seats", {}).get(seat_name)
         if not isinstance(seat, Mapping):
             raise ConfigError(f"Unknown seat: {seat_name}")
         return seat
+
+    @staticmethod
+    def _assert_external_provider_access(profile: Mapping[str, Any]) -> None:
+        privacy = profile.get("privacy", {})
+        if isinstance(privacy, Mapping) and privacy.get("external_provider_access") == "deny":
+            raise ConfigError(
+                "Selected profile denies external provider access; fuse and adversarial_gate cannot dispatch"
+            )
 
     def _call(
         self,
@@ -98,16 +276,40 @@ class FusionOrchestrator:
         schema_name: str = "structured_response",
     ) -> ModelResponse:
         store.check_kill()
-        budget.reserve_call(stage, seat_name)
+
+        def reserve_and_persist_attempt() -> None:
+            budget.reserve_call(stage, seat_name)
+            # A timed-out request may still have reached the provider and may be
+            # billable. Persist the reservation before transport starts so a
+            # failed retry or process restart cannot erase it.
+            store.write_budget_snapshot(budget)
+
         response = self.registry.complete(
             seat_name,
             system=system,
             prompt=prompt,
             response_schema=response_schema,
             schema_name=schema_name,
+            before_attempt=reserve_and_persist_attempt,
         )
-        budget.record(stage, seat_name, response)
-        store.write_json("ledger.json", budget.snapshot())
+        # Persist every normalized visible provider response before any budget,
+        # schema, or quality-floor check can reject it. Paid-but-invalid evidence
+        # must survive failure and resume just as successful evidence does.
+        response_artifact = {
+            "stage": stage,
+            "seat_name": seat_name,
+            "response": response.to_dict(),
+        }
+        response_artifact_hash = text_hash(
+            json.dumps(response_artifact, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        store.write_json(f"responses/{response_artifact_hash}.json", response_artifact)
+        try:
+            budget.record(stage, seat_name, response)
+        finally:
+            # An over-threshold response is already billable evidence. Persist its
+            # usage and stop latch even when record() fails closed.
+            store.write_budget_snapshot(budget)
         store.check_kill()
         return response
 
@@ -115,12 +317,11 @@ class FusionOrchestrator:
         self,
         task: str,
         context: str,
+        mechanical_evidence: str,
         profile: Mapping[str, Any],
         budget: BudgetTracker,
         store: RunStore,
     ) -> List[Dict[str, Any]]:
-        if store.exists("panel.json"):
-            return list(store.read_json("panel.json").get("results", []))
         fusion = profile["fusion"]
         seat_names = list(fusion["panel"])
         for optional_seat_name in fusion.get("optional_panel", []):
@@ -131,7 +332,39 @@ class FusionOrchestrator:
         max_panel_seats = int(fusion.get("max_panel_seats", len(seat_names)))
         seat_names = seat_names[:max_panel_seats]
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
-        max_concurrency = min(int(fusion.get("max_concurrency", 2)), len(seat_names))
+        stored_panel = store.read_json("panel.json") if store.exists("panel.json") else {}
+        stored_results = stored_panel.get("results", [])
+        if not isinstance(stored_results, list):
+            raise ConfigError("Stored panel artifact results must be an array")
+        latest_by_seat: Dict[str, Dict[str, Any]] = {
+            str(row["seat_name"]): dict(row)
+            for row in stored_results
+            if isinstance(row, Mapping) and row.get("seat_name") in seat_names
+        }
+        stored_attempts = stored_panel.get("attempts", stored_results)
+        attempts: List[Dict[str, Any]] = [
+            dict(row) for row in stored_attempts if isinstance(row, Mapping)
+        ] if isinstance(stored_attempts, list) else []
+        pending_seat_names = [
+            seat_name
+            for seat_name in seat_names
+            if latest_by_seat.get(seat_name, {}).get("status") != "completed"
+        ]
+
+        def persist_panel_snapshot(results: Sequence[Mapping[str, Any]]) -> None:
+            result_rows = [dict(row) for row in results]
+            live_count = sum(row.get("status") == "completed" for row in result_rows)
+            failed_count = sum(row.get("status") == "failed" for row in result_rows)
+            store.write_json(
+                "panel.json",
+                {
+                    "results": result_rows,
+                    "attempts": attempts,
+                    "live_count": live_count,
+                    "failed_count": failed_count,
+                    "degraded": failed_count > 0,
+                },
+            )
 
         def panel_worker(seat_name: str) -> SeatResult:
             seat = self._seat_config(seat_name)
@@ -143,89 +376,82 @@ class FusionOrchestrator:
                 "panel",
                 seat_name,
                 panel_system(role, persona, objective),
-                panel_prompt(task, context),
+                panel_prompt(
+                    task,
+                    _panel_context_bundle(
+                        context,
+                        mechanical_evidence,
+                        str(seat.get("context_bundle", "full_task_and_evidence")),
+                        fusion.get("partition_context", True) is True,
+                    ),
+                ),
             )
             quality_floor = fusion.get("quality_floor", {})
-            minimum_characters = int(quality_floor.get("minimum_characters", 1)) if isinstance(quality_floor, Mapping) else 1
-            if len(response.text.strip()) < minimum_characters:
-                raise ProviderError(
-                    f"Seat {seat_name} response was below the profile quality floor of {minimum_characters} characters"
-                )
-            if isinstance(quality_floor, Mapping) and quality_floor.get("reject_tool_markup", False):
-                lowered = response.text.lower()
-                if "<tool_call>" in lowered or "<function_call>" in lowered:
-                    raise ProviderError(f"Seat {seat_name} leaked tool-call markup")
-            if isinstance(quality_floor, Mapping) and quality_floor.get("reject_refusal_without_policy_reason", False):
-                normalized = response.text.strip().lower()
-                refusal_prefixes = (
-                    "i can't assist",
-                    "i cannot assist",
-                    "i'm unable to help",
-                    "i am unable to help",
-                    "sorry, but i can't",
-                )
-                if normalized.startswith(refusal_prefixes) and "policy" not in normalized:
-                    raise ProviderError(f"Seat {seat_name} returned an ungrounded refusal")
+            if isinstance(quality_floor, Mapping):
+                _validate_quality_floor(response.text, quality_floor, f"Seat {seat_name}")
             return SeatResult(seat_name=seat_name, anonymous_label="", role=role, status="completed", response=response)
 
-        completed: List[SeatResult] = []
-        failures: List[SeatResult] = []
-        with ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix="inception-panel") as executor:
-            futures: Dict[Future[SeatResult], str] = {
-                executor.submit(panel_worker, seat_name): seat_name for seat_name in seat_names
-            }
-            for future in as_completed(futures):
-                seat_name = futures[future]
-                try:
-                    completed.append(future.result())
-                except BudgetExceeded:
-                    for pending in futures:
-                        pending.cancel()
-                    raise
-                except Exception as exc:
-                    seat = self._seat_config(seat_name)
-                    failures.append(
-                        SeatResult(
+        if pending_seat_names:
+            max_concurrency = min(int(fusion.get("max_concurrency", 2)), len(pending_seat_names))
+            with ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix="inception-panel") as executor:
+                futures: Dict[Future[SeatResult], str] = {
+                    executor.submit(panel_worker, seat_name): seat_name for seat_name in pending_seat_names
+                }
+                for future in as_completed(futures):
+                    seat_name = futures[future]
+                    try:
+                        result = future.result()
+                    except BudgetExceeded:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+                    except Exception as exc:
+                        seat = self._seat_config(seat_name)
+                        result = SeatResult(
                             seat_name=seat_name,
                             anonymous_label="",
                             role=str(seat.get("role", "domain analyst")),
                             status="failed",
                             error=str(exc),
                         )
+                    result_row = result.to_dict()
+                    latest_by_seat[seat_name] = result_row
+                    attempts.append(result_row)
+                    persist_panel_snapshot(
+                        [latest_by_seat[name] for name in seat_names if name in latest_by_seat]
                     )
+
+        completed = [dict(latest_by_seat[name]) for name in seat_names if latest_by_seat.get(name, {}).get("status") == "completed"]
+        failures = [dict(latest_by_seat[name]) for name in seat_names if latest_by_seat.get(name, {}).get("status") == "failed"]
 
         min_live = int(fusion.get("min_live_seats", len(seat_names)))
         if len(completed) < min_live:
-            failure_summary = "; ".join(f"{failure.seat_name}: {failure.error}" for failure in failures)
+            persist_panel_snapshot([*completed, *failures])
+            store.mark_stage("panel", "failed", "panel.json")
+            failure_summary = "; ".join(
+                f"{failure.get('seat_name')}: {failure.get('error')}" for failure in failures
+            )
             raise ProviderError(f"Panel collapsed: {len(completed)}/{len(seat_names)} live; {failure_summary}")
-        rescue = profile.get("rescue", {})
-        allow_degradation = fusion.get(
-            "allow_degradation",
-            rescue.get("allow_degraded_single_provider", False) if isinstance(rescue, Mapping) else False,
-        )
+        allow_degradation = fusion.get("allow_degradation", False)
         if failures and allow_degradation is not True:
-            failure_summary = "; ".join(f"{failure.seat_name}: {failure.error}" for failure in failures)
+            persist_panel_snapshot([*completed, *failures])
+            store.mark_stage("panel", "failed", "panel.json")
+            failure_summary = "; ".join(
+                f"{failure.get('seat_name')}: {failure.get('error')}" for failure in failures
+            )
             raise ProviderError(f"Panel degradation is disabled; {failure_summary}")
 
         # Deterministic task-local shuffle hides model identity without making resumes unstable.
         if fusion.get("randomize_panel_order", True):
             random.Random(store.task_hash).shuffle(completed)
         for index, result in enumerate(completed):
-            result.anonymous_label = (
+            result["anonymous_label"] = (
                 f"Seat {string.ascii_uppercase[index]}"
                 if fusion.get("anonymize_model_identity", True)
-                else result.seat_name
+                else result["seat_name"]
             )
-        results = [result.to_dict() for result in [*completed, *failures]]
-        store.write_json(
-            "panel.json",
-            {
-                "results": results,
-                "live_count": len(completed),
-                "failed_count": len(failures),
-                "degraded": bool(failures),
-            },
-        )
+        results = [*completed, *failures]
+        persist_panel_snapshot(results)
         store.mark_stage("panel", "completed", "panel.json")
         return results
 
@@ -243,17 +469,23 @@ class FusionOrchestrator:
         fusion = profile["fusion"]
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
         live_reports = [report for report in reports if report.get("status") == "completed"]
+        judge_schema, required_fields = _judge_contract(profile)
+        judge_seat = self._seat_config(str(fusion["judge"]))
         response = self._call(
             budget,
             store,
             "judge",
             str(fusion["judge"]),
-            judge_system(objective),
+            judge_system(
+                objective,
+                str(judge_seat.get("persona", "")),
+                str(judge_seat.get("context_bundle", "")),
+            ),
             judge_prompt(task, live_reports, mechanical_evidence),
-            JUDGE_SCHEMA,
+            judge_schema,
             "fusion_judgment",
         )
-        judgment = validate_judgment(parse_json_object(response.text))
+        judgment = validate_judgment(parse_json_object(response.text), required_fields)
         store.write_json("judge.json", {"judgment": judgment, "response": response.to_dict()})
         store.mark_stage("judge", "completed", "judge.json")
         return judgment
@@ -279,12 +511,23 @@ class FusionOrchestrator:
         fusion = profile["fusion"]
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
         live_reports = [report for report in reports if report.get("status") == "completed"]
+        synthesizer_name = str(fusion["synthesizer"])
+        synthesizer_seat = self._seat_config(synthesizer_name)
+        if (
+            fusion.get("separate_no_tools_synthesis_turn") is True
+            and synthesizer_seat.get("tool_policy") != "none"
+        ):
+            raise ConfigError("separate_no_tools_synthesis_turn requires a tool-less synthesizer seat")
         response = self._call(
             budget,
             store,
             "synthesis" if round_index == 0 else "amendment",
-            str(fusion["synthesizer"]),
-            synthesis_system(objective),
+            synthesizer_name,
+            synthesis_system(
+                objective,
+                str(synthesizer_seat.get("persona", "")),
+                str(synthesizer_seat.get("context_bundle", "")),
+            ),
             synthesis_prompt(
                 task,
                 context,
@@ -294,6 +537,9 @@ class FusionOrchestrator:
                 amendment_feedback,
             ),
         )
+        quality_floor = fusion.get("quality_floor", {})
+        if isinstance(quality_floor, Mapping):
+            _validate_quality_floor(response.text, quality_floor, f"Synthesizer {synthesizer_name}")
         saved = {"text": response.text, "sha256": text_hash(response.text), "response": response.to_dict()}
         store.write_json(artifact_name, saved)
         store.mark_stage("synthesis" if round_index == 0 else f"amendment-{round_index}", "completed", artifact_name)
@@ -329,24 +575,38 @@ class FusionOrchestrator:
         if not reviewer_names:
             raise ConfigError("Adversarial gates are enabled but no reviewers are configured")
         synthesizer = str(profile["fusion"]["synthesizer"])
-        require_author_separation = gates.get("require_author_separation", gates.get("exclude_artifact_author", True))
+        require_author_separation = gates.get("exclude_artifact_author", True)
         if require_author_separation and synthesizer in reviewer_names:
             raise ConfigError("Gate author separation requires reviewer seats distinct from the synthesizer")
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
         max_concurrency = min(int(gates.get("max_concurrency", 2)), len(reviewer_names))
 
         def review_worker(reviewer_name: str) -> Dict[str, Any]:
+            reviewer_seat = self._seat_config(reviewer_name)
             response = self._call(
                 budget,
                 store,
                 "gate",
                 reviewer_name,
-                gate_system(objective),
+                gate_system(
+                    objective,
+                    str(reviewer_seat.get("persona", "")),
+                    str(reviewer_seat.get("context_bundle", "")),
+                ),
                 gate_prompt(task, artifact, artifact_hash, mechanical_evidence),
                 VERDICT_SCHEMA,
                 "adversarial_verdict",
             )
-            verdict = validate_verdict(parse_json_object(response.text), artifact_hash)
+            try:
+                verdict = validate_verdict(parse_json_object(response.text), artifact_hash)
+            except ProviderError as exc:
+                return {
+                    "seat_name": reviewer_name,
+                    "status": "failed",
+                    "failure_kind": "schema_invalid",
+                    "error": str(exc),
+                    "response": response.to_dict(),
+                }
             allowed_verdicts = gates.get("allowed_verdicts", ["PASS", "NEEDS_WORK", "FAIL"])
             if isinstance(allowed_verdicts, list) and verdict["verdict"] not in allowed_verdicts:
                 raise ProviderError(f"Reviewer returned verdict {verdict['verdict']!r}, which this profile disallows")
@@ -364,7 +624,14 @@ class FusionOrchestrator:
                         pending.cancel()
                     raise
                 except Exception as exc:
-                    reviews.append({"seat_name": reviewer_name, "status": "failed", "error": str(exc)})
+                    reviews.append(
+                        {
+                            "seat_name": reviewer_name,
+                            "status": "failed",
+                            "failure_kind": "provider_failure",
+                            "error": str(exc),
+                        }
+                    )
 
         pass_count = sum(
             1 for review in reviews if review.get("status") == "completed" and review["verdict"]["verdict"] == "PASS"
@@ -372,7 +639,55 @@ class FusionOrchestrator:
         required_passes = int(gates.get("required_passes", len(reviewer_names)))
         fail_closed = gates.get("fail_closed", True) is True
         failed_reviews = any(review.get("status") != "completed" for review in reviews)
-        passed = pass_count >= required_passes and (not failed_reviews or not fail_closed)
+        schema_failures = [
+            {
+                "seat_name": str(review.get("seat_name", "unknown")),
+                "error": str(review.get("error", "invalid structured verdict")),
+            }
+            for review in reviews
+            if review.get("failure_kind") == "schema_invalid"
+        ]
+        schema_blocked = (
+            bool(schema_failures)
+            and gates.get("schema_failure_is_blocking", True) is True
+        )
+        mechanical_failures = _mechanical_failures(mechanical_evidence)
+        mechanical_blocked = bool(mechanical_failures) and gates.get("mechanical_failure_is_blocking", True) is True
+        unresolved_blind_spots = [
+            str(blind_spot)
+            for review in reviews
+            if review.get("status") == "completed"
+            for blind_spot in review.get("verdict", {}).get("blind_spots", [])
+        ]
+        blind_spot_blocked = (
+            bool(unresolved_blind_spots)
+            and gates.get("blind_spot_requires_targeted_review", True) is True
+        )
+        deterministic_blockers = []
+        if mechanical_blocked:
+            deterministic_blockers.append(
+                "Mechanical evidence reports failure: " + "; ".join(mechanical_failures)
+            )
+        if blind_spot_blocked:
+            deterministic_blockers.append(
+                "Targeted review is required for unresolved blind spots: "
+                + "; ".join(unresolved_blind_spots)
+            )
+        if schema_blocked:
+            deterministic_blockers.append(
+                "At least one reviewer returned an invalid structured verdict: "
+                + "; ".join(
+                    f"{failure['seat_name']}: {failure['error']}"
+                    for failure in schema_failures
+                )
+            )
+        passed = (
+            pass_count >= required_passes
+            and (not failed_reviews or not fail_closed)
+            and not mechanical_blocked
+            and not blind_spot_blocked
+            and not schema_blocked
+        )
         result = {
             "enabled": True,
             "passed": passed,
@@ -380,6 +695,13 @@ class FusionOrchestrator:
             "pass_count": pass_count,
             "required_passes": required_passes,
             "fail_closed": fail_closed,
+            "mechanical_failures": mechanical_failures,
+            "mechanical_blocked": mechanical_blocked,
+            "schema_failures": schema_failures,
+            "schema_blocked": schema_blocked,
+            "unresolved_blind_spots": unresolved_blind_spots,
+            "blind_spot_blocked": blind_spot_blocked,
+            "deterministic_blockers": deterministic_blockers,
             "reviewers": reviews,
         }
         store.write_json(artifact_name, result)
@@ -389,6 +711,8 @@ class FusionOrchestrator:
     @staticmethod
     def _gate_feedback(gate: Mapping[str, Any]) -> str:
         feedback: List[Dict[str, Any]] = []
+        for blocker in gate.get("deterministic_blockers", []):
+            feedback.append({"deterministic_blocker": str(blocker)})
         for review in gate.get("reviewers", []):
             if review.get("status") == "completed":
                 verdict = review.get("verdict", {})
@@ -396,6 +720,7 @@ class FusionOrchestrator:
                     feedback.append(
                         {
                             "summary": verdict.get("summary"),
+                            "blind_spots": verdict.get("blind_spots", []),
                             "blocking_findings": verdict.get("blocking_findings", []),
                             "required_actions": verdict.get("required_actions", []),
                             "evidence": verdict.get("evidence", []),
@@ -417,63 +742,113 @@ class FusionOrchestrator:
         if not task.strip():
             raise ConfigError("Fusion task must not be empty")
         profile = active_profile(self.config, profile_name)
-        store = RunStore(task, self.config, run_id)
+        self._assert_external_provider_access(profile)
+        selected_profile_name = str(profile_name or self.config.get("active_profile", ""))
+        self._bind_selected_profile(selected_profile_name)
+        store = RunStore(
+            task,
+            self.config,
+            run_id,
+            input_identity={
+                "operation": "fuse",
+                "task": task,
+                "context": context,
+                "mechanical_evidence": mechanical_evidence,
+                "profile_name": selected_profile_name,
+            },
+        )
         budget = BudgetTracker(profile.get("budgets", {}))
         if store.exists("ledger.json"):
             budget.restore(store.read_json("ledger.json"))
         store.check_kill()
         try:
             fusion_config = profile["fusion"]
-            configured_engine = str(fusion_config.get("mode", fusion_config.get("engine", "client_orchestrated")))
+            configured_engine = str(fusion_config.get("engine", "client_orchestrated"))
             fusion_mode = {
                 "client_orchestrated": "client",
                 "openrouter_native": "native_openrouter",
-                "native_openrouter_fusion": "native_openrouter",
             }.get(configured_engine, configured_engine)
             if fusion_mode == "native_openrouter":
                 seat_name = profile["fusion"].get("native_fusion_seat")
                 if not seat_name:
                     raise ConfigError("native_openrouter mode requires fusion.native_fusion_seat")
-                try:
-                    response = self._call(
-                        budget,
-                        store,
-                        "native_openrouter_fusion",
-                        str(seat_name),
-                        synthesis_system(str(profile.get("objective", "Maximum-correctness answer"))),
-                        panel_prompt(task, context),
-                    )
-                    reports = []
-                    judgment = {
-                        "consensus": [],
-                        "contradictions": [],
-                        "partial_coverage": [],
-                        "unique_insights": [],
-                        "minority_findings": [],
-                        "blind_spots": ["Native OpenRouter Fusion does not expose raw inner-seat artifacts."],
-                        "verification_priorities": ["Apply an independent external adversarial gate."],
-                        "final_guidance": [],
-                    }
-                    synthesis = response.text
-                    store.write_json("synthesis.json", {"text": synthesis, "sha256": text_hash(synthesis), "response": response.to_dict()})
-                except ProviderError as exc:
-                    native_settings = profile["fusion"].get("native_openrouter_fusion", {})
-                    allow_fallback = isinstance(native_settings, Mapping) and native_settings.get(
-                        "fallback_to_client_orchestrated", False
-                    )
+                native_settings = profile["fusion"].get("native_openrouter_fusion", {})
+                if not isinstance(native_settings, Mapping) or native_settings.get("enabled") is not True:
+                    raise ConfigError("native_openrouter mode requires fusion.native_openrouter_fusion.enabled=true")
+                rescue_settings = profile.get("rescue", {})
+                rescue_enabled = (
+                    isinstance(rescue_settings, Mapping)
+                    and rescue_settings.get("enabled", True) is True
+                )
+                allow_fallback = (
+                    rescue_enabled
+                    and isinstance(native_settings, Mapping)
+                    and native_settings.get("fallback_to_client_orchestrated", False) is True
+                )
+                native_fallback_started = store.exists("native-openrouter-failure.json") or store.exists("panel.json")
+                if native_fallback_started:
                     if not allow_fallback:
-                        raise
-                    store.write_json(
-                        "native-openrouter-failure.json",
-                        {"status": "failed", "error": str(exc), "fallback": "client_orchestrated"},
-                    )
-                    reports = self._run_panel(task, context, profile, budget, store)
+                        raise ConfigError("Stored native Fusion fallback conflicts with the selected profile")
+                    reports = self._run_panel(task, context, mechanical_evidence, profile, budget, store)
                     judgment = self._run_judge(task, reports, profile, budget, store, mechanical_evidence)
                     synthesis, _ = self._run_synthesis(
                         task, context, reports, judgment, profile, budget, store, mechanical_evidence
                     )
-            elif fusion_mode in {"client", "hybrid"}:
-                reports = self._run_panel(task, context, profile, budget, store)
+                elif store.exists("synthesis.json"):
+                    saved_synthesis = store.read_json("synthesis.json")
+                    synthesis = str(saved_synthesis["text"])
+                    reports = []
+                    judgment = _native_openrouter_judgment()
+                else:
+                    try:
+                        native_seat = self._seat_config(str(seat_name))
+                        response = self._call(
+                            budget,
+                            store,
+                            "native_openrouter_fusion",
+                            str(seat_name),
+                            synthesis_system(
+                                str(profile.get("objective", "Maximum-correctness answer")),
+                                str(native_seat.get("persona", "")),
+                                str(native_seat.get("context_bundle", "")),
+                            ),
+                            panel_prompt(task, context),
+                        )
+                        reports = []
+                        judgment = _native_openrouter_judgment()
+                        synthesis = response.text
+                        quality_floor = fusion_config.get("quality_floor", {})
+                        if isinstance(quality_floor, Mapping):
+                            _validate_quality_floor(
+                                synthesis,
+                                quality_floor,
+                                f"Native Fusion seat {seat_name}",
+                            )
+                        store.write_json(
+                            "synthesis.json",
+                            {
+                                "mode": "native_openrouter",
+                                "text": synthesis,
+                                "sha256": text_hash(synthesis),
+                                "response": response.to_dict(),
+                            },
+                        )
+                        store.mark_stage("native-openrouter-fusion", "completed", "synthesis.json")
+                    except ProviderError as exc:
+                        if not allow_fallback:
+                            raise
+                        store.write_json(
+                            "native-openrouter-failure.json",
+                            {"status": "failed", "error": str(exc), "fallback": "client_orchestrated"},
+                        )
+                        store.mark_stage("native-openrouter-fusion", "failed", "native-openrouter-failure.json")
+                        reports = self._run_panel(task, context, mechanical_evidence, profile, budget, store)
+                        judgment = self._run_judge(task, reports, profile, budget, store, mechanical_evidence)
+                        synthesis, _ = self._run_synthesis(
+                            task, context, reports, judgment, profile, budget, store, mechanical_evidence
+                        )
+            elif fusion_mode == "client":
+                reports = self._run_panel(task, context, mechanical_evidence, profile, budget, store)
                 judgment = self._run_judge(task, reports, profile, budget, store, mechanical_evidence)
                 synthesis, _ = self._run_synthesis(
                     task, context, reports, judgment, profile, budget, store, mechanical_evidence
@@ -483,10 +858,11 @@ class FusionOrchestrator:
 
             gate = self._review_artifact(task, synthesis, profile, budget, store, mechanical_evidence, 0)
             gate_config = profile.get("gates", {})
-            max_amendments = int(gate_config.get("max_amendment_rounds", gate_config.get("max_revision_cycles", 0)))
+            max_amendments = int(gate_config.get("max_revision_cycles", 0))
             amendment_round = 0
             while not gate.get("passed") and amendment_round < max_amendments:
                 amendment_round += 1
+                prior_artifact_hash = str(gate.get("artifact_sha256", text_hash(synthesis)))
                 synthesis, _ = self._run_synthesis(
                     task,
                     context,
@@ -499,14 +875,45 @@ class FusionOrchestrator:
                     round_index=amendment_round,
                     amendment_feedback=self._gate_feedback(gate),
                 )
-                gate = self._review_artifact(
-                    task, synthesis, profile, budget, store, mechanical_evidence, amendment_round
-                )
+                amendment_hash = text_hash(synthesis)
+                if (
+                    gate_config.get("require_independent_amendment", True) is True
+                    and amendment_hash == prior_artifact_hash
+                ):
+                    gate = {
+                        "enabled": True,
+                        "passed": False,
+                        "artifact_sha256": amendment_hash,
+                        "pass_count": 0,
+                        "required_passes": int(gate_config.get("required_passes", 1)),
+                        "fail_closed": True,
+                        "deterministic_blockers": [
+                            "The amendment is byte-identical to the rejected artifact; a fresh corrected artifact is required."
+                        ],
+                        "reviewers": [],
+                    }
+                    amendment_gate_name = f"gate-{amendment_round}.json"
+                    store.write_json(amendment_gate_name, gate)
+                    store.mark_stage(f"gate-{amendment_round}", "rejected", amendment_gate_name)
+                else:
+                    gate = self._review_artifact(
+                        task, synthesis, profile, budget, store, mechanical_evidence, amendment_round
+                    )
 
             status = "completed" if gate.get("passed") else "rejected"
-            handoff = build_handoff(synthesis, store.run_id, gate, profile.get("execution", {}))
-            ledger = budget.snapshot()
-            store.write_json("ledger.json", ledger)
+            ledger = store.write_budget_snapshot(budget)
+            handoff = build_handoff(
+                synthesis,
+                store.run_id,
+                gate,
+                profile.get("execution", {}),
+                profile_name=selected_profile_name,
+                judge=judgment,
+                ledger=ledger,
+                budgets=profile.get("budgets", {}),
+                gates=profile.get("gates", {}),
+                native_codex=self.config.get("native_codex", {}),
+            )
             store.write_json("execution-handoff.json", handoff)
             panel_metadata = store.read_json("panel.json") if store.exists("panel.json") else {"results": reports}
             result = FusionResult(
@@ -526,11 +933,11 @@ class FusionOrchestrator:
             store.finish(status)
             return result
         except RunAborted:
-            store.write_json("ledger.json", budget.snapshot())
+            store.write_budget_snapshot(budget)
             store.finish("aborted")
             raise
         except Exception:
-            store.write_json("ledger.json", budget.snapshot())
+            store.write_budget_snapshot(budget)
             store.finish("failed")
             raise
 
@@ -546,13 +953,44 @@ class FusionOrchestrator:
         if not task.strip() or not artifact.strip():
             raise ConfigError("Gate task and artifact must not be empty")
         profile = active_profile(self.config, profile_name)
+        self._assert_external_provider_access(profile)
+        selected_profile_name = str(profile_name or self.config.get("active_profile", ""))
+        self._bind_selected_profile(selected_profile_name)
         composite_task = task + "\n\nARTIFACT-SHA256:" + text_hash(artifact)
-        store = RunStore(composite_task, self.config, run_id)
+        store = RunStore(
+            composite_task,
+            self.config,
+            run_id,
+            input_identity={
+                "operation": "adversarial_gate",
+                "task": task,
+                "artifact_sha256": text_hash(artifact),
+                "mechanical_evidence": mechanical_evidence,
+                "profile_name": selected_profile_name,
+            },
+        )
         budget = BudgetTracker(profile.get("budgets", {}))
-        gate = self._review_artifact(task, artifact, profile, budget, store, mechanical_evidence, 0)
-        store.write_json("ledger.json", budget.snapshot())
-        store.finish("completed" if gate.get("passed") else "rejected")
-        return {"run_id": store.run_id, "artifacts_dir": str(store.directory), "gate": gate, "ledger": budget.snapshot()}
+        if store.exists("ledger.json"):
+            budget.restore(store.read_json("ledger.json"))
+        store.check_kill()
+        try:
+            gate = self._review_artifact(task, artifact, profile, budget, store, mechanical_evidence, 0)
+            ledger = store.write_budget_snapshot(budget)
+            store.finish("completed" if gate.get("passed") else "rejected")
+            return {
+                "run_id": store.run_id,
+                "artifacts_dir": str(store.directory),
+                "gate": gate,
+                "ledger": ledger,
+            }
+        except RunAborted:
+            store.write_budget_snapshot(budget)
+            store.finish("aborted")
+            raise
+        except Exception:
+            store.write_budget_snapshot(budget)
+            store.finish("failed")
+            raise
 
     def run_status(self, run_id: str) -> Dict[str, Any]:
         if not run_id.replace("-", "").isalnum():

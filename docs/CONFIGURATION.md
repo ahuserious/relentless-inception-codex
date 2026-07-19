@@ -4,7 +4,7 @@ Relentless Inception ships with a strict `maximum_intelligence` profile: indepen
 
 The configuration is intentionally complete and displayable. Use the MCP configuration tools or edit a small user override; do not edit the shipped default because plugin upgrades may replace it.
 
-Configuration spans two enforcement layers. The MCP runtime directly enforces provider enablement, model calls and fallbacks, retries/circuits, concurrency, liveness and quality floors, identity hiding, strict judge/verdict schemas, artifact hashes, reviewer quorum, amendment count, core budgets, atomic state, resume, and kill checks. The active Codex skill enforces workspace-sensitive policies: evidence collection, path redaction before egress, named plan/pre/post/final checkpoints, projected-spend approval, native-agent selection, execution sandbox/approval behavior, tests, diff review, and shipping criteria. A field under `native_codex`, `privacy`, `evidence`, gate `stages`, execution, or shipping policy does not grant the MCP subprocess new Codex permissions. Fields such as `fallback_seats` and adaptive specialist strategy are available to the host workflow; the runtime itself performs model fallbacks and bounded synthesis amendments, not arbitrary cross-provider seat spawning.
+Configuration spans two enforcement layers. The MCP runtime directly enforces provider enablement, model calls and fallbacks, retries/circuits, concurrency, liveness and quality floors, identity hiding, strict judge/verdict schemas, artifact hashes, synthesis-review quorum, amendment count, core budgets, atomic state, resume, and kill checks. The active Codex skill owns workspace-sensitive lifecycle stages: it assembles each stage's named evidence, invokes `adversarial_gate` for enabled plan, pre-execution, post-execution, final, and summarize gates, retains same-artifact receipts, and blocks progress on failure. It also enforces path redaction before egress, projected-spend approval, native-agent selection, execution sandbox/approval behavior, tests, diff review, and shipping criteria. A field under `native_codex`, `privacy`, `evidence`, gate `stages`, execution, or shipping policy does not grant the MCP subprocess new Codex permissions. Fields such as `fallback_seats` and adaptive specialist strategy are available to the host workflow; the runtime itself performs model fallbacks and bounded synthesis amendments, not arbitrary cross-provider seat spawning.
 
 ## Files and precedence
 
@@ -25,6 +25,8 @@ The authoritative field catalog is [`plugins/relentless-inception/schemas/config
 - `config_validate` runs structural and cross-reference validation.
 
 `schema_version` must remain `1` for this release.
+
+Each profile also exposes one shared `objective`, used by the panel, judge, synthesizer, and reviewers as their optimization target. It is a model instruction, not execution authority: user scope, deterministic evidence, sandboxing, approvals, and fail-closed gates remain higher-order constraints. Panel and gate fan-out have separate `max_concurrency` controls, while every provider retains its own independent concurrency ceiling.
 
 ## Credentials
 
@@ -148,6 +150,8 @@ A seat is one fresh API request template. Important fields are:
 
 Temperature is `null` for the default reasoning seats. Do not use temperature as the primary diversity mechanism: benchmark results found that changing temperature did not remove correlated blind spots. Use different capable models, adversarial roles, and evidence bundles.
 
+`context_bundle` is a prompt lens in v0.1, not an egress or data-minimization boundary. Each seat still receives the context and evidence supplied to the run; `partition_context: true` tells the runtime to apply the named lens in that seat's instructions. When two seats must receive genuinely different material, the active Codex host must construct separately bounded arguments before provider submission.
+
 Fallback models should not have a higher unknown price than the seat's estimate. The shipped `maximum_intelligence` profile disables every model fallback so an unavailable requested model fails visibly instead of becoming a silent quality downgrade. The fallback lists remain displayable configuration: an operator can explicitly enable a cheaper Grok 4.3 or routed-model fallback in a less strict profile, with the requested and actual model retained in provenance.
 
 ## Fusion
@@ -165,7 +169,7 @@ The client path performs:
 4. a fresh strongest-seat generative synthesis using raw panel reports as primary evidence;
 5. independent verification.
 
-The following invariants are fixed true in schema because turning them off would no longer be this fusion method:
+The following controls are fixed true in schema because turning them off would no longer describe this fusion method:
 
 - independent first pass and initial-response preservation;
 - no majority vote or score averaging;
@@ -173,9 +177,11 @@ The following invariants are fixed true in schema because turning them off would
 - raw panels remain available to synthesis;
 - open-ended repeated debate is forbidden.
 
+The runtime preserves raw reports and requires judge fields for unique/minority insights, while judge, synthesis, and gate prompts prohibit vote-only selection and instruct models to retain supported minority evidence. These are prompt, schema, and artifact-preservation guarantees; they do not mechanically prove a model's internal decision rule or that it recognized every correct minority claim.
+
 The default requires two live responses but also sets `allow_degradation: false`. Consequently every required panel seat, and every optional seat that was actually enabled and launched, must return a valid response. `min_live_seats` remains useful for custom profiles, but it does not convert a missing configured seat into success under `maximum_intelligence`.
 
-`quality_floor` directly detects short/empty responses, leaked tool markup, and common unexplained boilerplate refusals; the active Codex evidence policy decides whether a longer report contains substantive claims. `adaptive_escalation` describes the host's bounded response to blind spots, contradictions, schema failures, empty responses, or mechanical failures. The runtime automatically performs only configured model fallbacks and bounded post-gate synthesis amendments; it does not invent or spawn an unlisted specialist seat.
+`quality_floor` directly checks panel, final synthesis, and native OpenRouter Fusion text for short/empty responses, leaked tool markup, and common unexplained boilerplate refusals. Judge and gate calls instead use strict JSON schemas. The active Codex evidence policy decides whether a longer report contains substantive claims. `adaptive_escalation` describes the host's bounded response to blind spots, contradictions, schema failures, empty responses, or mechanical failures. The runtime automatically performs only configured model fallbacks and bounded post-gate synthesis amendments; it does not invent or spawn an unlisted specialist seat.
 
 ### Native OpenRouter Fusion
 
@@ -196,34 +202,47 @@ Official references: [Fusion plugin](https://openrouter.ai/docs/guides/features/
 
 ## Adversarial gates
 
-The profile declares fail-closed plan, pre-execution, post-execution, final, and summarize checkpoints for the active Codex workflow. A full `fuse` call automatically gates its synthesized candidate once per amendment round, and `adversarial_gate` applies the same exact-hash reviewer contract to an explicitly supplied artifact. The active Codex skill invokes those tools at the other named checkpoints and supplies their required local evidence.
+The profile declares fail-closed plan, pre-execution, post-execution, final, and summarize checkpoints for the active Codex workflow. A full `fuse` call automatically gates only its synthesized candidate once per amendment round; that synthesis gate does not count as a plan or pre-execution receipt. `adversarial_gate` applies the same exact-hash reviewer contract to an explicitly supplied stage manifest. The active Codex skill invokes it separately for every enabled named checkpoint, verifies that every `required_evidence` item is present, and retains the stage name, artifact hash, gate run id, and verdict in host task state.
 
 Gate rules include:
 
 - two independent valid reviewer passes over the same artifact hash;
 - a confirmed mechanical failure blocks regardless of model agreement;
-- blind criteria require targeted review before pass;
-- malformed verdicts are failures;
+- any reviewer-reported blind spot blocks the current gate; the host must arrange targeted review and call the gate again rather than expecting the runtime to spawn a specialist;
+- malformed verdicts are rejected by the always-on fail-closed parser; `schema_failure_is_blocking: true` displays that invariant rather than enabling it;
 - the artifact author is excluded from independent review;
-- a failure can change to pass only through a fresh amendment reviewer checking the original blocking issues;
+- after synthesis-gate failure, amendment uses a fresh generation call, rejects a byte-identical candidate, and submits the replacement to fresh gate calls against the original blocking issues; this is structural independence, not proof that provider generations reasoned independently;
 - revision cycles are bounded.
+
+`allowed_verdicts` is the fixed `PASS`/`NEEDS_WORK`/`FAIL` vocabulary required by the strict schema, not a configurable subset. Reviewer persona, author exclusion, majority/minority handling, and criteria coverage are enforced through configured identity checks, prompt contracts, and output validation; the runtime cannot inspect or prove a model's hidden reasoning process.
 
 External gate seats have `tool_policy: "none"`. They evaluate supplied diffs, test output, provenance, and other evidence. The active Codex session runs local checks; a remote reviewer cannot truthfully claim it executed a repository command.
 
+Each named stage's `timeout_seconds` and `tool_policy` are host-owned workflow limits. The active skill enforces the deadline and checks that the configured reviewer seats' effective provider tools are no broader than the stage policy. Those fields do not dynamically rewrite provider or seat configuration inside an `adversarial_gate` call.
+
+Configuration validation rejects a required pre/post execution gate when the corresponding `gates.stages` entry or the gate system is disabled. It also rejects a `tool_policy: "none"` stage whose configured reviewer seat still enables provider tools, preventing a displayed lifecycle policy from being weaker in practice.
+
 ## Budgets
 
-Every profile exposes hard limits for:
+Every profile exposes controls for:
 
-- model calls;
-- aggregate, input, visible output, and reasoning tokens;
-- server-tool calls;
+- actual provider HTTP attempts, including each transport retry and model fallback;
+- aggregate input-plus-output token accounting, with reasoning and cached-token breakdowns;
+- provider-reported server-tool calls;
 - wall time;
-- total USD and per-provider USD;
-- user approval threshold;
-- warning fraction;
-- synthesis/gate budget reserve.
+- observed total USD and per-provider USD;
+- unknown-cost handling;
+- a host-only projected-spend approval threshold;
+- a known-USD warning fraction;
+- a synthesis/gate reserve drawn only from the `max_calls` attempt budget.
 
-The default hard stop is $100 per run and reserves 30% of the call budget for synthesis and gates. The `$25` approval threshold is a host-facing checkpoint: the active Codex skill must ask before projected spend crosses it because a noninteractive MCP server cannot open an approval prompt. These values are intentionally visible and user-configurable. Rescue cannot override a hard stop, and unknown cost is never treated as zero.
+These controls have two deliberately different enforcement points. `max_calls` is reserved atomically before each HTTP attempt, so `hard_stop` is a true pre-dispatch attempt ceiling even when panel workers run concurrently. Token, tool, wall-time, and dollar values are observed-response stop thresholds: after a response reaches or crosses one, blocking enforcement rejects every later dispatch. They cannot prevent that response—or other requests already in flight—from crossing the configured value. Provider-side request token limits remain the only way to bound one accepted generation before its usage is known.
+
+The aggregate token counter is `input + output`. Cached tokens are a detail already contained in input, and reasoning tokens are a detail already contained in output, so adding either again would double-count usage. The ledger preserves input, output, cached, and reasoning values separately; `max_reasoning_tokens` can stop on that output subset independently.
+
+The default sets a 40-attempt hard ceiling, a `$100` observed known-cost stop threshold, `unknown_cost_policy: "fail_closed"`, and reserves 30% of attempts for synthesis and gates. If a completed response has neither reported cost nor a configured estimate, it is recorded and all later dispatch stops. This still cannot retroactively cap that completed response. Selecting `unknown_cost_policy: "warn"` deliberately accepts incomplete dollar enforcement and surfaces a warning instead.
+
+`enforcement: "hard_stop"` blocks at the enforcement points above. `approval_then_hard_stop` also blocks; a noninteractive MCP process cannot approve its own overage, so the host must obtain approval and explicitly change configuration before a new matching run can proceed. `warn_only` records threshold warnings and continues, and therefore must not be described as a budget cap. The `$25` approval threshold is host-facing for the same reason. `warning_fraction` currently applies only to known observed USD cost, while unknown cost follows `unknown_cost_policy`. The reserve protects only HTTP attempts under `max_calls`; it does not reserve tokens, tools, wall time, or dollars. Rescue cannot override either blocking mode.
 
 OpenRouter native Fusion costs the parallel panel calls plus its comparative/final work in addition to the outer request. Increasing panel size scales cost approximately linearly. Benchmark scaling showed a typical quality knee around four strong samples and a plateau around seven, so the schema caps native Fusion at eight seats.
 
@@ -245,15 +264,17 @@ Raw visible provider responses **are persisted locally** because the synthesizer
 
 Do not select a metadata-only/non-resumable response mode until the runtime explicitly implements one. Deleting local run state does not delete provider logs.
 
+The `observability` object is a displayable host-export preference surface, not a second persistence backend. In v0.1, `enabled` and `write_jsonl_ledger` are fixed `false`: `artifact_directory`, `record_*`, reconciliation, and `content_logging` describe a possible host-managed export, but the MCP runtime does not consume them. The runtime always writes its canonical atomic JSON manifest, response artifacts, and budget ledger under the private runtime data directory. This distinction keeps an attractive export setting from silently weakening resume, gate integrity, or budget accounting.
+
 ## Evidence
 
-Evidence policy controls source quality, citation verification, deterministic code checks, command/exit-code recording, test output, input/output hashes, minimum source count, and treatment of unverifiable claims.
+Evidence policy tells the active Codex host how to collect source material, verify citations, run deterministic code checks, record command/test evidence, enforce minimum source count, and treat unverifiable claims before it calls the plugin. The MCP runtime itself enforces the fixed input/output hashing and raw-panel preservation invariants; the configurable evidence keys do not cause the subprocess to browse, inspect the workspace, or run tests.
 
 Self-reported model confidence is disabled because it is not calibrated across providers. Mechanical evidence and verified sources outrank confidence or vote count. Supported minority findings remain attached to their evidence through judge, synthesis, gate, and execution handoff.
 
 ## Rescue
 
-Transport retry and semantic rescue are separate. The runtime enforces bounded transport retries, model fallbacks, semantic response validation, and a per-provider circuit breaker. The host workflow interprets `fallback_seats`, targeted specialist strategy, and human-handoff thresholds:
+Transport retry and semantic rescue are separate. Provider `max_retries` is the adapter's HTTP-attempt ceiling; `backoff_initial_seconds` and `backoff_max_seconds` delay those HTTP transport retries when rescue is enabled. With `rescue.enabled: true`, the runtime also applies explicit same-seat model fallback, router fallback controls, the optional native-Fusion-to-client fallback, and a per-provider circuit breaker. `fallback_on` is the runtime allowlist of semantic categories eligible for local model fallback, additionally requiring the seat's `allow_model_fallbacks`; it does not launch `fallback_seats`. With rescue disabled, bounded provider transport retries remain but receive no rescue delay, and all configured model/router/Fusion fallback plus circuit breaking are disabled. Semantic response validation and sanitized failure preservation are mandatory fail-closed invariants. The `retry_on` taxonomy, `retry_attempts`, `fallback_seats`, targeted specialist strategy, and human-handoff thresholds are host workflow policy rather than hidden autonomous loops:
 
 - retry the same route only for connection, timeout, rate-limit, or server errors;
 - use model/provider fallback for empty content, invalid schema, unsupported parameters, explicit policy refusal, context overflow, or provider-tool failure;
@@ -268,9 +289,15 @@ Transport retry and semantic rescue are separate. The runtime enforces bounded t
 
 The plugin's external seats deliberate. They do not execute.
 
-`native_codex` records host preferences such as executor model, reasoning effort, reviewer models, parallelism, and whether pre/post gates are mandatory. `profiles.<name>.execution` defines the handoff contract: fused-plan requirement, sandbox request, user approvals, unrelated-change preservation, tests, diff review, bounded repair cycles, and completion evidence.
+`native_codex` records host preferences such as whether native delegation is enabled, executor/reviewer models, named reviewer roles, reasoning-only role boundaries, parallelism, workspace-context inheritance, and required fusion/post-execution review. `reviewer_roles` selects installed Codex agent roles whose own TOML chooses the provider and model; the shipped default requests `grok45_reviewer`, while `reasoning_only_roles` prevents the locally tested xAI role from being mistaken for a tool-capable worker. The host checks that a named role exists and has passed its compatibility smoke test before using it, otherwise it reports the unavailable role and may use the listed native reviewer models. The complete object is copied into and hash-bound with each handoff; it does not itself spawn an agent or override live Codex limits. `profiles.<name>.execution` defines the remainder of the handoff contract: fused-plan requirement, sandbox request, user approvals, unrelated-change preservation, tests, diff review, bounded repair cycles, completion evidence, and the exact `handoff_include` sections.
 
-This is `host_handoff`, not an MCP provider. The plugin cannot impersonate or programmatically spawn a native Codex agent. The active Codex task decides whether to delegate, applies its live sandbox and approval policy, and remains responsible for every workspace or external mutation.
+`execution.completion_requires` is likewise a list of obligations for the active Codex host. The MCP FusionResult copies it into the packet but does not verify those outcomes or mark them complete; Codex must satisfy them before reporting task success.
+
+Every persisted schema-v2 handoff freezes and hashes the complete packet: `selected_profile`, execution and native-agent settings, selected evidence, lifecycle state, synthesis receipt, and exact instruction. A later `execute-handoff` command uses only that snapshot, requires the separately reviewed `--expected-payload-sha256`, and rejects any mismatch; changing `active_profile` cannot silently swap its profile, model, sandbox, timeout, approval posture, or evidence. The packet also retains narrower execution-contract hashes for precise diagnostics. These unkeyed hashes detect mismatch and bind resume/dispatch behavior; they are not a signature against an attacker who can rewrite both the private run directory and the independently supplied expected hash. `handoff_include` selects `fused_plan`, `constraints`, `minority_findings`, `blind_spots`, `required_checks`, and `budget_remaining`. If `require_fused_plan` is true but `fused_plan` is omitted, the runtime deliberately emits a blocked packet.
+
+Readiness is intentionally strict. `ready_for_host_workflow` means the MCP synthesis gate passed and Codex may begin host-side lifecycle review. `ready` and `mutation_authorized` remain false while an enabled plan or pre-execution stage is listed in `lifecycle.pending_gates`. Post-execution, final, and summarize stages appear in `lifecycle.later_gates`; they are completion obligations and therefore do not create the circular requirement that work pass a post-execution gate before it can begin. The active task records passing host receipts rather than rewriting the historical packet.
+
+The default is `codex_handoff`, not an MCP provider. The plugin cannot impersonate or programmatically spawn a native Codex agent. The active Codex task decides whether to delegate, applies its live sandbox and approval policy, and remains responsible for every workspace or external mutation. Optional `codex_cli` mode is separately disabled by `allow_recursive_codex_cli: false`; even when enabled it requires explicit command confirmation and refuses packets with pending host gates.
 
 External models may never write the workspace. Destructive actions and external writes require the same user authorization they would require without fusion.
 

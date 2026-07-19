@@ -32,13 +32,13 @@ The major configuration groups are:
 - `secret_env_files`: paths to approved owner-only static credential files used to bridge API keys into the plugin subprocess without putting secret values in plugin configuration;
 - `providers`: transport type, base URL, endpoint paths, credential environment-variable name, timeouts, retry policy, storage, headers, and model discovery;
 - `seats`: provider, exact model id, reasoning effort, output limit, price hints, fallback policy, and provider-routing preferences;
-- `native_codex`: host-handoff preferences, preferred executor/reviewer models, suggested concurrency, and required pre/post gates; these are instructions for the Codex host, not MCP authority to spawn agents;
+- `native_codex`: host-handoff preferences, preferred executor/reviewer models, named reviewer roles whose agent TOMLs choose provider/model, reasoning-only role boundaries, suggested concurrency, and required pre/post gates; these are instructions for the Codex host, not MCP authority to spawn agents;
 - `profiles`: named end-to-end policies, each containing `fusion`, `gates`, `budgets`, `privacy`, `evidence`, `rescue`, `execution`, and `observability` sections;
 - `active_profile`: the profile used when a tool call does not override it.
 
 Use `config_schema` to discover any additional settings added by the installed version.
 
-Some settings necessarily span enforcement layers. The MCP runtime enforces provider calls, response schemas, panel liveness, reviewer hashes/quorum, core budgets, run hashes, and kill checks. The active Codex skill enforces workspace scope, path selection/redaction before egress, mechanical test collection, execution approvals, and native-agent handoff. Observability and retention settings describe what local artifacts the runtime records. Do not imply that a declarative host policy gives the MCP server new Codex permissions.
+Some settings necessarily span enforcement layers. The MCP runtime enforces provider calls, response schemas, panel liveness, the synthesis reviewer hashes/quorum, core budgets, run hashes, mandatory private response/provenance persistence, and kill checks. The active Codex skill separately invokes every enabled plan, pre-execution, post-execution, final, and summarize stage with its configured `required_evidence`; those host-owned stages are not automatically completed by `fuse`. It also enforces workspace scope, path selection/redaction before egress, mechanical test collection, execution approvals, and native-agent handoff. In v0.1 the `observability` object is a disabled host-export preference surface, not an alternate runtime logger; canonical private run state is always written. Do not imply that a declarative host policy gives the MCP server new Codex permissions.
 
 ## Safe mutation workflow
 
@@ -46,7 +46,7 @@ For each requested change:
 
 1. Show the current value with `config_get`.
 2. Explain behavioral, cost, and privacy impact.
-3. If the change adds data egress, raises a hard budget, permits degradation, or changes native Codex files, obtain explicit confirmation.
+3. If the change adds data egress, changes a provider `base_url`, raises a hard budget, permits degradation, or changes native Codex files, obtain explicit confirmation. A base-URL change sends that provider entry's credential and selected task material to the new origin.
 4. Call `config_set` for the smallest dotted-path change accepted by the tool schema.
 5. Call `config_validate`.
 6. Call `doctor`.
@@ -92,7 +92,7 @@ A high-quality profile should:
 - avoid using the artifact author's exact model instance as its only reviewer or synthesizer;
 - set `min_live_seats` high enough that provider failure cannot turn a consortium into a single opinion;
 - preserve minority findings and require targeted re-review of blind spots;
-- configure hard limits for calls, total tokens, wall time, and dollars;
+- configure an atomic hard attempt ceiling plus observed-response stop thresholds for total tokens, wall time, tools, and dollars;
 - make degradation opt-in and visible.
 
 Do not promise that more seats always improve quality. Additional seats increase cost and can add correlated noise; use capability diversity and evidence coverage as the reason for each seat.
@@ -112,16 +112,16 @@ Explain these choices when present in the schema:
 
 ## Native Codex opt-in setup
 
-Only offer native setup when the user explicitly wants Grok or another provider to run as a true Codex subagent with Codex-managed tools and sandboxing.
+Only offer native setup when the user explicitly wants Grok or another provider to run as a true Codex subagent. A native role may be reasoning-only; it has Codex-managed tools only when the installed provider/tool loop has actually passed compatibility tests.
 
 1. Show the relevant `examples/native-codex-*.toml.example` files.
 2. Explain that provider definitions must be merged into user-level `~/.codex/config.toml`; project config cannot override machine-local provider/auth settings.
 3. Explain that custom agent files belong under `~/.codex/agents/` or a trusted project's `.codex/agents/`.
 4. Keep reviewer agents read-only and keep `[agents].max_depth = 1` unless recursive delegation is deliberately required.
 5. Ask before writing either path.
-6. After setup, restart or reload Codex and smoke-test a response plus a streamed two-turn tool-call continuation.
+6. After setup, restart or reload Codex and smoke-test a text response. Before exposing any tool, separately pass a streamed two-turn function-call/output continuation.
 
-Native xAI/OpenRouter/trusted-router compatibility is protocol-level and version-sensitive. If the smoke test fails, use the model as an external MCP panelist instead of claiming native Codex support.
+Native xAI/OpenRouter/trusted-router compatibility is protocol-level and version-sensitive. On the locally tested Codex 0.145/xAI combination, Grok 4.5 works only as a hardened single-turn reasoning reviewer: disable web search, shell, plugins/apps, skill/tool features, and every inherited MCP server, and give the role a complete immutable evidence packet. The first function call can execute but its result continuation fails, so never ask that role to inspect, retrieve, execute, or mutate. If the text smoke test fails too, use the model only as an external MCP panelist.
 
 ## Finish
 
@@ -131,7 +131,7 @@ Return:
 - provider and seat matrix with requested model, effort, enabled state, and credential env name;
 - judge and synthesizer;
 - gate policy;
-- hard budgets;
+- the attempt ceiling, observed-usage stop thresholds, enforcement mode, and unknown-cost policy;
 - storage/retention settings;
 - doctor and provider-test results;
 - any unverified or degraded capability.

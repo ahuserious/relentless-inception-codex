@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .errors import ConfigError, ProviderError
 from .types import ModelResponse, Usage
@@ -25,10 +25,47 @@ JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IG
 ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+class _ClassifiedProviderError(ProviderError):
+    """Internal provider failure carrying a conservative fallback category."""
+
+    def __init__(self, category: str, message: str) -> None:
+        super().__init__(message)
+        self.category = category
+
+
 def _safe_error_text(value: str, limit: int = 800) -> str:
     value = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+", r"\1<redacted>", value)
     value = re.sub(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"']+", r"\1<redacted>", value)
     return value[:limit]
+
+
+def _failure_category(error: ProviderError) -> str:
+    category = getattr(error, "category", "unclassified")
+    return str(category) if isinstance(category, str) and category else "unclassified"
+
+
+def _response_failure_category(value: Any) -> str:
+    normalized = str(value).lower()
+    if any(marker in normalized for marker in ("context length", "context window", "context_overflow")):
+        return "context_overflow"
+    if any(marker in normalized for marker in ("content_filter", "policy refusal", "safety policy")):
+        return "policy_refusal"
+    if any(marker in normalized for marker in ("unsupported parameter", "unknown parameter", "not supported")):
+        return "unsupported_parameters"
+    return "unclassified"
+
+
+def _http_failure_category(status: int, body: str) -> str:
+    response_category = _response_failure_category(body)
+    if response_category != "unclassified":
+        return response_category
+    if status == 408:
+        return "timeout"
+    if status == 429:
+        return "rate_limit"
+    if status >= 500:
+        return "server_error"
+    return "unclassified"
 
 
 def parse_json_object(text: str) -> Dict[str, Any]:
@@ -53,10 +90,21 @@ def parse_json_object(text: str) -> Dict[str, Any]:
 
 
 def _extract_responses_text(payload: Mapping[str, Any]) -> str:
+    status = payload.get("status")
+    if status is not None and status != "completed":
+        incomplete_details = payload.get("incomplete_details") or payload.get("error")
+        detail = ""
+        if incomplete_details is not None:
+            detail = f": {_safe_error_text(json.dumps(incomplete_details, ensure_ascii=False, default=str))}"
+        raise _ClassifiedProviderError(
+            _response_failure_category(incomplete_details),
+            f"Responses provider returned non-completed status {status!r}{detail}",
+        )
     direct = payload.get("output_text")
     if isinstance(direct, str) and direct.strip():
         return direct.strip()
     fragments: List[str] = []
+    refusals: List[str] = []
     output = payload.get("output")
     if isinstance(output, list):
         for item in output:
@@ -71,21 +119,42 @@ def _extract_responses_text(payload: Mapping[str, Any]) -> str:
                 text = part.get("text")
                 if isinstance(text, str) and part.get("type") in {"output_text", "text", None}:
                     fragments.append(text)
+                refusal = part.get("refusal")
+                if part.get("type") == "refusal" and isinstance(refusal, str) and refusal.strip():
+                    refusals.append(refusal.strip())
     text = "\n".join(fragment.strip() for fragment in fragments if fragment.strip()).strip()
     if not text:
-        raise ProviderError("Provider returned HTTP success but no usable text")
+        if refusals:
+            raise _ClassifiedProviderError(
+                "policy_refusal",
+                f"Provider returned a policy refusal: {_safe_error_text(' '.join(refusals))}",
+            )
+        raise _ClassifiedProviderError("empty_response", "Provider returned HTTP success but no usable text")
     return text
 
 
 def _extract_chat_text(payload: Mapping[str, Any]) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
-        raise ProviderError("Provider returned HTTP success without choices")
+        raise _ClassifiedProviderError("schema_invalid", "Provider returned HTTP success without choices")
     first = choices[0]
     if not isinstance(first, Mapping):
-        raise ProviderError("Provider returned a malformed first choice")
+        raise _ClassifiedProviderError("schema_invalid", "Provider returned a malformed first choice")
+    finish_reason = first.get("finish_reason")
+    if finish_reason not in (None, "stop"):
+        category = "policy_refusal" if finish_reason == "content_filter" else "unclassified"
+        raise _ClassifiedProviderError(
+            category,
+            f"Chat provider returned non-terminal or truncated finish reason {finish_reason!r}",
+        )
     message = first.get("message", {})
     content = message.get("content") if isinstance(message, Mapping) else None
+    refusal = message.get("refusal") if isinstance(message, Mapping) else None
+    if isinstance(refusal, str) and refusal.strip():
+        raise _ClassifiedProviderError(
+            "policy_refusal",
+            f"Chat provider returned a policy refusal: {_safe_error_text(refusal.strip())}",
+        )
     if isinstance(content, str) and content.strip():
         return content.strip()
     if isinstance(content, list):
@@ -93,7 +162,7 @@ def _extract_chat_text(payload: Mapping[str, Any]) -> str:
         text = "\n".join(fragment for fragment in fragments if isinstance(fragment, str)).strip()
         if text:
             return text
-    raise ProviderError("Provider returned HTTP success but an empty completion")
+    raise _ClassifiedProviderError("empty_response", "Provider returned HTTP success but an empty completion")
 
 
 def _usage_from_payload(payload: Mapping[str, Any]) -> Usage:
@@ -102,13 +171,26 @@ def _usage_from_payload(payload: Mapping[str, Any]) -> Usage:
         return Usage(tool_calls=_count_tool_calls(payload))
     input_details = raw_usage.get("input_tokens_details") or raw_usage.get("prompt_tokens_details") or {}
     output_details = raw_usage.get("output_tokens_details") or raw_usage.get("completion_tokens_details") or {}
+    reported_cost = raw_usage.get("cost")
+    cost_ticks = raw_usage.get("cost_in_usd_ticks")
+    if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool):
+        cost_usd: Optional[float] = float(reported_cost)
+    elif isinstance(cost_ticks, (int, float)) and not isinstance(cost_ticks, bool):
+        cost_usd = float(cost_ticks) / 10_000_000_000
+    else:
+        cost_usd = None
+    tool_call_counts = [_count_tool_calls(payload)]
+    for field_name in ("tool_calls", "num_server_side_tools_used"):
+        field_value = raw_usage.get(field_name)
+        if isinstance(field_value, (int, float)) and not isinstance(field_value, bool):
+            tool_call_counts.append(max(0, int(field_value)))
     return Usage(
         input_tokens=int(raw_usage.get("input_tokens") or raw_usage.get("prompt_tokens") or 0),
         output_tokens=int(raw_usage.get("output_tokens") or raw_usage.get("completion_tokens") or 0),
         reasoning_tokens=int(output_details.get("reasoning_tokens") or 0) if isinstance(output_details, Mapping) else 0,
         cached_tokens=int(input_details.get("cached_tokens") or 0) if isinstance(input_details, Mapping) else 0,
-        tool_calls=int(raw_usage.get("tool_calls") or _count_tool_calls(payload)),
-        cost_usd=float(raw_usage["cost"]) if isinstance(raw_usage.get("cost"), (int, float)) else None,
+        tool_calls=max(tool_call_counts),
+        cost_usd=cost_usd,
     )
 
 
@@ -123,6 +205,42 @@ def _count_tool_calls(payload: Mapping[str, Any]) -> int:
         and isinstance(item.get("type"), str)
         and (str(item["type"]).endswith("_call") or str(item["type"]) in {"web_search", "x_search", "code_interpreter"})
     )
+
+
+def _openrouter_route(payload: Mapping[str, Any], headers: Mapping[str, str]) -> Dict[str, Any]:
+    normalized_headers = {str(key).lower(): value for key, value in headers.items()}
+    current_generation_id = normalized_headers.get("x-generation-id")
+    legacy_generation_id = normalized_headers.get("x-openrouter-generation-id")
+    route: Dict[str, Any] = {
+        "openrouter_generation_id": current_generation_id or legacy_generation_id,
+        "openrouter_legacy_generation_id": legacy_generation_id,
+        "openrouter_provider": normalized_headers.get("x-openrouter-provider"),
+    }
+
+    metadata = payload.get("openrouter_metadata")
+    if metadata is not None:
+        # Router metadata is explicitly additive. Preserve the full JSON value so
+        # new fields remain available without making response parsing brittle.
+        route["openrouter_metadata"] = copy.deepcopy(metadata)
+    if isinstance(metadata, Mapping):
+        endpoints = metadata.get("endpoints")
+        available = endpoints.get("available") if isinstance(endpoints, Mapping) else None
+        if isinstance(available, list):
+            selected_endpoints = [
+                endpoint
+                for endpoint in available
+                if isinstance(endpoint, Mapping) and endpoint.get("selected") is True
+            ]
+            if len(selected_endpoints) == 1:
+                selected_endpoint = selected_endpoints[0]
+                selected_provider = selected_endpoint.get("provider")
+                selected_model = selected_endpoint.get("model")
+                if isinstance(selected_provider, str) and selected_provider:
+                    route["openrouter_selected_provider"] = selected_provider
+                    route.setdefault("openrouter_provider", selected_provider)
+                if isinstance(selected_model, str) and selected_model:
+                    route["openrouter_selected_model"] = selected_model
+    return {key: value for key, value in route.items() if value is not None}
 
 
 def _calculate_cost(usage: Usage, seat: Mapping[str, Any]) -> Optional[float]:
@@ -150,21 +268,29 @@ def _calculate_cost(usage: Usage, seat: Mapping[str, Any]) -> Optional[float]:
         return None
     uncached_input = max(0, usage.input_tokens - usage.cached_tokens)
     cached_cost = usage.cached_tokens * float(cached_rate or 0) / 1_000_000
-    return round(uncached_input * float(input_rate) / 1_000_000 + cached_cost + usage.output_tokens * float(output_rate) / 1_000_000, 8)
+    return (
+        uncached_input * float(input_rate) / 1_000_000
+        + cached_cost
+        + usage.output_tokens * float(output_rate) / 1_000_000
+    )
 
 
 class ProviderRegistry:
     """Create requests from config and normalize every provider response."""
 
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(self, config: Mapping[str, Any], profile_name: Optional[str] = None) -> None:
         self.config = config
         self._secret_values = self._load_secret_files(config)
         profiles = config.get("profiles", {})
-        selected_profile = profiles.get(config.get("active_profile"), {}) if isinstance(profiles, Mapping) else {}
-        self._rescue = selected_profile.get("rescue", {}) if isinstance(selected_profile, Mapping) else {}
-        if not isinstance(self._rescue, Mapping) or self._rescue.get("enabled", True) is not True:
-            self._rescue = {}
+        selected_profile_name = profile_name if profile_name is not None else config.get("active_profile")
+        selected_profile = profiles.get(selected_profile_name, {}) if isinstance(profiles, Mapping) else {}
+        configured_rescue = selected_profile.get("rescue", {}) if isinstance(selected_profile, Mapping) else {}
+        self._rescue_enabled = bool(
+            isinstance(configured_rescue, Mapping) and configured_rescue.get("enabled", True) is True
+        )
+        self._rescue = dict(configured_rescue) if self._rescue_enabled else {}
         self._circuit_lock = threading.Lock()
+        self._transport_state = threading.local()
         self._provider_failures: Dict[str, int] = {}
         self._provider_open_until: Dict[str, float] = {}
         self._semaphores: Dict[str, threading.BoundedSemaphore] = {}
@@ -255,13 +381,12 @@ class ProviderRegistry:
             headers["anthropic-version"] = str(provider.get("anthropic_version", "2023-06-01"))
         else:
             headers["Authorization"] = f"Bearer {api_key}"
-        configured_headers = provider.get("headers", {})
-        if isinstance(configured_headers, Mapping):
-            headers.update({str(key): str(value) for key, value in configured_headers.items()})
         header_env = provider.get("header_env", {})
         if isinstance(header_env, Mapping):
             for header_name, environment_name in header_env.items():
-                environment_value = os.environ.get(str(environment_name))
+                environment_value = os.environ.get(str(environment_name)) or self._secret_values.get(
+                    str(environment_name)
+                )
                 if environment_value:
                     headers[str(header_name)] = environment_value
         if provider.get("router_metadata", False):
@@ -281,47 +406,150 @@ class ProviderRegistry:
             source = "owner_only_file"
         return {"credential_env": environment_name, "credential_present": source != "missing", "credential_source": source}
 
+    def _reset_transport_failures(self) -> None:
+        self._transport_state.failures = []
+
+    def _safe_provider_error_text(self, value: str, provider: Mapping[str, Any]) -> str:
+        redacted = value
+        environment_names: List[str] = []
+        api_key_environment = provider.get("api_key_env")
+        if isinstance(api_key_environment, str) and api_key_environment:
+            environment_names.append(api_key_environment)
+        header_environment = provider.get("header_env", {})
+        if isinstance(header_environment, Mapping):
+            environment_names.extend(
+                str(environment_name)
+                for environment_name in header_environment.values()
+                if environment_name
+            )
+        for environment_name in environment_names:
+            secret = os.environ.get(environment_name) or self._secret_values.get(environment_name)
+            if secret:
+                redacted = redacted.replace(secret, "<redacted>")
+        return _safe_error_text(redacted)
+
+    def _record_transport_failure(
+        self,
+        *,
+        attempt: int,
+        error: ProviderError,
+        provider: Mapping[str, Any],
+        status: Optional[int] = None,
+    ) -> None:
+        failure: Dict[str, Any] = {
+            "attempt": attempt,
+            "category": _failure_category(error),
+            "error": self._safe_provider_error_text(str(error), provider),
+        }
+        if status is not None:
+            failure["status"] = status
+        failures = getattr(self._transport_state, "failures", None)
+        if not isinstance(failures, list):
+            failures = []
+            self._transport_state.failures = failures
+        failures.append(failure)
+
+    def _consume_transport_failures(self) -> List[Dict[str, Any]]:
+        failures = getattr(self._transport_state, "failures", [])
+        self._transport_state.failures = []
+        if not isinstance(failures, list):
+            return []
+        return copy.deepcopy(failures)
+
     def _post_json(
         self,
         url: str,
         payload: Mapping[str, Any],
         provider: Mapping[str, Any],
+        *,
+        before_attempt: Optional[Callable[[], None]] = None,
     ) -> Tuple[Dict[str, Any], Mapping[str, str], float]:
+        self._reset_transport_failures()
         request = urllib.request.Request(
             url,
             data=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
             headers=self._headers(provider),
             method="POST",
         )
-        timeout_seconds = float(provider.get("timeout_seconds", provider.get("request_timeout_seconds", 600)))
-        retry_count = int(provider.get("retries", provider.get("max_retries", 2)))
+        timeout_seconds = float(provider.get("request_timeout_seconds", 600))
+        retry_count = int(provider.get("max_retries", 2))
         configured_retry_statuses = provider.get("retry_statuses", RETRYABLE_HTTP_STATUS)
         retryable_statuses = set(configured_retry_statuses) if isinstance(configured_retry_statuses, list) else RETRYABLE_HTTP_STATUS
         started = time.monotonic()
         last_error: Optional[Exception] = None
         for attempt in range(retry_count + 1):
+            if before_attempt is not None:
+                before_attempt()
             try:
                 with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl.create_default_context()) as response:
                     response_bytes = response.read()
                     response_headers = dict(response.headers.items())
                 decoded = json.loads(response_bytes.decode("utf-8"))
                 if not isinstance(decoded, dict):
-                    raise ProviderError("Provider response root was not an object")
+                    raise _ClassifiedProviderError(
+                        "schema_invalid", "Provider response root was not an object"
+                    )
                 return decoded, response_headers, time.monotonic() - started
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                last_error = ProviderError(f"Provider HTTP {exc.code}: {_safe_error_text(body)}")
+                last_error = _ClassifiedProviderError(
+                    _http_failure_category(exc.code, body),
+                    f"Provider HTTP {exc.code}: {self._safe_provider_error_text(body, provider)}",
+                )
                 if exc.code not in retryable_statuses or attempt >= retry_count:
                     raise last_error from exc
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-                last_error = ProviderError(f"Provider transport failure: {_safe_error_text(str(exc))}")
+                self._record_transport_failure(
+                    attempt=attempt + 1,
+                    error=_ClassifiedProviderError(
+                        _failure_category(last_error),
+                        f"Provider HTTP {exc.code}",
+                    ),
+                    provider=provider,
+                    status=exc.code,
+                )
+            except json.JSONDecodeError as exc:
+                last_error = _ClassifiedProviderError(
+                    "schema_invalid",
+                    f"Provider returned malformed JSON: {_safe_error_text(str(exc))}",
+                )
                 if attempt >= retry_count:
                     raise last_error from exc
-            initial_backoff = float(self._rescue.get("backoff_initial_seconds", 1.0)) if isinstance(self._rescue, Mapping) else 1.0
-            max_backoff = float(self._rescue.get("backoff_max_seconds", 8.0)) if isinstance(self._rescue, Mapping) else 8.0
-            jitter = random.random() if not isinstance(self._rescue, Mapping) or self._rescue.get("jitter", True) else 0.0
-            backoff = min(max_backoff, initial_backoff * (2**attempt) + jitter)
-            time.sleep(backoff)
+                self._record_transport_failure(
+                    attempt=attempt + 1,
+                    error=last_error,
+                    provider=provider,
+                )
+            except TimeoutError as exc:
+                last_error = _ClassifiedProviderError(
+                    "timeout",
+                    f"Provider transport failure: {self._safe_provider_error_text(str(exc), provider)}",
+                )
+                if attempt >= retry_count:
+                    raise last_error from exc
+                self._record_transport_failure(
+                    attempt=attempt + 1,
+                    error=last_error,
+                    provider=provider,
+                )
+            except (urllib.error.URLError, OSError) as exc:
+                last_error = _ClassifiedProviderError(
+                    "connection_error",
+                    f"Provider transport failure: {self._safe_provider_error_text(str(exc), provider)}",
+                )
+                if attempt >= retry_count:
+                    raise last_error from exc
+                self._record_transport_failure(
+                    attempt=attempt + 1,
+                    error=last_error,
+                    provider=provider,
+                )
+            if self._rescue_enabled:
+                initial_backoff = float(self._rescue.get("backoff_initial_seconds", 1.0))
+                max_backoff = float(self._rescue.get("backoff_max_seconds", 8.0))
+                jitter = random.random() if self._rescue.get("jitter", True) else 0.0
+                backoff = min(max_backoff, initial_backoff * (2**attempt) + jitter)
+                if backoff > 0:
+                    time.sleep(backoff)
         raise last_error or ProviderError("Provider request failed")
 
     def _response_schema(self, name: str, schema: Mapping[str, Any], provider_type: str) -> Dict[str, Any]:
@@ -342,6 +570,7 @@ class ProviderRegistry:
         prompt: str,
         response_schema: Optional[Mapping[str, Any]] = None,
         schema_name: str = "structured_response",
+        before_attempt: Optional[Callable[[], None]] = None,
     ) -> ModelResponse:
         seats = self.config.get("seats", {})
         seat = seats.get(seat_name) if isinstance(seats, Mapping) else None
@@ -361,11 +590,24 @@ class ProviderRegistry:
                 self._provider_open_until.pop(provider_name, None)
                 self._provider_failures[provider_name] = 0
         provider_type = str(provider.get("type"))
-        requested_models = [str(seat.get("model"))]
+        original_requested_model = str(seat.get("model"))
+        requested_models = [original_requested_model]
         fallbacks = seat.get("fallback_models", [])
-        if isinstance(fallbacks, list):
+        configured_fallback_categories = self._rescue.get("fallback_on", [])
+        fallback_categories = (
+            {str(category) for category in configured_fallback_categories}
+            if isinstance(configured_fallback_categories, list)
+            else set()
+        )
+        allow_model_fallbacks = (
+            self._rescue_enabled
+            and seat.get("allow_model_fallbacks", False) is True
+            and bool(fallback_categories)
+        )
+        if allow_model_fallbacks and isinstance(fallbacks, list):
             requested_models.extend(str(model) for model in fallbacks if model)
         errors: List[str] = []
+        failed_attempts: List[Dict[str, str]] = []
         semaphore = self._semaphores.setdefault(provider_name, threading.BoundedSemaphore(2))
         with semaphore:
             for model in requested_models:
@@ -380,13 +622,32 @@ class ProviderRegistry:
                         prompt,
                         response_schema,
                         schema_name,
+                        before_attempt,
                     )
                     with self._circuit_lock:
                         self._provider_failures[provider_name] = 0
+                    response.requested_model = original_requested_model
+                    if failed_attempts:
+                        response.route = dict(response.route)
+                        response.route["model_fallback"] = {
+                            "used": model != original_requested_model,
+                            "original_requested_model": original_requested_model,
+                            "selected_model": model,
+                            "failed_attempts": copy.deepcopy(failed_attempts),
+                        }
                     return response
                 except ProviderError as exc:
-                    errors.append(f"{model}: {exc}")
-                    if seat.get("allow_model_fallbacks", False) is not True:
+                    category = _failure_category(exc)
+                    sanitized_error = _safe_error_text(str(exc))
+                    failed_attempts.append(
+                        {
+                            "model": model,
+                            "category": category,
+                            "error": sanitized_error,
+                        }
+                    )
+                    errors.append(f"{model}: {sanitized_error}")
+                    if not allow_model_fallbacks or category not in fallback_categories:
                         break
         with self._circuit_lock:
             failure_count = self._provider_failures.get(provider_name, 0) + 1
@@ -408,13 +669,47 @@ class ProviderRegistry:
         prompt: str,
         response_schema: Optional[Mapping[str, Any]],
         schema_name: str,
+        before_attempt: Optional[Callable[[], None]],
     ) -> ModelResponse:
+        # A transport call can report its successful retry history through this
+        # thread-local slot. Reset here as well so mocked transports and failures
+        # in downstream response parsing cannot leak provenance into another call.
+        self._reset_transport_failures()
+        transport_failures: List[Dict[str, Any]] = []
         effective_provider = dict(provider)
         if seat.get("timeout_seconds") is not None:
             effective_provider["request_timeout_seconds"] = seat["timeout_seconds"]
         effort = seat.get("reasoning_effort")
+        reasoning_max_tokens = seat.get("reasoning_max_tokens")
         max_tokens = int(seat.get("max_output_tokens", 8192))
         temperature = seat.get("temperature")
+        provider_capabilities = provider.get("capabilities", {})
+        if (
+            effort not in (None, "none") or reasoning_max_tokens is not None
+        ) and isinstance(provider_capabilities, Mapping) and provider_capabilities.get("reasoning") is False:
+            raise ConfigError("Seat requests reasoning but provider capabilities.reasoning=false")
+        if (
+            response_schema is not None
+            and isinstance(provider_capabilities, Mapping)
+            and provider_capabilities.get("structured_outputs") is False
+        ):
+            raise ConfigError("Structured response requested but provider capabilities.structured_outputs=false")
+        tool_policy = str(seat.get("tool_policy", "none"))
+        if tool_policy not in {"none", "provider_server_tools"}:
+            raise ConfigError(f"Unsupported seat tool_policy: {tool_policy!r}")
+        if tool_policy == "none" and seat.get("first_tool_required", False):
+            raise ConfigError("first_tool_required requires tool_policy 'provider_server_tools'")
+        if tool_policy == "provider_server_tools" and provider_type not in {"xai_responses", "openai_responses"}:
+            raise ConfigError(
+                "provider_server_tools is implemented only for xAI/OpenAI Responses adapters"
+            )
+        server_tools = seat.get("server_tools", [])
+        if tool_policy == "provider_server_tools":
+            provider_capabilities = provider.get("capabilities", {})
+            if isinstance(provider_capabilities, Mapping) and provider_capabilities.get("tools") is False:
+                raise ConfigError("provider_server_tools requires provider capabilities.tools=true")
+            if not isinstance(server_tools, list) or not server_tools:
+                raise ConfigError("provider_server_tools requires at least one configured server tool")
         if provider_type in {"xai_responses", "openai_responses"}:
             payload: Dict[str, Any] = {
                 "model": model,
@@ -425,8 +720,13 @@ class ProviderRegistry:
             }
             if effort not in (None, "none"):
                 payload["reasoning"] = {"effort": effort}
-            server_tools = seat.get("server_tools", [])
-            if isinstance(server_tools, list) and server_tools:
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if reasoning_max_tokens is not None:
+                raise ConfigError(
+                    "reasoning_max_tokens is supported only by chat providers using the reasoning object"
+                )
+            if tool_policy == "provider_server_tools":
                 normalized_tools: List[Dict[str, Any]] = []
                 for tool in server_tools:
                     if isinstance(tool, str):
@@ -444,8 +744,12 @@ class ProviderRegistry:
                 payload.update(self._response_schema(schema_name, response_schema, provider_type))
             suffix = str(provider.get("responses_path", "/responses"))
             response_payload, headers, latency = self._post_json(
-                self._endpoint(str(provider["base_url"]), suffix), payload, effective_provider
+                self._endpoint(str(provider["base_url"]), suffix),
+                payload,
+                effective_provider,
+                before_attempt=before_attempt,
             )
+            transport_failures = self._consume_transport_failures()
             text = _extract_responses_text(response_payload)
         elif provider_type in {"openai_compatible_chat", "openrouter_chat", "openrouter_fusion"}:
             payload = {
@@ -458,9 +762,21 @@ class ProviderRegistry:
             }
             if temperature is not None:
                 payload["temperature"] = temperature
-            if effort not in (None, "none"):
-                reasoning_field = str(provider.get("reasoning_field", "reasoning"))
-                payload[reasoning_field] = {"effort": effort} if reasoning_field == "reasoning" else effort
+            reasoning_field = str(provider.get("reasoning_field", "reasoning"))
+            if reasoning_field == "reasoning":
+                reasoning: Dict[str, Any] = {}
+                if effort not in (None, "none"):
+                    reasoning["effort"] = effort
+                if reasoning_max_tokens is not None:
+                    reasoning["max_tokens"] = int(reasoning_max_tokens)
+                if reasoning:
+                    payload["reasoning"] = reasoning
+            elif effort not in (None, "none"):
+                payload[reasoning_field] = effort
+            elif reasoning_max_tokens is not None:
+                raise ConfigError(
+                    "reasoning_max_tokens requires a provider with reasoning_field='reasoning'"
+                )
             provider_routing: Dict[str, Any] = {}
             configured_preferences = provider.get("provider_preferences")
             if isinstance(configured_preferences, Mapping):
@@ -468,11 +784,23 @@ class ProviderRegistry:
             seat_routing = seat.get("provider_routing")
             if isinstance(seat_routing, Mapping):
                 provider_routing.update(seat_routing)
+            if not self._rescue_enabled and (
+                provider_type in {"openrouter_chat", "openrouter_fusion"}
+                or "allow_fallbacks" in provider_routing
+            ):
+                # OpenRouter enables provider failover by default, so disabling
+                # rescue must explicitly turn it off even when config omitted it.
+                provider_routing["allow_fallbacks"] = False
             provider_routing = {key: value for key, value in provider_routing.items() if value not in (None, [], {})}
             if provider_routing:
                 payload["provider"] = provider_routing
             models = seat.get("router_model_fallbacks")
-            if isinstance(models, list) and models:
+            if (
+                self._rescue_enabled
+                and seat.get("allow_model_fallbacks", False) is True
+                and isinstance(models, list)
+                and models
+            ):
                 payload["models"] = [model, *[str(value) for value in models]]
             if response_schema:
                 payload.update(self._response_schema(schema_name, response_schema, provider_type))
@@ -496,10 +824,18 @@ class ProviderRegistry:
                 payload["tool_choice"] = "required"
             suffix = str(provider.get("chat_path", "/chat/completions"))
             response_payload, headers, latency = self._post_json(
-                self._endpoint(str(provider["base_url"]), suffix), payload, effective_provider
+                self._endpoint(str(provider["base_url"]), suffix),
+                payload,
+                effective_provider,
+                before_attempt=before_attempt,
             )
+            transport_failures = self._consume_transport_failures()
             text = _extract_chat_text(response_payload)
         elif provider_type == "anthropic_messages":
+            if reasoning_max_tokens is not None:
+                raise ConfigError(
+                    "reasoning_max_tokens is not supported with Anthropic adaptive thinking"
+                )
             payload = {
                 "model": model,
                 "system": system,
@@ -512,32 +848,52 @@ class ProviderRegistry:
                 payload["thinking"] = {"type": "adaptive"}
             suffix = str(provider.get("messages_path", "/messages"))
             response_payload, headers, latency = self._post_json(
-                self._endpoint(str(provider["base_url"]), suffix), payload, effective_provider
+                self._endpoint(str(provider["base_url"]), suffix),
+                payload,
+                effective_provider,
+                before_attempt=before_attempt,
             )
+            transport_failures = self._consume_transport_failures()
+            stop_reason = response_payload.get("stop_reason")
+            if stop_reason not in (None, "end_turn", "stop_sequence"):
+                category = "policy_refusal" if stop_reason == "refusal" else "unclassified"
+                raise _ClassifiedProviderError(
+                    category,
+                    f"Anthropic returned non-terminal or truncated stop reason {stop_reason!r}",
+                )
             content = response_payload.get("content")
             if not isinstance(content, list):
-                raise ProviderError("Anthropic response did not contain a content array")
+                raise _ClassifiedProviderError(
+                    "schema_invalid", "Anthropic response did not contain a content array"
+                )
             fragments = [part.get("text", "") for part in content if isinstance(part, Mapping) and part.get("type") == "text"]
             text = "\n".join(fragment for fragment in fragments if isinstance(fragment, str) and fragment.strip()).strip()
             if not text:
-                raise ProviderError("Anthropic returned HTTP success but no usable text")
+                raise _ClassifiedProviderError(
+                    "empty_response", "Anthropic returned HTTP success but no usable text"
+                )
         else:
             raise ConfigError(f"Unsupported provider type: {provider_type}")
 
         if len(text.strip()) < int(seat.get("minimum_response_characters", 1)):
-            raise ProviderError("Provider response failed the configured semantic minimum length")
+            raise _ClassifiedProviderError(
+                "empty_response", "Provider response failed the configured semantic minimum length"
+            )
         usage = _usage_from_payload(response_payload)
+        if seat.get("first_tool_required", False) is True and usage.tool_calls < 1:
+            raise _ClassifiedProviderError(
+                "tool_failure",
+                "Provider returned without the required server-tool call",
+            )
         usage.cost_usd = _calculate_cost(usage, seat)
         actual_model = str(response_payload.get("model") or model)
         request_id = response_payload.get("id")
-        route = {
-            "openrouter_generation_id": headers.get("x-openrouter-generation-id"),
-            "openrouter_provider": headers.get("x-openrouter-provider"),
-        }
+        route = _openrouter_route(response_payload, headers)
+        if transport_failures:
+            route["transport_failures"] = transport_failures
         citations = response_payload.get("citations")
         if isinstance(citations, list):
             route["citations"] = [citation for citation in citations if isinstance(citation, (str, Mapping))]
-        route = {key: value for key, value in route.items() if value}
         return ModelResponse(
             text=text,
             provider=provider_name,
@@ -554,7 +910,7 @@ class ProviderRegistry:
         provider = self._provider(provider_name)
         url = self._endpoint(str(provider["base_url"]), str(provider.get("models_path", "/models")))
         request = urllib.request.Request(url, headers=self._headers(provider), method="GET")
-        timeout_seconds = float(provider.get("timeout_seconds", provider.get("request_timeout_seconds", 60)))
+        timeout_seconds = float(provider.get("request_timeout_seconds", 60))
         try:
             with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl.create_default_context()) as response:
                 payload = json.loads(response.read().decode("utf-8"))

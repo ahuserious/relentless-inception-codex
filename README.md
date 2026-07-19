@@ -4,12 +4,12 @@ Relentless Inception is a Codex-native plugin for bounded multi-model deliberati
 
 The default pipeline is:
 
-1. independent, identity-hidden model seats with distinct lenses and context bundles;
+1. independent, identity-hidden model seats with distinct persona/context lenses (the host must pre-partition material when seats need different data);
 2. deterministic evidence supplied by Codex or the user;
 3. a structured comparative judge that diagnoses rather than decides;
 4. a fresh strongest-model synthesis that must preserve supported minority findings;
 5. independent reviewers bound to the exact artifact SHA-256;
-6. a passing handoff to the active Codex session, which retains workspace, sandbox, and approval control.
+6. a persisted host-workflow packet whose enabled plan/pre-execution gates must pass before the active Codex session authorizes mutation.
 
 This is a new runtime-backed implementation inspired by [`ahuserious/relentless-inception-grok`](https://github.com/ahuserious/relentless-inception-grok), not a mechanical host rename. The source Grok plugin is principally an orchestration contract; this port implements the call graph, configuration enforcement, persistence, budgets, kill switch, resume semantics, structured gates, and Codex packaging in code.
 
@@ -17,7 +17,7 @@ This is a new runtime-backed implementation inspired by [`ahuserious/relentless-
 
 Version `0.1.0` is an alpha suitable for deliberate, cost-aware use. Direct xAI Grok 4.5, OpenAI Responses, Anthropic Messages, OpenRouter, OpenRouter native Fusion, and generic OpenAI-compatible/TrustedRouter transports are supported. External API seats can use provider-hosted tools when explicitly configured, but they never receive Codex filesystem access.
 
-Codex plugins currently do not auto-register plugin-owned native agents. The bundled skills coordinate native Codex reviewers/executors through the active host when available; opt-in TOML templates are included for personal agent/provider setup.
+Codex plugins currently do not auto-register plugin-owned native agents. The bundled skills coordinate native Codex reviewers/executors through the active host when available; opt-in TOML templates are included for personal agent/provider setup. A local Codex 0.145 smoke test established a narrow native xAI path: Grok 4.5 can serve as a single-turn, reasoning-only reviewer when web search, shell, plugins/apps, inherited MCP servers, and other tool-producing features are disabled. It is not a tool-capable native worker on this build—the first shell request executed, but the function-result continuation failed with an xAI compaction-blob error. The plugin's external Grok 4.5/4.3 seats remain the operational path for fusion and xAI-hosted tools.
 
 ## Install from this checkout
 
@@ -59,7 +59,8 @@ For a shell-level diagnostic without installation:
 - Model outputs are untrusted data and are fenced in downstream prompts.
 - Panel, call, token, tool-call, provider-cost, total-cost, wall-time, and concurrency limits are enforced.
 - Maximum-intelligence mode fails closed on panel collapse, schema failure, gate failure, or budget exhaustion.
-- The ordinary execution backend is `active_codex`. Recursive `codex exec` is disabled unless both config and an explicit command confirmation enable it.
+- The ordinary execution backend is `active_codex`. Its packet freezes the selected profile and execution settings; enabled plan/pre-execution gates keep mutation readiness false until the visible host records their passing receipts.
+- Recursive `codex exec` is disabled unless both config and an explicit command confirmation enable it; it requires the separately reviewed schema-v2 packet hash and refuses pending host gates or any packet mismatch.
 - A global or per-run empty `KILL` file stops further calls.
 
 See [configuration](docs/CONFIGURATION.md), [architecture](docs/ARCHITECTURE.md), [providers](docs/PROVIDERS.md), [security](docs/SECURITY.md), and [design evidence](docs/DESIGN_EVIDENCE.md).

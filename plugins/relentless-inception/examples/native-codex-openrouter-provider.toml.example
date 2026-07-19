@@ -1,9 +1,11 @@
 # EXPERIMENTAL OPT-IN EXAMPLE — merge into user-level ~/.codex/config.toml.
 #
-# OpenRouter's Responses API is currently beta and stateless-only. A successful
-# text response does not prove that Codex's streamed tool continuation works.
-# Test the full tool loop on the installed Codex version before using this for a
-# native subagent. Otherwise keep OpenRouter models as external MCP panelists.
+# OpenRouter's Responses API is currently beta and stateless-only. Codex 0.145
+# custom providers advertise namespace tools, so the endpoint must support those
+# requests as well as streamed function-call continuation. A successful text
+# response does not prove either capability, and Chat Completions is no longer a
+# Codex wire fallback. Keep OpenRouter models as external MCP panelists unless the
+# complete native tool loop passes on the installed versions.
 
 [model_providers.openrouter_ri]
 name = "OpenRouter Responses (Relentless Inception)"

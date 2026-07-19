@@ -28,17 +28,28 @@ from .providers import ProviderRegistry
 
 
 def doctor(config: Mapping[str, Any]) -> Dict[str, Any]:
-    registry = ProviderRegistry(config)
+    validation_errors = validate_config(config)
+    configured_providers = config.get("providers", {})
+    if not isinstance(configured_providers, Mapping):
+        configured_providers = {}
+    try:
+        registry: Optional[ProviderRegistry] = ProviderRegistry(config)
+    except (RelentlessInceptionError, OSError, TypeError, ValueError):
+        registry = None
     providers: Dict[str, Any] = {}
-    for name, provider in config.get("providers", {}).items():
-        credential_status = registry.credential_status(name) if isinstance(provider, Mapping) else {}
+    for name, provider in configured_providers.items():
+        credential_status = (
+            registry.credential_status(str(name))
+            if registry is not None and isinstance(provider, Mapping)
+            else {}
+        )
         providers[name] = {
             "enabled": bool(provider.get("enabled", True)) if isinstance(provider, Mapping) else False,
             "type": provider.get("type") if isinstance(provider, Mapping) else None,
             **credential_status,
         }
     return {
-        "ok": not validate_config(config),
+        "ok": not validation_errors,
         "version": "0.1.0",
         "python": platform.python_version(),
         "plugin_root": str(PLUGIN_ROOT),
@@ -46,10 +57,10 @@ def doctor(config: Mapping[str, Any]) -> Dict[str, Any]:
         "user_config": str(user_config_path()),
         "user_config_exists": user_config_path().exists(),
         "active_profile": config.get("active_profile"),
-        "profiles": sorted(config.get("profiles", {})),
-        "seats": sorted(config.get("seats", {})),
+        "profiles": sorted(config.get("profiles", {})) if isinstance(config.get("profiles"), Mapping) else [],
+        "seats": sorted(config.get("seats", {})) if isinstance(config.get("seats"), Mapping) else [],
         "providers": providers,
-        "validation_errors": validate_config(config),
+        "validation_errors": validation_errors,
         "notes": [
             "Credential values are never displayed.",
             "Provider probes are opt-in because they can incur API cost.",
@@ -122,27 +133,63 @@ def build_parser() -> argparse.ArgumentParser:
     execute_parser = subparsers.add_parser("execute-handoff")
     execute_parser.add_argument("run_id")
     execute_parser.add_argument("--workdir", required=True)
+    execute_parser.add_argument("--expected-payload-sha256", required=True)
     execute_parser.add_argument("--confirm", action="store_true")
     return parser
 
 
 def dispatch(args: argparse.Namespace) -> Any:
-    config = load_config()
+    if args.command == "execute-handoff":
+        if not args.run_id.replace("-", "").isalnum():
+            raise RelentlessInceptionError("Invalid run_id")
+        handoff_path = runtime_data_dir() / "runs" / args.run_id / "execution-handoff.json"
+        if not handoff_path.exists():
+            raise RelentlessInceptionError(f"Run has no execution handoff: {args.run_id}")
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        if not isinstance(handoff, dict):
+            raise RelentlessInceptionError("Execution handoff must be a JSON object")
+        return execute_codex_cli(
+            handoff,
+            workdir=args.workdir,
+            confirmed=args.confirm,
+            expected_payload_sha256=args.expected_payload_sha256,
+        )
+
     if args.command == "config":
-        if args.config_command == "show":
-            return redact_config(config)
         if args.config_command == "schema":
             return load_schema()
-        if args.config_command == "get":
-            return {"path": args.path, "value": redact_config(deep_get(config, args.path))}
         if args.config_command == "set":
             updated = set_user_config(args.path, _json_value(args.value))
             return {"updated": args.path, "value": redact_config(deep_get(updated, args.path)), "config_path": str(user_config_path())}
+        config = load_config(validate=False)
+        if args.config_command == "show":
+            return redact_config(config)
+        if args.config_command == "get":
+            return {"path": args.path, "value": redact_config(deep_get(config, args.path))}
         if args.config_command == "validate":
             errors = validate_config(config)
             return {"ok": not errors, "errors": errors}
     if args.command == "doctor":
-        return doctor(config)
+        return doctor(load_config(validate=False))
+    if args.command == "status":
+        if not args.run_id.replace("-", "").isalnum():
+            raise RelentlessInceptionError("Invalid run_id")
+        manifest_path = runtime_data_dir() / "runs" / args.run_id / "manifest.json"
+        if not manifest_path.exists():
+            raise RelentlessInceptionError(f"Unknown run_id: {args.run_id}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise RelentlessInceptionError("Run manifest must be a JSON object")
+        return manifest
+    if args.command == "abort":
+        if not args.run_id.replace("-", "").isalnum():
+            raise RelentlessInceptionError("Invalid run_id")
+        kill_path = runtime_data_dir() / "runs" / args.run_id / "KILL"
+        if not kill_path.parent.is_dir():
+            raise RelentlessInceptionError(f"Unknown run_id: {args.run_id}")
+        kill_path.touch(exist_ok=True)
+        return {"aborted": args.run_id, "kill_file": str(kill_path), "recoverable": True}
+    config = load_config()
     if args.command == "provider":
         registry = ProviderRegistry(config)
         if args.provider_command == "models":
@@ -168,28 +215,6 @@ def dispatch(args: argparse.Namespace) -> Any:
             mechanical_evidence=args.evidence,
             profile_name=args.profile,
             run_id=args.resume,
-        )
-    if args.command == "status":
-        return orchestrator.run_status(args.run_id)
-    if args.command == "abort":
-        if not args.run_id.replace("-", "").isalnum():
-            raise RelentlessInceptionError("Invalid run_id")
-        kill_path = runtime_data_dir() / "runs" / args.run_id / "KILL"
-        if not kill_path.parent.is_dir():
-            raise RelentlessInceptionError(f"Unknown run_id: {args.run_id}")
-        kill_path.touch(exist_ok=True)
-        return {"aborted": args.run_id, "kill_file": str(kill_path), "recoverable": True}
-    if args.command == "execute-handoff":
-        result_path = runtime_data_dir() / "runs" / args.run_id / "result.json"
-        if not result_path.exists():
-            raise RelentlessInceptionError(f"Run has no completed result: {args.run_id}")
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-        profile = config["profiles"][config["active_profile"]]
-        return execute_codex_cli(
-            result["execution_handoff"],
-            profile.get("execution", {}),
-            workdir=args.workdir,
-            confirmed=args.confirm,
         )
     raise RelentlessInceptionError(f"Unsupported command: {args.command}")
 

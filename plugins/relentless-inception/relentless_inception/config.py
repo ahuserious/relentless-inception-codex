@@ -8,6 +8,7 @@ import json
 import os
 import re
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
@@ -17,8 +18,18 @@ from .errors import ConfigError
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PLUGIN_ROOT / "config" / "default.json"
 CONFIG_SCHEMA_PATH = PLUGIN_ROOT / "schemas" / "config.schema.json"
-SECRET_KEY_PATTERN = re.compile(r"(^|_)(api_?key|token|secret|password)($|_)", re.IGNORECASE)
+SECRET_KEY_PATTERN = re.compile(r"(^|[_-])(api[_-]?key|token|secret|password)($|[_-])", re.IGNORECASE)
 SAFE_SECRET_REFERENCE_SUFFIXES = ("_env", "_file_env", "_env_files")
+JUDGE_FIELD_NAMES = {
+    "consensus",
+    "contradictions",
+    "partial_coverage",
+    "unique_insights",
+    "minority_findings",
+    "blind_spots",
+    "verification_priorities",
+    "final_guidance",
+}
 
 
 def runtime_data_dir() -> Path:
@@ -96,14 +107,166 @@ def _required_string(mapping: Mapping[str, Any], key: str, path: str, errors: Li
         errors.append(f"{path}.{key} must be a non-empty string")
 
 
-def validate_config(config: Mapping[str, Any]) -> List[str]:
-    """Validate invariants not safely expressible through a dependency-free JSON Schema check."""
+def _json_equal(left: Any, right: Any) -> bool:
+    return json.dumps(left, sort_keys=True, separators=(",", ":")) == json.dumps(
+        right, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _schema_type_matches(value: Any, expected_type: str) -> bool:
+    if expected_type == "null":
+        return value is None
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "object":
+        return isinstance(value, Mapping)
+    return False
+
+
+def _resolve_schema_reference(root_schema: Mapping[str, Any], reference: str) -> Mapping[str, Any]:
+    if not reference.startswith("#/"):
+        raise ConfigError(f"Unsupported external JSON Schema reference: {reference}")
+    current: Any = root_schema
+    for raw_segment in reference[2:].split("/"):
+        segment = raw_segment.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, Mapping) or segment not in current:
+            raise ConfigError(f"Broken JSON Schema reference: {reference}")
+        current = current[segment]
+    if not isinstance(current, Mapping):
+        raise ConfigError(f"JSON Schema reference does not resolve to an object: {reference}")
+    return current
+
+
+def _schema_errors(
+    value: Any,
+    schema: Mapping[str, Any],
+    root_schema: Mapping[str, Any],
+    path: str,
+) -> List[str]:
+    """Validate the dependency-free Draft 2020-12 subset used by config.schema.json."""
+
+    if "$ref" in schema:
+        return _schema_errors(value, _resolve_schema_reference(root_schema, str(schema["$ref"])), root_schema, path)
 
     errors: List[str] = []
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list):
+        branch_errors = [
+            _schema_errors(value, branch, root_schema, path)
+            for branch in one_of
+            if isinstance(branch, Mapping)
+        ]
+        passing_branches = sum(not branch for branch in branch_errors)
+        if passing_branches != 1:
+            errors.append(f"{path} must match exactly one allowed schema variant")
+            if passing_branches == 0:
+                concise_reasons = [branch[0] for branch in branch_errors if branch]
+                errors.extend(concise_reasons[:2])
+
+    expected_types = schema.get("type")
+    if isinstance(expected_types, str):
+        expected_types = [expected_types]
+    if isinstance(expected_types, list):
+        allowed_types = [str(item) for item in expected_types]
+        if not any(_schema_type_matches(value, expected_type) for expected_type in allowed_types):
+            return [f"{path} must have JSON type {' or '.join(allowed_types)}"]
+
+    if "const" in schema and not _json_equal(value, schema["const"]):
+        errors.append(f"{path} must equal {schema['const']!r}")
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and not any(_json_equal(value, candidate) for candidate in enum_values):
+        errors.append(f"{path} must be one of {enum_values!r}")
+
+    if isinstance(value, str):
+        minimum_length = schema.get("minLength")
+        if isinstance(minimum_length, int) and len(value) < minimum_length:
+            errors.append(f"{path} must contain at least {minimum_length} characters")
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str) and re.search(pattern, value) is None:
+            errors.append(f"{path} must match pattern {pattern!r}")
+        if schema.get("format") == "uri":
+            parsed = urllib.parse.urlparse(value)
+            if not parsed.scheme or not parsed.netloc:
+                errors.append(f"{path} must be an absolute URI")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        exclusive_maximum = schema.get("exclusiveMaximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            errors.append(f"{path} must be >= {minimum}")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            errors.append(f"{path} must be <= {maximum}")
+        if isinstance(exclusive_minimum, (int, float)) and value <= exclusive_minimum:
+            errors.append(f"{path} must be > {exclusive_minimum}")
+        if isinstance(exclusive_maximum, (int, float)) and value >= exclusive_maximum:
+            errors.append(f"{path} must be < {exclusive_maximum}")
+
+    if isinstance(value, list):
+        minimum_items = schema.get("minItems")
+        maximum_items = schema.get("maxItems")
+        if isinstance(minimum_items, int) and len(value) < minimum_items:
+            errors.append(f"{path} must contain at least {minimum_items} items")
+        if isinstance(maximum_items, int) and len(value) > maximum_items:
+            errors.append(f"{path} must contain at most {maximum_items} items")
+        if schema.get("uniqueItems") is True:
+            encoded_items = [json.dumps(item, sort_keys=True, separators=(",", ":")) for item in value]
+            if len(encoded_items) != len(set(encoded_items)):
+                errors.append(f"{path} must not contain duplicate items")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, Mapping):
+            for index, item in enumerate(value):
+                errors.extend(_schema_errors(item, item_schema, root_schema, f"{path}[{index}]"))
+
+    if isinstance(value, Mapping):
+        minimum_properties = schema.get("minProperties")
+        if isinstance(minimum_properties, int) and len(value) < minimum_properties:
+            errors.append(f"{path} must contain at least {minimum_properties} properties")
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            for required_key in required:
+                if required_key not in value:
+                    errors.append(f"{path}.{required_key} is required")
+        property_names = schema.get("propertyNames")
+        if isinstance(property_names, Mapping):
+            for key in value:
+                errors.extend(_schema_errors(str(key), property_names, root_schema, f"{path}.<property-name>"))
+        properties = schema.get("properties", {})
+        if not isinstance(properties, Mapping):
+            properties = {}
+        additional_properties = schema.get("additionalProperties", True)
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            child_schema = properties.get(key)
+            if isinstance(child_schema, Mapping):
+                errors.extend(_schema_errors(child, child_schema, root_schema, child_path))
+            elif additional_properties is False:
+                errors.append(f"{child_path} is not an allowed configuration property")
+            elif isinstance(additional_properties, Mapping):
+                errors.extend(_schema_errors(child, additional_properties, root_schema, child_path))
+    return errors
+
+
+def validate_config(config: Mapping[str, Any]) -> List[str]:
+    """Validate the shipped schema and cross-reference invariants without third-party packages."""
+
+    schema = load_schema()
+    errors = _schema_errors(config, schema, schema, "config")
     if config.get("schema_version") != 1:
         errors.append("schema_version must be 1")
 
     for path, key, value in _walk(config):
+        if ".header_env." in f".{path}.":
+            continue
         if _is_plaintext_secret_key(key) and value not in (None, "", False):
             errors.append(f"{path} looks like a plaintext secret; store only an environment-variable name")
 
@@ -134,7 +297,7 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
             errors.append(f"{path} must be an object")
             continue
         provider_type = provider.get("type")
-        if provider_type not in supported_provider_types:
+        if not isinstance(provider_type, str) or provider_type not in supported_provider_types:
             errors.append(f"{path}.type must be one of {sorted(supported_provider_types)}")
         _required_string(provider, "base_url", path, errors)
         api_key_env = provider.get("api_key_env")
@@ -142,12 +305,6 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
             errors.append(f"{path}.api_key_env must name an environment variable")
         if provider_type == "xai_responses" and provider.get("store", False) is not False:
             errors.append(f"{path}.store must be false by default; explicitly override only with informed consent")
-        literal_headers = provider.get("headers", {})
-        if isinstance(literal_headers, Mapping):
-            for header_name in literal_headers:
-                if str(header_name).lower() in {"authorization", "x-api-key", "api-key", "proxy-authorization"}:
-                    errors.append(f"{path}.headers must not contain credential header {header_name!r}; use api_key_env/header_env")
-
     allowed_efforts = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
     for seat_name, seat in seats.items():
         path = f"seats.{seat_name}"
@@ -155,20 +312,88 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
             errors.append(f"{path} must be an object")
             continue
         provider_name = seat.get("provider")
-        if provider_name not in providers:
+        provider_is_known = isinstance(provider_name, str) and provider_name in providers
+        if not provider_is_known:
             errors.append(f"{path}.provider references unknown provider {provider_name!r}")
         _required_string(seat, "model", path, errors)
         effort = seat.get("reasoning_effort")
-        if effort is not None and effort not in allowed_efforts:
+        if effort is not None and (not isinstance(effort, str) or effort not in allowed_efforts):
             errors.append(f"{path}.reasoning_effort is unsupported")
-        if provider_name in providers and providers[provider_name].get("type") == "xai_responses":
+        reasoning_max_tokens = seat.get("reasoning_max_tokens")
+        provider = providers.get(provider_name) if provider_is_known else None
+        provider_type = provider.get("type") if isinstance(provider, Mapping) else None
+        provider_capabilities = provider.get("capabilities", {}) if isinstance(provider, Mapping) else {}
+        if reasoning_max_tokens is not None:
+            if effort not in (None, "none"):
+                errors.append(
+                    f"{path}.reasoning_max_tokens cannot be combined with reasoning_effort; set reasoning_effort='none'"
+                )
+            if not isinstance(provider_type, str) or provider_type not in {
+                "openrouter_chat",
+                "openrouter_fusion",
+                "openai_compatible_chat",
+            }:
+                errors.append(
+                    f"{path}.reasoning_max_tokens is supported only by compatible chat providers"
+                )
+            elif isinstance(provider, Mapping) and provider.get("reasoning_field", "reasoning") != "reasoning":
+                errors.append(
+                    f"{path}.reasoning_max_tokens requires provider reasoning_field='reasoning'"
+                )
+        if (
+            effort not in (None, "none") or reasoning_max_tokens is not None
+        ) and isinstance(provider_capabilities, Mapping) and provider_capabilities.get("reasoning") is False:
+            errors.append(f"{path} requests reasoning but its provider declares capabilities.reasoning=false")
+        if provider_type == "xai_responses":
             model_name = str(seat.get("model", ""))
             valid_xai_efforts = {"low", "medium", "high"} if model_name.startswith("grok-4.5") else {"none", "low", "medium", "high"}
-            if effort not in valid_xai_efforts:
+            if not isinstance(effort, str) or effort not in valid_xai_efforts:
                 errors.append(f"{path}.reasoning_effort for {model_name or 'this xAI model'} must be one of {sorted(valid_xai_efforts)}")
+        tool_policy = seat.get("tool_policy")
+        if seat.get("first_tool_required") is True and tool_policy != "provider_server_tools":
+            errors.append(f"{path}.first_tool_required requires tool_policy='provider_server_tools'")
+        if tool_policy == "provider_server_tools":
+            if not isinstance(provider_type, str) or provider_type not in {
+                "xai_responses",
+                "openai_responses",
+            }:
+                errors.append(
+                    f"{path}.tool_policy='provider_server_tools' is implemented only for xAI/OpenAI Responses providers"
+                )
+            server_tools = seat.get("server_tools")
+            if not isinstance(server_tools, list) or not server_tools:
+                errors.append(f"{path}.server_tools must be non-empty when provider_server_tools is enabled")
+            if isinstance(provider_capabilities, Mapping) and provider_capabilities.get("tools") is False:
+                errors.append(f"{path}.tool_policy requires provider capabilities.tools=true")
+        fallback_seats = seat.get("fallback_seats", [])
+        if isinstance(fallback_seats, list):
+            for fallback_seat_name in fallback_seats:
+                if not isinstance(fallback_seat_name, str) or fallback_seat_name not in seats:
+                    errors.append(f"{path}.fallback_seats references unknown seat {fallback_seat_name!r}")
+        structured_output_by_role = {
+            "panel": "panel_report",
+            "judge": "judge_analysis",
+            "synthesizer": "final_answer",
+            "verifier": "gate_verdict",
+        }
+        role = seat.get("role")
+        expected_output = structured_output_by_role.get(role) if isinstance(role, str) else None
+        if expected_output and seat.get("structured_output") != expected_output:
+            errors.append(
+                f"{path}.structured_output must be {expected_output!r} for role {role!r}"
+            )
+        if (
+            isinstance(role, str)
+            and role in {"judge", "verifier"}
+            and isinstance(provider_capabilities, Mapping)
+            and provider_capabilities.get("structured_outputs") is False
+        ):
+            errors.append(
+                f"{path} role {role!r} requires provider capabilities.structured_outputs=true"
+            )
 
     active_profile = config.get("active_profile")
-    if active_profile not in profiles:
+    if not isinstance(active_profile, str) or active_profile not in profiles:
         errors.append(f"active_profile references unknown profile {active_profile!r}")
     for profile_name, profile in profiles.items():
         path = f"profiles.{profile_name}"
@@ -184,12 +409,55 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
             errors.append(f"{path}.fusion.panel must be a non-empty array")
             panel = []
         for seat_name in panel:
-            if seat_name not in seats:
+            if not isinstance(seat_name, str) or seat_name not in seats:
                 errors.append(f"{path}.fusion.panel references unknown seat {seat_name!r}")
+        optional_panel = fusion.get("optional_panel", [])
+        if isinstance(optional_panel, list):
+            for seat_name in optional_panel:
+                if not isinstance(seat_name, str) or seat_name not in seats:
+                    errors.append(f"{path}.fusion.optional_panel references unknown seat {seat_name!r}")
         for role_key in ("judge", "synthesizer"):
             seat_name = fusion.get(role_key)
-            if seat_name not in seats:
+            if not isinstance(seat_name, str) or seat_name not in seats:
                 errors.append(f"{path}.fusion.{role_key} references unknown seat {seat_name!r}")
+        engine = fusion.get("engine")
+        native_fusion = fusion.get("native_openrouter_fusion", {})
+        native_enabled = isinstance(native_fusion, Mapping) and native_fusion.get("enabled") is True
+        if native_enabled != (engine == "openrouter_native"):
+            errors.append(
+                f"{path}.fusion.native_openrouter_fusion.enabled must be true exactly when engine='openrouter_native'"
+            )
+        if engine == "openrouter_native":
+            native_seat_name = fusion.get("native_fusion_seat")
+            native_seat = (
+                seats.get(native_seat_name, {})
+                if isinstance(native_seat_name, str) and native_seat_name in seats
+                else {}
+            )
+            native_provider_name = native_seat.get("provider") if isinstance(native_seat, Mapping) else None
+            native_provider = (
+                providers.get(native_provider_name, {})
+                if isinstance(native_provider_name, str) and native_provider_name in providers
+                else {}
+            )
+            if not isinstance(native_seat, Mapping) or native_seat.get("enabled", True) is not True:
+                errors.append(f"{path}.fusion.native_fusion_seat must reference an enabled seat")
+            if not isinstance(native_provider, Mapping) or native_provider.get("type") != "openrouter_fusion":
+                errors.append(f"{path}.fusion.native_fusion_seat must use an openrouter_fusion provider")
+        synthesizer_name = fusion.get("synthesizer")
+        synthesizer = (
+            seats.get(synthesizer_name, {})
+            if isinstance(synthesizer_name, str) and synthesizer_name in seats
+            else {}
+        )
+        if (
+            fusion.get("separate_no_tools_synthesis_turn") is True
+            and isinstance(synthesizer, Mapping)
+            and synthesizer.get("tool_policy") != "none"
+        ):
+            errors.append(
+                f"{path}.fusion.separate_no_tools_synthesis_turn requires synthesizer seat {synthesizer_name!r} to use tool_policy='none'"
+            )
         min_live = fusion.get("min_live_seats", 1)
         if not isinstance(min_live, int) or min_live < 1:
             errors.append(f"{path}.fusion.min_live_seats must be an integer >= 1")
@@ -197,7 +465,20 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
             errors.append(f"{path}.fusion.min_live_seats cannot exceed panel length")
         max_concurrency = fusion.get("max_concurrency", 1)
         if not isinstance(max_concurrency, int) or not 1 <= max_concurrency <= 16:
-            errors.append(f"{path}.fusion.max_concurrency must be between 1 and 16")
+                errors.append(f"{path}.fusion.max_concurrency must be between 1 and 16")
+        judge_required_fields = fusion.get("judge_required_fields", [])
+        if isinstance(judge_required_fields, list):
+            unsupported_judge_fields = sorted(
+                {
+                    field_name
+                    for field_name in judge_required_fields
+                    if isinstance(field_name, str) and field_name not in JUDGE_FIELD_NAMES
+                }
+            )
+            if unsupported_judge_fields:
+                errors.append(
+                    f"{path}.fusion.judge_required_fields contains unsupported fields {unsupported_judge_fields}"
+                )
 
         gates = profile.get("gates", {})
         if isinstance(gates, Mapping) and gates.get("enabled"):
@@ -206,13 +487,58 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
                 errors.append(f"{path}.gates.reviewers must be non-empty when gates are enabled")
             else:
                 for seat_name in reviewers:
-                    if seat_name not in seats:
+                    if not isinstance(seat_name, str) or seat_name not in seats:
                         errors.append(f"{path}.gates.reviewers references unknown seat {seat_name!r}")
             required_passes = gates.get("required_passes", 1)
             if not isinstance(required_passes, int) or required_passes < 1:
                 errors.append(f"{path}.gates.required_passes must be >= 1")
             elif isinstance(reviewers, list) and required_passes > len(reviewers):
                 errors.append(f"{path}.gates.required_passes cannot exceed reviewer count")
+            stages = gates.get("stages", {})
+            if isinstance(stages, Mapping) and isinstance(reviewers, list):
+                for stage_name, stage in stages.items():
+                    if not isinstance(stage, Mapping) or stage.get("enabled") is not True:
+                        continue
+                    if stage.get("tool_policy") == "none":
+                        for reviewer_name in reviewers:
+                            reviewer = (
+                                seats.get(reviewer_name, {})
+                                if isinstance(reviewer_name, str) and reviewer_name in seats
+                                else {}
+                            )
+                            if isinstance(reviewer, Mapping) and reviewer.get("tool_policy") != "none":
+                                errors.append(
+                                    f"{path}.gates.stages.{stage_name}.tool_policy='none' requires "
+                                    f"reviewer seat {reviewer_name!r} to use tool_policy='none'"
+                                )
+
+        execution = profile.get("execution", {})
+        if isinstance(execution, Mapping):
+            stages = gates.get("stages", {}) if isinstance(gates, Mapping) else {}
+            pre_execution_stage = stages.get("pre_execution", {}) if isinstance(stages, Mapping) else {}
+            post_execution_stage = stages.get("post_execution", {}) if isinstance(stages, Mapping) else {}
+            if execution.get("require_pre_execution_gate") is True and (
+                not isinstance(gates, Mapping)
+                or gates.get("enabled") is not True
+                or not isinstance(pre_execution_stage, Mapping)
+                or pre_execution_stage.get("enabled") is not True
+            ):
+                errors.append(
+                    f"{path}.execution.require_pre_execution_gate requires an enabled gates.stages.pre_execution stage"
+                )
+            if execution.get("require_post_execution_gate") is True and (
+                not isinstance(gates, Mapping)
+                or gates.get("enabled") is not True
+                or not isinstance(post_execution_stage, Mapping)
+                or post_execution_stage.get("enabled") is not True
+            ):
+                errors.append(
+                    f"{path}.execution.require_post_execution_gate requires an enabled gates.stages.post_execution stage"
+                )
+            if execution.get("allow_recursive_codex_cli") is True and execution.get("mode") != "codex_cli":
+                errors.append(
+                    f"{path}.execution.allow_recursive_codex_cli may be true only when mode='codex_cli'"
+                )
 
         budgets = profile.get("budgets", {})
         if isinstance(budgets, Mapping):
@@ -238,11 +564,21 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
     return errors
 
 
-def redact_config(value: Any, key: str = "") -> Any:
+def redact_config(value: Any, key: str = "", *, environment_reference: bool = False) -> Any:
     if isinstance(value, Mapping):
-        return {child_key: redact_config(child, child_key) for child_key, child in value.items()}
+        child_values_are_environment_references = key == "header_env"
+        return {
+            child_key: redact_config(
+                child,
+                child_key,
+                environment_reference=child_values_are_environment_references,
+            )
+            for child_key, child in value.items()
+        }
     if isinstance(value, list):
-        return [redact_config(child, key) for child in value]
+        return [redact_config(child, key, environment_reference=environment_reference) for child in value]
+    if environment_reference:
+        return value
     if _is_plaintext_secret_key(key) and value not in (None, "", False):
         return "<redacted>"
     return value
@@ -277,7 +613,8 @@ def _deep_set(value: MutableMapping[str, Any], dotted_path: str, new_value: Any)
         if not isinstance(child, MutableMapping):
             raise ConfigError(f"Cannot set a child beneath non-object path segment {segment!r}")
         current = child
-    if _is_plaintext_secret_key(segments[-1]) and new_value not in (None, "", False):
+    is_header_environment_reference = len(segments) >= 2 and segments[-2] == "header_env"
+    if not is_header_environment_reference and _is_plaintext_secret_key(segments[-1]) and new_value not in (None, "", False):
         raise ConfigError("Refusing to store a plaintext secret; set an *_env field to an environment-variable name")
     current[segments[-1]] = new_value
 

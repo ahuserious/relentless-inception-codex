@@ -65,7 +65,7 @@ The configuration schema is intentionally broader than one Python function becau
 
 | Layer | Enforces |
 |---|---|
-| MCP runtime | Provider credentials and calls, normalized responses, panel liveness, judge/verdict structure, artifact hashes, reviewer quorum, core call/token/known-cost/time budgets, run confinement, and kill checks. |
+| MCP runtime | Provider credentials and calls, normalized responses, panel liveness, judge/verdict structure, artifact hashes, reviewer quorum, atomic pre-dispatch attempt ceilings, observed-response token/tool/known-cost/time stop thresholds, run confinement, and kill checks. |
 | Codex skills and active session | Goal/scope confirmation, path selection and redaction before egress, acceptance criteria, mechanical evidence collection, active-workspace execution, approvals, diff review, and post-execution submission. |
 | Native Codex runtime | Actual subagent availability, model/provider selection, inherited tools, sandbox, permission mode, and native tool-loop compatibility. |
 | Provider/router | Upstream retention, model availability, routing, usage reporting, and remote cancellation behavior. |
@@ -91,14 +91,17 @@ The MCP server stores run artifacts beneath `PLUGIN_DATA` when Codex supplies it
 
 - a SHA-256 of the task;
 - a redacted configuration hash;
+- an operation-input hash covering the selected profile, context, mechanical evidence, and, for standalone gates, the candidate artifact hash;
 - stage status and artifact names;
 - requested and actual model provenance;
-- token and known-cost accounting;
+- input, output, reasoning-detail, cached-input-detail, aggregate input-plus-output, tool, and known-cost accounting;
 - count of calls for which cost was unknown;
 - raw external responses needed for evidence, synthesis, and deterministic resume;
 - the fused result, gate result, and execution handoff.
 
-Resume refuses a run id when the task or configuration hash differs. Runtime directories are private (`0700`), files are private (`0600`), writes are atomic, and artifact paths are confined to the run directory. Constructed outbound prompts and hidden reasoning are not persisted as separate artifacts, but raw model responses are. A global or per-run `KILL` file aborts later stages; `run_abort` is the user-facing control.
+Resume refuses a run id when the task, configuration, operation, selected profile, context, mechanical evidence, or candidate artifact identity differs. This prevents stale panel or gate artifacts from being reused after evidence changes. Cumulative wall time and cost accounting survive resume. Runtime directories are private (`0700`), files are private (`0600`), writes are atomic, and artifact paths are confined to the run directory. Constructed outbound prompts and hidden reasoning are not persisted as separate artifacts, but raw model responses are. A global or per-run `KILL` file aborts later stages; `run_abort` is the user-facing control.
+
+Budget enforcement distinguishes what is knowable before network dispatch. Every actual HTTP attempt, including retries and fallbacks, is atomically reserved against `max_calls` before sending. Token, provider-tool, elapsed-time, and dollar usage are known only from a response or local estimate, so those values are stop-before-next-dispatch thresholds. A response and other concurrent requests already in flight can cross them. The resulting stop reason is persisted and blocks resume from launching more work. Unknown cost fails closed by default after recording the completed call.
 
 ## Deliberation pipeline
 
@@ -137,22 +140,25 @@ Majority voting and score averaging are explicitly prohibited. Repetition across
 
 Independent verifier seats try to falsify the exact candidate artifact. A gate binds its verdict to the candidate SHA-256. Missing evidence, schema failure, a reproducible mechanical failure, or insufficient live reviewers blocks a pass.
 
-The default maximum-intelligence policy requires a same-artifact quorum: two independent verifier seats must each return `PASS` for the identical candidate SHA-256. This is not two sequential whole-gate rounds. A higher-level release workflow may additionally run the complete gate twice on an unchanged commit hash. Plan, pre-execution, post-execution, final, and summary checkpoints can use the same primitive with stage-specific evidence requirements.
+The default maximum-intelligence policy requires a same-artifact quorum: two independent verifier seats must each return `PASS` for the identical candidate SHA-256. This is not two sequential whole-gate rounds. A higher-level release workflow may additionally run the complete gate twice on an unchanged commit hash. Plan, pre-execution, post-execution, final, and summary checkpoints use the same primitive with stage-specific evidence requirements, but they are invoked by the active Codex skill. The MCP `fuse` runtime owns only the synthesis-candidate gate; it never reports a named host lifecycle stage as completed implicitly.
 
 ### 6. Execution handoff
 
-The MCP server returns an `execution_handoff` containing the verified synthesis, constraints, unresolved minority findings, required checks, and remaining budget information. Its default backend is the **active Codex session**.
+The MCP server returns an `execution_handoff` containing only the sections selected by `handoff_include`: the verified synthesis, execution constraints, unresolved minority findings, blind spots, required checks, and/or remaining budget information. It also freezes the selected profile and a hash-bound execution-settings snapshot. Its default backend is the **active Codex session**.
+
+This handoff is a host-workflow packet with two readiness levels. `ready_for_host_workflow` means the synthesis gate passed and the required plan is present. `ready` and `mutation_authorized` remain false while enabled plan or pre-execution gates are pending. Post-execution, final, and summarize gates are recorded as later completion obligations, not incorrectly treated as prerequisites for starting work.
 
 The active session then:
 
 1. re-inspects the real workspace;
-2. applies repository instructions and current user scope;
-3. requests approvals through Codex when needed;
-4. edits with ordinary Codex tools;
-5. runs mechanical checks;
-6. submits the resulting exact artifact to a post-execution gate.
+2. assembles every configured plan-stage evidence item and invokes `adversarial_gate` over that immutable manifest;
+3. assembles every configured pre-execution evidence item and invokes a separate exact-artifact gate;
+4. records both host receipts and only then authorizes mutation in visible task state;
+5. applies repository instructions and current user scope, requesting approvals through Codex when needed;
+6. edits with ordinary Codex tools and runs mechanical checks;
+7. invokes configured post-execution, final, and summarize gates with their required evidence.
 
-The handoff is advice plus an evidence contract. It is not an instruction that bypasses newer user input, repository reality, or permissions.
+The handoff is advice plus an evidence contract. Schema v2 hashes the complete persisted packet—including the selected artifacts, instruction, lifecycle state, synthesis receipt, profile, and execution settings—and the recursive CLI refuses any mismatch. It is not an instruction that bypasses newer user input, repository reality, permissions, or pending host gates. Host receipts are append-only workflow evidence; they do not retroactively rewrite the original packet's readiness fields.
 
 ## Execution authority
 
@@ -164,15 +170,19 @@ The handoff is advice plus an evidence contract. It is not an instruction that b
 | Active Codex session | Yes, within sandbox | Yes | Yes | According to sandbox and user scope |
 | Native Codex subagent | According to inherited tools and sandbox | Yes | Only where the runtime can surface approval; otherwise approval-required actions fail | According to inherited/effective sandbox |
 
-This distinction is central. Describing an API panelist as a "Grok subagent" would be misleading. A true Grok-powered Codex subagent requires an opt-in Codex provider and custom-agent configuration that passes a compatibility test.
+This distinction is central. Describing an API panelist as a "Grok subagent" would be misleading. A true Grok-powered Codex subagent requires an opt-in Codex provider, a registered custom-agent role, and a provider/tool-loop combination that passes a compatibility test.
 
 ## Optional native Codex agents
 
-Codex loads personal custom agents from `~/.codex/agents/` and project agents from `.codex/agents/`. Custom agent files are session configuration layers and can select a model, reasoning effort, provider, sandbox, MCP servers, and instructions. The parent turn's live permissions remain authoritative.
+Codex 0.145 registers named roles under `[agents.<role>]` in the main configuration. Each role declares its description, a `config_file` path, and optional nickname candidates. The referenced personal or project TOML is a session configuration layer containing model/provider selection, reasoning effort, sandbox, MCP, and instruction settings—not the role metadata itself. The parent turn's live permissions remain authoritative. See the official [configuration schema](https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json) and [subagent documentation](https://developers.openai.com/codex/multi-agent).
 
 Provider definitions and credentials are machine-local configuration. Codex ignores `model_provider` and `model_providers` in project-scoped `.codex/config.toml`, so direct xAI, OpenRouter, or trusted-router definitions must be merged into user-level `~/.codex/config.toml`. No plugin install should do that silently. See [PROVIDERS.md](PROVIDERS.md) and the examples directory.
 
-The native path has a stronger capability than an external panelist: if the provider is sufficiently Responses-compatible, the model participates in Codex's tool loop and Codex executes requested tools under its sandbox. That compatibility must be tested with streaming and a two-turn function-call continuation, not inferred from a successful text completion.
+The native path has a stronger capability than an external panelist only when the provider is sufficiently Responses-compatible: the model participates in Codex's tool loop and Codex executes requested tools under its sandbox. Codex 0.145 custom providers advertise/send namespace tools by default, which xAI rejects with HTTP 422. A local smoke test found a deliberately narrower configuration that disables web search, shell, plugins/apps, inherited MCP servers, and other tool-producing features: a single-turn Grok 4.5 text review then completed successfully. That is a reasoning-only native reviewer, not a tool-capable worker. In a separate probe Codex executed Grok's first shell function call, but xAI rejected the continuation because the returned compaction blob could not be decoded. The former Chat Completions wire is not available as a workaround. The namespace incompatibility is tracked in [openai/codex#14242](https://github.com/openai/codex/issues/14242); provider defaults are visible in Codex's [provider source](https://github.com/openai/codex/blob/main/codex-rs/model-provider/src/provider.rs).
+
+The plugin's external xAI seats use their own Responses adapter and remain operational, including explicitly configured xAI-hosted tools. Native Grok should receive a complete immutable evidence packet from its parent and must not call tools until a full two-turn function-call continuation passes on the installed Codex/xAI versions.
+
+For any native custom provider, compatibility must be tested with streaming and a two-turn function-call continuation, not inferred from a successful text completion.
 
 ## Failure, degradation, and recovery
 
@@ -181,7 +191,7 @@ The native path has a stronger capability than an external panelist: if the prov
 - Optional seats can fail without erasing their failure, but the configured minimum live panel still applies.
 - Model fallback requires explicit seat/profile permission and retains requested-versus-actual provenance.
 - Budget exhaustion stops and reports; it does not silently lower quality or continue unmetered.
-- `run_status` is the source of truth for a persisted run. A task/config hash mismatch prevents accidental resume into the wrong mission.
+- `run_status` is the source of truth for a persisted run. A task/config/full-input hash mismatch prevents accidental resume with stale context, evidence, profile, or artifact identity.
 - This release does not promise an always-running watchdog or unattended daemon. Continued Codex execution still depends on the active task and its normal lifecycle.
 
 ## Design lineage

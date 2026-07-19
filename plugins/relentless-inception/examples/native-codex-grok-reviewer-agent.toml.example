@@ -1,27 +1,73 @@
-# OPT-IN CUSTOM AGENT — copy to ~/.codex/agents/grok45_reviewer.toml only after
-# merging native-codex-xai-provider.toml.example into ~/.codex/config.toml and
-# setting XAI_API_KEY in the Codex process environment.
+# EXPERIMENTAL CUSTOM-AGENT CONFIG LAYER — copy to
+# ~/.codex/agents/grok45_reviewer.toml, then register it with the
+# [agents.grok45_reviewer] table shown in native-codex-agent-limits.toml.example.
+# Also merge native-codex-xai-provider.toml.example into ~/.codex/config.toml and
+# set XAI_API_KEY in the Codex process environment.
 #
-# Custom agent files are Codex session-configuration layers. The xAI provider
-# path is protocol-compatible in principle but must pass the local streaming and
-# tool-continuation smoke test. If it fails, use Grok as an external MCP reviewer.
-
-name = "grok45_reviewer"
-description = "Independent read-only Grok 4.5 reviewer for falsifying plans, diffs, and evidence without implementing changes."
-nickname_candidates = ["Axiom", "Kepler", "Turing"]
+# This file is only the role's Codex config layer; role metadata belongs in the
+# main config table, not here. A local Codex 0.145 text-only smoke test passed
+# with this narrowed posture. Native function-result continuation did not pass,
+# so this role must receive all evidence from the parent and must never call a
+# tool. Use the plugin's external xAI seats for provider-hosted tools and fusion.
 
 model_provider = "xai"
 model = "grok-4.5"
 model_reasoning_effort = "high"
+model_auto_compact_token_limit = 1000000
 sandbox_mode = "read-only"
+approval_policy = "never"
+web_search = "disabled"
+include_apps_instructions = false
+include_environment_context = false
+include_permissions_instructions = false
+
+[skills]
+include_instructions = false
+
+# Disable known tool-producing feature surfaces. Keep this list aligned with the
+# installed Codex version (`codex features list`) and re-run the strict-config
+# and live text smoke tests after an upgrade.
+[features]
+apps = false
+auth_elicitation = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+computer_use = false
+goals = false
+image_generation = false
+in_app_browser = false
+memories = false
+multi_agent = false
+plugins = false
+remote_compaction_v2 = false
+remote_plugin = false
+request_permissions_tool = false
+shell_tool = false
+skill_mcp_dependency_install = false
+skill_search = false
+tool_call_mcp_elicitation = false
+tool_suggest = false
+unified_exec = false
+workspace_dependencies = false
+
+# Config layers merge with the parent. Repeat this override for EVERY MCP server
+# defined by the user's main Codex configuration; replace `example_server` with
+# each real server id. Do not enable the role while any inherited MCP server can
+# still expose tools.
+#
+# [mcp_servers.example_server]
+# enabled = false
 
 developer_instructions = """
-Act as an independent adversarial reviewer, not an implementer.
+Act as an independent reasoning-only adversarial reviewer, not an implementer.
 
 Review the exact artifact and acceptance criteria supplied by the parent Codex
 session. Look for correctness failures, hidden assumptions, security and privacy
 risks, missing edge cases, and gaps between claimed and mechanical evidence.
-Never claim to have run a command you did not run. Lead with blocking findings,
+You have deliberately been given no tools. Never request or call a tool, and
+never claim to have retrieved, inspected, or executed evidence that the parent
+did not include. Lead with blocking findings,
 include exact evidence or reproduction steps, and preserve a supported minority
 finding even when it conflicts with the leading proposal.
 

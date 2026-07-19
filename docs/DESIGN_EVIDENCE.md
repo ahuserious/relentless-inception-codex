@@ -10,7 +10,7 @@ Other adopted findings:
 
 - preserve supported lone-minority findings because weak synthesis can erase the only correct answer;
 - prefer three to five high-quality independent reports; scaling tends to flatten around seven;
-- distinct roles and context bundles diversify errors more reliably than temperature alone;
+- distinct roles and context lenses—or genuinely host-partitioned bundles when different data is required—diversify errors more reliably than temperature alone;
 - keep research/tool use separate from a no-tools synthesis turn;
 - validate HTTP-successful empty, malformed, or schema-invalid responses locally;
 - use a quality floor and explicit degradation record instead of counting every successful HTTP call as a live expert;
@@ -53,6 +53,6 @@ External API panelists are not native Codex subagents. They receive only the exp
 ## Known boundaries
 
 - A plugin cannot currently install or select an arbitrary native Codex provider per spawned agent through its manifest. Personal agent/provider TOMLs are therefore opt-in templates and must be smoke-tested on the installed Codex version.
-- Cost enforcement is exact when a router reports cost and estimated from configured token pricing otherwise. Provider pricing can change; catalog refresh and ledger reconciliation remain necessary.
+- Call-attempt enforcement is exact before dispatch. Cost is observed or estimated only after a provider response, so its configured value is a stop-before-next-dispatch threshold rather than a guaranteed per-run cap; provider pricing can change, and catalog refresh plus ledger reconciliation remain necessary.
 - Raw model outputs are persisted locally for evidence and resume. Constructed prompts and hidden reasoning are not persisted by this runtime.
 - The runtime supports provider-hosted search/code tools, not arbitrary local tool proxying to external seats.

@@ -66,6 +66,67 @@ class McpServerSmokeTests(unittest.TestCase):
         validation_payload = json.loads(validation_result["content"][0]["text"])
         self.assertEqual(validation_payload, {"errors": [], "ok": True})
 
+    def test_invalid_config_can_be_diagnosed_and_cannot_disable_run_abort(self) -> None:
+        messages = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "config_validate", "arguments": {}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "doctor", "arguments": {}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "run_abort", "arguments": {"run_id": "active-run"}},
+            },
+        ]
+        stdin = "\n".join(json.dumps(message) for message in messages) + "\n"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            user_config_path = os.path.join(temporary_directory, "invalid-user-config.json")
+            with open(user_config_path, "w", encoding="utf-8") as user_config:
+                json.dump({"providers": {"xai_direct": {"max_concurrency": "invalid"}}}, user_config)
+            run_directory = os.path.join(temporary_directory, "runs", "active-run")
+            os.makedirs(run_directory)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "RELENTLESS_INCEPTION_DATA_DIR": temporary_directory,
+                    "RELENTLESS_INCEPTION_CONFIG": user_config_path,
+                    "PYTHONPATH": str(PLUGIN_ROOT),
+                }
+            )
+            completed = subprocess.run(
+                [sys.executable, str(MCP_SERVER_PATH)],
+                input=stdin,
+                text=True,
+                capture_output=True,
+                cwd=str(PLUGIN_ROOT),
+                env=environment,
+                timeout=10,
+                check=False,
+            )
+            kill_file_created = os.path.exists(os.path.join(run_directory, "KILL"))
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+        payloads = [json.loads(response["result"]["content"][0]["text"]) for response in responses]
+        self.assertFalse(responses[0]["result"]["isError"])
+        self.assertFalse(payloads[0]["ok"])
+        self.assertTrue(payloads[0]["errors"])
+        self.assertFalse(responses[1]["result"]["isError"])
+        self.assertFalse(payloads[1]["ok"])
+        self.assertFalse(responses[2]["result"]["isError"])
+        self.assertTrue(kill_file_created)
+
 
 if __name__ == "__main__":
     unittest.main()

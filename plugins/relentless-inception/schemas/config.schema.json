@@ -68,7 +68,7 @@
     "providerCapabilities": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Declared transport capabilities used during preflight and routing. These declarations do not override live capability probes.",
+      "description": "Fail-closed adapter capability declarations. Configuration and runtime reject a requested reasoning, strict-schema, or provider-tool feature when its declaration is false; declarations still require live compatibility testing.",
       "required": ["tools", "structured_outputs", "reasoning", "streaming"],
       "properties": {
         "tools": {
@@ -85,7 +85,7 @@
         },
         "streaming": {
           "type": "boolean",
-          "description": "Whether the adapter can consume streaming responses and final usage data."
+          "description": "Whether this plugin adapter consumes streaming responses and final usage data. All v0.1 bundled adapters are buffered and therefore declare false."
         }
       }
     },
@@ -254,33 +254,17 @@
           "type": "string",
           "format": "uri",
           "pattern": "^https://",
-          "description": "HTTPS API base URL including any required version prefix. Use a dedicated provider entry for each router region or policy boundary."
+          "description": "HTTPS API base URL including any required version prefix. Every request sends this provider's credential and selected task material to this origin; changing it is a security-sensitive egress change. Use a dedicated provider entry for each router region or policy boundary."
         },
         "api_key_env": {
           "$ref": "#/$defs/environmentVariableName",
           "description": "Environment-variable name containing the provider credential. Literal credentials are rejected by the runtime."
-        },
-        "organization_env": {
-          "$ref": "#/$defs/environmentVariableName",
-          "description": "Optional environment-variable name for a provider organization or tenant identifier."
-        },
-        "project_env": {
-          "$ref": "#/$defs/environmentVariableName",
-          "description": "Optional environment-variable name for a provider project identifier."
         },
         "header_env": {
           "type": "object",
           "description": "Additional request headers mapped to environment-variable names. Do not put literal header values here.",
           "propertyNames": {"type": "string", "minLength": 1},
           "additionalProperties": {"$ref": "#/$defs/environmentVariableName"}
-        },
-        "proxy_url_env": {
-          "$ref": "#/$defs/environmentVariableName",
-          "description": "Optional environment-variable name containing an approved HTTPS proxy URL."
-        },
-        "tls_verify": {
-          "type": "boolean",
-          "description": "Verify server TLS certificates. Disabling is unsafe and should only be used for explicitly trusted local test infrastructure."
         },
         "store": {
           "type": "boolean",
@@ -324,7 +308,7 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 300,
-          "description": "Maximum time to establish a network connection before rescue policy is applied."
+          "description": "Desired connection timeout for a future split-timeout adapter. The v0.1 stdlib transport cannot separate connect from read time and uses request_timeout_seconds for the whole request."
         },
         "request_timeout_seconds": {
           "type": "number",
@@ -414,7 +398,7 @@
         "context_bundle": {
           "type": "string",
           "minLength": 1,
-          "description": "Named context-partition policy. Panels should receive sufficient but intentionally different evidence bundles where safe."
+          "description": "Named prompt lens supplied to this seat. In v0.1 it changes the role's instructions but does not remove or data-minimize the context and evidence supplied to the run; the Codex host must pre-partition an argument when true data separation is required."
         },
         "reasoning_effort": {
           "$ref": "#/$defs/reasoningEffort"
@@ -422,7 +406,7 @@
         "reasoning_max_tokens": {
           "type": ["integer", "null"],
           "minimum": 1,
-          "description": "Optional explicit reasoning-token budget. Do not set alongside an incompatible provider effort control."
+          "description": "Optional explicit reasoning-token budget for compatible chat providers whose reasoning_field is reasoning. Set reasoning_effort to none when using it. The v0.1 xAI/OpenAI Responses and Anthropic adaptive paths reject this field rather than silently ignoring it."
         },
         "max_output_tokens": {
           "type": "integer",
@@ -478,7 +462,7 @@
         "structured_output": {
           "type": "string",
           "enum": ["none", "panel_report", "judge_analysis", "final_answer", "gate_verdict"],
-          "description": "Named output contract validated after the request. Invalid outputs trigger semantic rescue rather than entering fusion as valid evidence."
+          "description": "Named role contract. Judge and gate contracts use strict JSON Schema plus local validation; panel_report and final_answer are prompt/semantic contracts validated for usable text rather than strict JSON."
         },
         "allow_model_fallbacks": {
           "type": "boolean",
@@ -597,6 +581,8 @@
         "executor_model",
         "executor_reasoning_effort",
         "reviewer_models",
+        "reviewer_roles",
+        "reasoning_only_roles",
         "reviewer_reasoning_effort",
         "max_parallel_agents",
         "inherit_workspace_context",
@@ -606,7 +592,7 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Whether outputs include a native Codex execution/review handoff."
+          "description": "Whether the active Codex host may use native subagents for execution or review. A normal active-Codex handoff is still produced when false; the preference is frozen into that packet."
         },
         "mode": {
           "const": "host_handoff",
@@ -626,6 +612,18 @@
           "items": {"type": "string", "minLength": 1},
           "description": "Preferred native Codex models the host may use for independent diff or evidence review."
         },
+        "reviewer_roles": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
+          "description": "Preferred named Codex agent roles for independent review. Each role's separate Codex agent TOML selects its model provider and model; the host uses a role only when it is installed and compatibility-tested."
+        },
+        "reasoning_only_roles": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
+          "description": "Named reviewer roles that must receive a complete immutable evidence packet and must never retrieve, call tools, execute, or mutate. The host enforces this boundary; the MCP server cannot change native Codex tools."
+        },
         "reviewer_reasoning_effort": {
           "$ref": "#/$defs/reasoningEffort"
         },
@@ -641,18 +639,18 @@
         },
         "require_fusion_before_execution": {
           "type": "boolean",
-          "description": "Block the execution handoff until synthesis completed successfully."
+          "description": "Host invariant, frozen into the handoff, requiring a passed synthesis gate before native delegation. The fusion tool structurally satisfies this before emitting a ready packet."
         },
         "require_gate_after_execution": {
           "type": "boolean",
-          "description": "Require a fresh post-execution gate over the diff and verification evidence."
+          "description": "Add a post-execution lifecycle obligation to the frozen handoff for any native implementation path."
         }
       }
     },
     "qualityFloor": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Semantic validation applied to successful HTTP responses before they count as live evidence.",
+      "description": "Semantic text validation applied to successful panel, final-synthesis, and native OpenRouter Fusion responses before they count as valid evidence. Judge and gate outputs instead use their strict JSON contracts.",
       "required": ["minimum_characters", "require_nonempty_claims", "reject_tool_markup", "reject_refusal_without_policy_reason"],
       "properties": {
         "minimum_characters": {
@@ -662,7 +660,7 @@
         },
         "require_nonempty_claims": {
           "type": "boolean",
-          "description": "Require at least one substantive claim or recommendation in structured panel output."
+          "description": "Require at least one visible line with substantive prose rather than only headings or fragments. This is a semantic floor for panel and synthesis text, not factual verification."
         },
         "reject_tool_markup": {
           "type": "boolean",
@@ -742,76 +740,12 @@
     "nativeOpenRouterFusion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional OpenRouter-managed Fusion fast path. It is not the canonical cross-provider engine because OpenRouter does not document provider routing for each inner analysis seat.",
-      "required": [
-        "enabled",
-        "provider",
-        "router_model",
-        "preset",
-        "analysis_models",
-        "judge_model",
-        "max_tool_calls",
-        "max_completion_tokens",
-        "reasoning",
-        "panel_temperature",
-        "tool_choice",
-        "fallback_to_client_orchestrated"
-      ],
+      "description": "Profile switch and recovery policy for the OpenRouter-managed Fusion fast path. The referenced native_fusion_seat is the single source of truth for provider, router model, Fusion plugin models, limits, reasoning, temperature, and required tool choice.",
+      "required": ["enabled", "fallback_to_client_orchestrated"],
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Use OpenRouter's server-side Fusion router/tool instead of local client orchestration for this profile."
-        },
-        "provider": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Name of an enabled provider entry with type openrouter_fusion."
-        },
-        "router_model": {
-          "const": "openrouter/fusion",
-          "description": "OpenRouter Fusion router identifier."
-        },
-        "preset": {
-          "type": "string",
-          "minLength": 1,
-          "description": "OpenRouter Fusion preset identifier, such as general-high, combined with explicitly configured models."
-        },
-        "analysis_models": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 8,
-          "items": {"type": "string", "minLength": 1},
-          "description": "One to eight OpenRouter model slugs invoked in parallel by native Fusion."
-        },
-        "judge_model": {
-          "type": "string",
-          "minLength": 1,
-          "description": "OpenRouter model slug used by native Fusion for comparative analysis."
-        },
-        "max_tool_calls": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 16,
-          "description": "Fusion server-tool call ceiling documented by OpenRouter."
-        },
-        "max_completion_tokens": {
-          "type": "integer",
-          "minimum": 256,
-          "description": "Completion budget passed to the native Fusion analysis and judge pipeline."
-        },
-        "reasoning": {
-          "$ref": "#/$defs/fusionReasoning"
-        },
-        "panel_temperature": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 2,
-          "description": "Temperature applied to native Fusion panel calls. The judge remains deterministic; temperature is not a substitute for model or context diversity."
-        },
-        "tool_choice": {
-          "type": "string",
-          "enum": ["auto", "required"],
-          "description": "Whether the outer model may skip Fusion. required is necessary when a gate must always deliberate."
+          "description": "Must be true exactly when fusion.engine is openrouter_native. The seat referenced by native_fusion_seat supplies the executable request."
         },
         "fallback_to_client_orchestrated": {
           "type": "boolean",
@@ -915,7 +849,7 @@
         },
         "partition_context": {
           "type": "boolean",
-          "description": "Honor each seat's context_bundle so diversity comes from evidence and adversarial role, not sampling noise alone."
+          "description": "Apply each seat's context_bundle as a prompt lens so diversity comes from adversarial role rather than sampling noise alone. This does not partition or data-minimize the supplied context/evidence; the Codex host must construct separate arguments when true isolation is required."
         },
         "preserve_initial_responses": {
           "const": true,
@@ -923,11 +857,11 @@
         },
         "prohibit_majority_vote": {
           "const": true,
-          "description": "Forbid selecting an answer solely by vote or mean score. Fusion must resolve claims and evidence generatively."
+          "description": "Fixed prompt-and-workflow invariant instructing judge and synthesizer to resolve claims and evidence generatively rather than select by vote or mean score. The runtime does not mechanically prove the model's internal decision rule."
         },
         "preserve_minority_findings": {
           "const": true,
-          "description": "Require supported lone-minority findings to survive judge and synthesis instead of being averaged away."
+          "description": "Fixed prompt-and-schema invariant requiring judge, synthesis, and review stages to surface supported lone-minority findings instead of averaging them away. The runtime preserves the reports but cannot mechanically prove that a model recognized every valid minority claim."
         },
         "raw_panel_is_primary_evidence": {
           "const": true,
@@ -969,12 +903,12 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 7200,
-          "description": "Gate deadline scaled for its evidence and reasoning effort. A timeout is an explicit failure, not an implicit pass."
+          "description": "Host-workflow deadline for this named stage. The active Codex skill must stop/abort and record failure when it expires; provider request timeouts remain independently configured on each provider."
         },
         "tool_policy": {
           "type": "string",
           "enum": ["none", "provider_server_tools"],
-          "description": "Provider-side tool authority available to external verifier seats. It never grants Codex or local tools."
+          "description": "Host-owned upper bound for reviewer-seat provider tools at this stage. The skill must verify each configured reviewer seat complies; this field does not dynamically override a seat, grant Codex/local tools, or broaden provider authority."
         },
         "required_evidence": {
           "type": "array",
@@ -987,7 +921,7 @@
     "gateStages": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Lifecycle points at which independent verification can block progress.",
+      "description": "Host-owned lifecycle points at which independent verification blocks progress. The MCP fuse runtime gates only its synthesis candidate; the active Codex skill must invoke these named stages with their required evidence.",
       "required": ["plan", "pre_execution", "post_execution", "final", "summarize"],
       "properties": {
         "plan": {"$ref": "#/$defs/gateStage", "description": "Checks requirement coverage, assumptions, risk, and proposed verification before work begins."},
@@ -1005,6 +939,7 @@
         "enabled",
         "fail_closed",
         "reviewers",
+        "max_concurrency",
         "required_passes",
         "allowed_verdicts",
         "mechanical_failure_is_blocking",
@@ -1018,7 +953,7 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Run configured adversarial gates around planning, execution, finalization, and summaries."
+          "description": "Require configured verification. The MCP fuse runtime enforces the synthesis gate; the active Codex skill owns plan, pre-execution, post-execution, final, and summarize stage invocation."
         },
         "fail_closed": {
           "const": true,
@@ -1030,18 +965,20 @@
           "items": {"type": "string", "minLength": 1},
           "description": "Independent verifier seat names. The runtime checks that they exist and are not the artifact-author instance."
         },
+        "max_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Maximum verifier requests in flight at once. Provider-specific concurrency caps still apply."
+        },
         "required_passes": {
           "type": "integer",
           "minimum": 1,
           "description": "Number of valid independent pass verdicts required in addition to deterministic checks."
         },
         "allowed_verdicts": {
-          "type": "array",
-          "items": {"type": "string", "enum": ["PASS", "NEEDS_WORK", "FAIL"]},
-          "minItems": 3,
-          "maxItems": 3,
-          "uniqueItems": true,
-          "description": "Closed verdict vocabulary used in strict gate output."
+          "const": ["PASS", "NEEDS_WORK", "FAIL"],
+          "description": "Fixed closed verdict vocabulary used by the strict gate schema. It is displayed for clarity but is not a configurable subset or ordering."
         },
         "mechanical_failure_is_blocking": {
           "const": true,
@@ -1049,11 +986,11 @@
         },
         "blind_spot_requires_targeted_review": {
           "const": true,
-          "description": "Any required criterion checked by no live reviewer must receive targeted review before pass."
+          "description": "Any live reviewer-reported blind spot blocks the current gate verdict. The runtime does not spawn a specialist automatically; the Codex host must arrange targeted review and submit a new artifact/gate call before pass."
         },
         "schema_failure_is_blocking": {
           "const": true,
-          "description": "Malformed reviewer or verdict output cannot be interpreted as success."
+          "description": "Displayed invariant matching the always-on fail-closed parser: malformed reviewer or verdict output is rejected regardless of this field and can never be interpreted as success."
         },
         "exclude_artifact_author": {
           "type": "boolean",
@@ -1061,7 +998,7 @@
         },
         "require_independent_amendment": {
           "const": true,
-          "description": "Only a fresh reviewer instance may amend a failure after verifying fixes against the original blocking issues."
+          "description": "Structural amendment invariant: a failed synthesis triggers a fresh generation call, a byte-identical candidate is rejected, and fresh gate calls review the replacement against the blocking issues. This does not mechanically prove semantic independence between provider generations."
         },
         "max_revision_cycles": {
           "type": "integer",
@@ -1077,9 +1014,10 @@
     "budgets": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Hard resource ledger. Provider-reported usage is recorded per role and reconciled when an asynchronous generation endpoint is available.",
+      "description": "Attempt and observed-usage ledger. max_calls is checked atomically before each actual HTTP attempt. Token, tool, wall-time, and dollar thresholds are checked from observed provider responses and block later dispatch under hard enforcement; they cannot prevent one response or already in-flight concurrent responses from crossing a threshold.",
       "required": [
         "enforcement",
+        "unknown_cost_policy",
         "max_calls",
         "max_total_tokens",
         "max_input_tokens",
@@ -1097,22 +1035,27 @@
         "enforcement": {
           "type": "string",
           "enum": ["hard_stop", "approval_then_hard_stop", "warn_only"],
-          "description": "Action at configured limits. hard_stop is the safe default and cannot be bypassed by rescue."
+          "description": "Action at configured thresholds. hard_stop blocks; approval_then_hard_stop also blocks until the host obtains approval and explicitly changes configuration; warn_only records warnings and continues. Rescue cannot bypass either blocking mode."
         },
-        "max_calls": {"type": "integer", "minimum": 1, "description": "Maximum external model calls across initial work, retries, escalation, synthesis, and gates."},
-        "max_total_tokens": {"type": "integer", "minimum": 1, "description": "Maximum provider-accounted input, visible output, reasoning, and cache-write tokens combined."},
-        "max_input_tokens": {"type": "integer", "minimum": 1, "description": "Maximum accumulated input tokens across all roles."},
-        "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Maximum accumulated visible completion tokens across all roles."},
-        "max_reasoning_tokens": {"type": "integer", "minimum": 1, "description": "Maximum accumulated billed reasoning tokens across all roles."},
-        "max_tool_calls": {"type": "integer", "minimum": 1, "description": "Maximum provider-native or orchestrator-sanctioned tool calls across the run."},
-        "max_wall_seconds": {"type": "number", "exclusiveMinimum": 0, "description": "Maximum elapsed wall time for the complete run."},
-        "max_cost_usd": {"type": "number", "exclusiveMinimum": 0, "description": "Hard USD ceiling for the run using reported cost or conservative estimates when cost is delayed."},
-        "approval_threshold_usd": {"type": "number", "minimum": 0, "description": "Projected spend above which the host should obtain explicit user approval before launching additional work."},
-        "warning_fraction": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Fraction of a hard limit at which the user receives a budget warning."},
-        "reserve_fraction_for_synthesis_and_gates": {"type": "number", "minimum": 0, "maximum": 0.9, "description": "Fraction of remaining budget protected from panel fan-out so the strongest synthesis and required gates can still run."},
+        "unknown_cost_policy": {
+          "type": "string",
+          "enum": ["fail_closed", "warn"],
+          "description": "Action when neither a provider-reported price nor a configured estimate is available. fail_closed records the completed call and blocks all later dispatch; warn deliberately leaves dollar thresholds incomplete."
+        },
+        "max_calls": {"type": "integer", "minimum": 1, "description": "Pre-dispatch ceiling on actual provider HTTP attempts, including every retry and fallback attempt, under hard_stop or approval_then_hard_stop. Atomic reservation prevents concurrent workers from exceeding this count. Under warn_only it is a warning threshold and may be exceeded."},
+        "max_total_tokens": {"type": "integer", "minimum": 1, "description": "Observed-response stop threshold for provider-accounted input plus output tokens. Cached tokens are a breakdown of input and reasoning tokens are a breakdown of output, so neither is added again."},
+        "max_input_tokens": {"type": "integer", "minimum": 1, "description": "Observed-response stop threshold for accumulated input tokens across all roles, including any cached-token subset."},
+        "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Observed-response stop threshold for accumulated output tokens across all roles, including any reasoning-token subset."},
+        "max_reasoning_tokens": {"type": "integer", "minimum": 1, "description": "Observed-response stop threshold for the accumulated reasoning-token detail across all roles. This is also contained in output and is not added again to max_total_tokens."},
+        "max_tool_calls": {"type": "integer", "minimum": 1, "description": "Observed-response stop threshold for provider-native or orchestrator-sanctioned tool calls across the run."},
+        "max_wall_seconds": {"type": "number", "exclusiveMinimum": 0, "description": "Pre-dispatch and post-response elapsed-time threshold. It cannot cancel an HTTP attempt already accepted by a provider."},
+        "max_cost_usd": {"type": "number", "exclusiveMinimum": 0, "description": "Observed known-or-estimated USD stop threshold. A completed or already in-flight call can cross it; under blocking enforcement no later attempt is dispatched."},
+        "approval_threshold_usd": {"type": "number", "minimum": 0, "description": "Host-only projected-spend checkpoint. The MCP runtime cannot request approval and does not enforce this threshold; the active Codex workflow must obtain explicit user approval before launching additional work above it."},
+        "warning_fraction": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Fraction of the known observed USD cost limit at which the runtime records a warning. It does not currently emit fraction warnings for call, token, tool, or wall-time limits, and unknown cost follows unknown_cost_policy instead."},
+        "reserve_fraction_for_synthesis_and_gates": {"type": "number", "minimum": 0, "maximum": 0.9, "description": "Fraction of max_calls protected from panel fan-out so synthesis and required gates retain HTTP-attempt capacity. It does not reserve tokens, wall time, tool calls, or USD."},
         "per_provider_max_cost_usd": {
           "type": "object",
-          "description": "Optional hard USD sub-limits keyed by provider name, limiting one router or vendor without reducing the run-wide ceiling.",
+          "description": "Optional observed-response USD stop thresholds keyed by provider name. They block later dispatch under blocking enforcement but cannot cap an already accepted provider call.",
           "additionalProperties": {"type": "number", "exclusiveMinimum": 0}
         }
       }
@@ -1120,7 +1063,7 @@
     "privacy": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Policy controlling what workspace material may leave the machine and what run content may be stored locally or by providers.",
+      "description": "Data-egress and persistence policy. The MCP runtime directly enforces external_provider_access=deny and mandatory local persistence invariants; path selection, content redaction, consent, and route-policy checks are enforced by the active Codex host before it constructs tool arguments.",
       "required": [
         "external_provider_access",
         "sensitive_path_policy",
@@ -1139,27 +1082,27 @@
         "path_denylist"
       ],
       "properties": {
-        "external_provider_access": {"type": "string", "enum": ["deny", "allow_with_redaction", "allow"], "description": "Whether API-backed seats may receive workspace-derived content. allow_with_redaction is the safe functional default."},
-        "sensitive_path_policy": {"type": "string", "enum": ["deny", "require_user_approval", "redact"], "description": "Action when an in-scope bundle references a path matched as sensitive."},
-        "sensitive_value_redaction": {"type": "boolean", "description": "Redact likely credentials, tokens, keys, and private identifiers before provider submission."},
-        "redact_environment_values": {"type": "boolean", "description": "Never include environment-variable values in prompts, logs, or error reports."},
-        "redact_git_credentials": {"type": "boolean", "description": "Remove embedded Git remote credentials and credential-helper output from evidence bundles."},
-        "prompt_injection_fencing": {"type": "boolean", "description": "Place review criteria before artifacts and mark artifact content as untrusted data whose instructions must not be followed."},
+        "external_provider_access": {"type": "string", "enum": ["deny", "allow_with_redaction", "allow"], "description": "Runtime egress gate. deny blocks fuse and adversarial_gate before run creation; the active Codex host must perform the requested redaction when allow_with_redaction is selected."},
+        "sensitive_path_policy": {"type": "string", "enum": ["deny", "require_user_approval", "redact"], "description": "Codex-host policy for an in-scope bundle that references a sensitive path; the MCP receives text arguments, not workspace path authority."},
+        "sensitive_value_redaction": {"type": "boolean", "description": "Codex-host policy to redact likely credentials, tokens, keys, and private identifiers before provider submission."},
+        "redact_environment_values": {"type": "boolean", "description": "Codex-host policy to keep environment values out of constructed prompts and evidence; runtime errors independently redact credential-shaped text."},
+        "redact_git_credentials": {"type": "boolean", "description": "Codex-host policy to remove embedded Git remote credentials and credential-helper output from evidence bundles."},
+        "prompt_injection_fencing": {"const": true, "description": "Mandatory runtime prompt invariant: review criteria precede JSON-encoded untrusted artifact data whose embedded instructions have no authority."},
         "treat_artifacts_as_untrusted_data": {"const": true, "description": "Require all model seats to treat reviewed files, web pages, and panel text as evidence rather than authority."},
-        "persist_raw_prompts": {"type": "boolean", "description": "Store exact submitted prompts locally. Disabled by default; enabling materially increases privacy exposure."},
+        "persist_raw_prompts": {"const": false, "description": "Constructed outbound prompts are not written as separate artifacts by the v0.1 runtime; keep this false to avoid implying a nonexistent logging backend."},
         "persist_raw_responses": {"const": true, "description": "Store raw visible provider responses in the private run directory because synthesis, exact-artifact gates, and crash resume require them. This is local persistence and does not change provider retention."},
         "persist_reasoning": {"const": false, "description": "Hidden chain-of-thought is never requested for persistence or written to run artifacts."},
-        "persist_metadata_and_hashes": {"type": "boolean", "description": "Store provenance, hashes, usage, route, validation, and timing metadata needed for audit without raw content."},
-        "allow_provider_training": {"type": "boolean", "description": "Whether routes that may train on submitted data are allowed. false should be paired with provider-specific privacy filters."},
-        "require_zero_data_retention_when_available": {"type": "boolean", "description": "Prefer or require zero-data-retention routes where the provider exposes an enforceable control."},
-        "path_allowlist": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Optional glob allowlist for files eligible to enter external evidence bundles. Empty means user-requested scope governs."},
-        "path_denylist": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Glob patterns excluded from external evidence bundles even when a broader directory is in scope."}
+        "persist_metadata_and_hashes": {"const": true, "description": "Provenance, hashes, usage, route, validation, and timing metadata are mandatory for budget, resume, and same-artifact gate integrity."},
+        "allow_provider_training": {"type": "boolean", "description": "Codex-host route policy. false requires the host to verify provider-specific privacy controls; for OpenRouter this should also be encoded in provider_preferences."},
+        "require_zero_data_retention_when_available": {"type": "boolean", "description": "Codex-host route policy to select or verify zero-data-retention controls where enforceable; it does not manufacture ZDR on a direct provider."},
+        "path_allowlist": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Codex-host glob allowlist for files eligible to enter external evidence bundles. Empty means user-requested scope governs."},
+        "path_denylist": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Codex-host glob denylist applied before constructing external evidence bundles."}
       }
     },
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Requirements for claims, citations, deterministic checks, and audit provenance used by synthesis and gates.",
+      "description": "Codex-host requirements for claims, citations, deterministic checks, and audit provenance. Fixed structural invariants are enforced by the MCP runtime; configurable evidence collection occurs before the host calls it.",
       "required": [
         "require_claim_evidence",
         "require_primary_sources_when_available",
@@ -1175,18 +1118,18 @@
         "on_unverifiable_claim"
       ],
       "properties": {
-        "require_claim_evidence": {"type": "boolean", "description": "Require important factual, implementation, and safety claims to cite supplied or retrieved evidence."},
-        "require_primary_sources_when_available": {"type": "boolean", "description": "Prefer official documentation, source code, direct measurements, and research papers over secondary summaries."},
-        "verify_citations": {"type": "boolean", "description": "Retrieve or inspect cited material and reject citations that do not support the associated claim when tools permit."},
-        "require_mechanical_checks_for_code": {"type": "boolean", "description": "Require tests, schema validation, compilation, linting, or another deterministic check appropriate to code changes."},
-        "record_commands_and_exit_codes": {"type": "boolean", "description": "Record sanitized verification commands and exit codes so a confirmed failure can block the gate."},
-        "record_test_output": {"type": "boolean", "description": "Record bounded, sanitized test summaries and artifact references without leaking credentials."},
-        "hash_inputs_and_outputs": {"type": "boolean", "description": "Hash input bundles and outputs so amendments and gates can identify exactly what they reviewed."},
+        "require_claim_evidence": {"type": "boolean", "description": "Codex-host policy requiring important factual, implementation, and safety claims to cite supplied or retrieved evidence before a gate call."},
+        "require_primary_sources_when_available": {"type": "boolean", "description": "Codex-host policy preferring official documentation, source code, direct measurements, and research papers over secondary summaries."},
+        "verify_citations": {"type": "boolean", "description": "Codex-host policy to retrieve or inspect cited material and reject citations that do not support the associated claim when authorized tools permit."},
+        "require_mechanical_checks_for_code": {"type": "boolean", "description": "Codex-host policy requiring tests, schema validation, compilation, linting, or another deterministic check appropriate to code changes."},
+        "record_commands_and_exit_codes": {"type": "boolean", "description": "Codex-host policy to record sanitized verification commands and exit codes in supplied evidence so a confirmed failure can block the gate."},
+        "record_test_output": {"type": "boolean", "description": "Codex-host policy to record bounded, sanitized test summaries and artifact references in supplied evidence without leaking credentials."},
+        "hash_inputs_and_outputs": {"const": true, "description": "Mandatory runtime invariant: hash input bundles and outputs so resume and gates identify exactly what they reviewed."},
         "preserve_raw_panel_for_synthesizer": {"const": true, "description": "Provide complete valid panel reports to synthesis rather than only lossy judge summaries."},
         "preserve_supported_minority": {"const": true, "description": "Carry minority claims with evidence into synthesis and final dissent reporting."},
         "accept_self_reported_confidence": {"const": false, "description": "Do not weight a seat by uncalibrated self-reported confidence. Deterministic and external evidence controls weight instead."},
-        "minimum_live_sources": {"type": "integer", "minimum": 1, "description": "Minimum independent supporting sources required for a high-confidence external factual claim when multiple sources exist."},
-        "on_unverifiable_claim": {"type": "string", "enum": ["mark_uncertain", "omit", "fail_gate"], "description": "Treatment of material claims that cannot be verified within authorized tools and budgets."}
+        "minimum_live_sources": {"type": "integer", "minimum": 1, "description": "Codex-host policy for the minimum independent supporting sources required for a high-confidence external factual claim when multiple sources exist."},
+        "on_unverifiable_claim": {"type": "string", "enum": ["mark_uncertain", "omit", "fail_gate"], "description": "Codex-host treatment of material claims that cannot be verified within authorized tools and budgets before submitting evidence for review."}
       }
     },
     "rescue": {
@@ -1213,31 +1156,31 @@
         "human_handoff_after_failures"
       ],
       "properties": {
-        "enabled": {"type": "boolean", "description": "Enable configured transport backoff and provider circuit breakers; host-level escalation fields remain visible policy."},
-        "retry_attempts": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Host-level semantic/orchestration retry ceiling beyond provider max_retries."},
-        "backoff_initial_seconds": {"type": "number", "minimum": 0, "description": "Initial delay before a retryable orchestration failure is retried."},
-        "backoff_max_seconds": {"type": "number", "minimum": 0, "description": "Maximum exponential retry delay."},
+        "enabled": {"type": "boolean", "description": "Enable model fallback, transport-retry backoff, and provider circuit breakers. Provider max_retries remains an independent transport-attempt ceiling; when rescue is false those attempts have no rescue delay."},
+        "retry_attempts": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Host-owned semantic/orchestration retry ceiling beyond provider max_retries; the v0.1 MCP adapter does not autonomously repeat a semantic orchestration round from this value."},
+        "backoff_initial_seconds": {"type": "number", "minimum": 0, "description": "Initial delay before the HTTP transport retries a retryable provider failure when rescue is enabled."},
+        "backoff_max_seconds": {"type": "number", "minimum": 0, "description": "Maximum exponential delay between HTTP transport retry attempts when rescue is enabled."},
         "jitter": {"type": "boolean", "description": "Randomize retry delays to avoid synchronized provider retry storms."},
-        "semantic_failure_detection": {"type": "boolean", "description": "Validate nonempty content, schema, refusal, and tool markup even when HTTP transport succeeded."},
+        "semantic_failure_detection": {"const": true, "description": "Fail-closed semantic validation is mandatory: panel and final synthesis apply the configured quality floor, while judge and gate responses require strict schemas. HTTP success alone never makes evidence valid."},
         "retry_on": {
           "type": "array",
           "items": {"type": "string", "enum": ["timeout", "rate_limit", "server_error", "connection_error"]},
           "uniqueItems": true,
-          "description": "Transport-like failures eligible for retry of the same model/route."
+          "description": "Host-visible retry taxonomy. The v0.1 transport adapter uses provider retry_statuses and transport exception classes directly rather than dynamically interpreting this list."
         },
         "fallback_on": {
           "type": "array",
           "items": {"type": "string", "enum": ["empty_response", "schema_invalid", "unsupported_parameters", "policy_refusal", "tool_failure", "context_overflow"]},
           "uniqueItems": true,
-          "description": "Host policy for failures that justify configured model or cross-provider fallback. The adapter locally falls back only when allow_model_fallbacks is true."
+          "description": "Failure categories the runtime permits to trigger a configured same-seat model fallback when rescue.enabled and the seat's allow_model_fallbacks are both true. It does not autonomously spawn cross-provider fallback_seats."
         },
         "circuit_breaker_failures": {"type": "integer", "minimum": 1, "description": "Consecutive failures that temporarily disable a provider route for the run."},
         "circuit_breaker_reset_seconds": {"type": "number", "minimum": 0, "description": "Cooldown before a tripped provider route may be probed again."},
         "panel_collapse_action": {"type": "string", "enum": ["fail_closed_and_escalate", "human_handoff"], "description": "Action when fewer than min_live_seats produce valid reports."},
         "fusion_failure_action": {"type": "string", "enum": ["stronger_synthesizer_then_human", "human_handoff", "fail"], "description": "Action when judge or synthesis remains invalid after local fallback."},
         "budget_exhausted_action": {"const": "stop_and_report", "description": "Budget exhaustion always stops additional paid calls and reports completed evidence."},
-        "preserve_failed_attempts": {"type": "boolean", "description": "Retain sanitized failure metadata so repeated faults and degradation are auditable."},
-        "allow_degraded_single_provider": {"type": "boolean", "description": "Permit a recorded single-provider panel when cross-provider seats are unavailable, provided min_live_seats still holds."},
+        "preserve_failed_attempts": {"const": true, "description": "Sanitized failure provenance is mandatory for deterministic resume, degradation review, and gate integrity."},
+        "allow_degraded_single_provider": {"const": false, "description": "Compatibility mirror of the fail-closed fusion policy. Degraded required panels are not permitted; fusion.allow_degradation is authoritative."},
         "allow_single_live_seat": {"const": false, "description": "One surviving answer never counts as fusion or passes a fail-closed gate."},
         "human_handoff_after_failures": {"type": "integer", "minimum": 1, "description": "Host-level cumulative failure threshold after which Codex stops and asks the user for direction."}
       }
@@ -1249,6 +1192,11 @@
       "required": [
         "enabled",
         "mode",
+        "allow_recursive_codex_cli",
+        "codex_binary",
+        "model",
+        "reasoning_effort",
+        "timeout_seconds",
         "remote_models_may_write_workspace",
         "require_fused_plan",
         "require_pre_execution_gate",
@@ -1266,12 +1214,17 @@
         "completion_requires"
       ],
       "properties": {
-        "enabled": {"type": "boolean", "description": "Produce an executable Codex handoff after a valid fused plan."},
-        "mode": {"const": "codex_handoff", "description": "Execution is performed by the user-visible Codex host, not by external deliberation APIs."},
+        "enabled": {"type": "boolean", "description": "Produce a persisted Codex host-workflow packet after a valid fused plan."},
+        "mode": {"type": "string", "enum": ["codex_handoff", "codex_cli", "none"], "description": "codex_handoff returns the packet to the visible active Codex task; codex_cli permits an explicitly confirmed recursive Codex process only when allow_recursive_codex_cli is also true; none disables execution."},
+        "allow_recursive_codex_cli": {"type": "boolean", "description": "Opt in to the higher-risk recursive codex exec backend. The CLI still requires --confirm and refuses any packet with pending plan or pre-execution gates."},
+        "codex_binary": {"type": "string", "minLength": 1, "description": "Codex executable used only by mode codex_cli. The value is frozen into the reviewed handoff so later profile changes cannot alter execution."},
+        "model": {"type": "string", "minLength": 1, "description": "Codex execution model used only by mode codex_cli and persisted with the handoff."},
+        "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultra"], "description": "Codex execution reasoning effort used only by mode codex_cli and persisted with the handoff."},
+        "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 86400, "description": "Maximum recursive Codex execution time in seconds. This does not change provider or lifecycle-gate deadlines."},
         "remote_models_may_write_workspace": {"const": false, "description": "External API seats never receive filesystem mutation authority."},
         "require_fused_plan": {"type": "boolean", "description": "Require a valid synthesis artifact before execution can begin."},
-        "require_pre_execution_gate": {"type": "boolean", "description": "Require an authorization/scope gate before Codex mutates files or external state."},
-        "require_post_execution_gate": {"type": "boolean", "description": "Require an independent review of the actual diff and verification evidence."},
+        "require_pre_execution_gate": {"type": "boolean", "description": "Require a host-owned authorization/scope gate before Codex mutates files or external state. This gate is not satisfied by the MCP synthesis gate."},
+        "require_post_execution_gate": {"type": "boolean", "description": "Require a host-owned independent review of the actual diff and verification evidence after implementation. This later gate does not determine initial handoff readiness."},
         "require_user_approval_for_destructive_actions": {"const": true, "description": "Require explicit user approval before deletion, destructive Git operations, or other difficult-to-recover actions."},
         "require_user_approval_for_external_writes": {"type": "boolean", "description": "Require explicit approval before sending messages, publishing, deploying, or mutating external services unless already clearly authorized."},
         "preserve_unrelated_changes": {"const": true, "description": "Do not overwrite or clean unrelated user work in a dirty workspace."},
@@ -1281,14 +1234,14 @@
         "require_diff_review": {"type": "boolean", "description": "Inspect the final diff for scope, regressions, credential exposure, and unintended edits before completion."},
         "max_fix_cycles": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Maximum bounded implement-test-review repair cycles before human handoff."},
         "stop_on_test_failure": {"type": "boolean", "description": "If true, stop immediately on the first failing check; if false, allow bounded diagnosis/fix cycles while preserving failure evidence."},
-        "handoff_include": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true, "description": "Named fusion artifacts included in the Codex execution handoff."},
-        "completion_requires": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true, "description": "Named outcomes required before the orchestration reports success."}
+        "handoff_include": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["fused_plan", "constraints", "minority_findings", "blind_spots", "required_checks", "budget_remaining"]}, "uniqueItems": true, "description": "Exact artifact sections included in the persisted Codex handoff. Omitting fused_plan while require_fused_plan is true produces a blocked packet."},
+        "completion_requires": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true, "description": "Named host-workflow completion obligations copied into the handoff. The MCP FusionResult does not verify or mark these outcomes complete; the active Codex task must satisfy them before reporting success to the user."}
       }
     },
     "observability": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Audit trail for provenance, usage, failures, and validation without requiring raw prompt or reasoning retention.",
+      "description": "Optional host-export preference surface. The v0.1 MCP runtime does not consume these export controls: it always keeps canonical crash-resumable JSON state in the private runtime data directory and never persists hidden reasoning or constructed prompts.",
       "required": [
         "enabled",
         "artifact_directory",
@@ -1304,28 +1257,29 @@
         "content_logging"
       ],
       "properties": {
-        "enabled": {"type": "boolean", "description": "Write a local run manifest and ledger."},
-        "artifact_directory": {"type": "string", "minLength": 1, "description": "Workspace-relative or runtime-data path for run artifacts. The default directory is ignored by Git."},
-        "write_jsonl_ledger": {"type": "boolean", "description": "Append one structured ledger event per request, validation, fallback, gate, and execution handoff."},
-        "record_provider_and_model": {"type": "boolean", "description": "Record the configured provider and model for every role."},
-        "record_requested_and_actual_model": {"type": "boolean", "description": "Record both requested and actual models so router and fallback changes are visible."},
-        "record_route_metadata": {"type": "boolean", "description": "Record sanitized router strategy/provider metadata when available."},
-        "record_usage_and_cost": {"type": "boolean", "description": "Record input, output, reasoning, cache tokens, cost, and upstream cost when provided."},
-        "record_latency": {"type": "boolean", "description": "Record role-level connection and completion latency."},
-        "record_fallbacks": {"type": "boolean", "description": "Record every retry, fallback model, provider descent, and degraded-mode flag."},
-        "record_schema_validation": {"type": "boolean", "description": "Record output contract names and validation success/failure without leaking hidden reasoning."},
-        "reconcile_usage_by_generation_id": {"type": "boolean", "description": "Use a provider generation identifier to refresh delayed usage/cost where an official endpoint supports it."},
-        "content_logging": {"type": "string", "enum": ["none", "metadata_only", "redacted", "full"], "description": "Maximum content retained locally. full should be combined only with explicit privacy review and secure storage."}
+        "enabled": {"const": false, "description": "Optional host export is not implemented by the v0.1 MCP runtime and therefore must remain false. Canonical private run state is still written for integrity and resume."},
+        "artifact_directory": {"type": "string", "minLength": 1, "description": "Desired destination for a future host-controlled export. It does not redirect the canonical private runtime directory in v0.1."},
+        "write_jsonl_ledger": {"const": false, "description": "JSONL export is not implemented by the v0.1 MCP runtime and therefore must remain false. The canonical budget ledger is an atomic JSON artifact."},
+        "record_provider_and_model": {"type": "boolean", "description": "Host-export preference for configured provider/model fields. Canonical state records these fields independently of this preference."},
+        "record_requested_and_actual_model": {"type": "boolean", "description": "Host-export preference for requested and actual model identity. Canonical state records both independently of this preference."},
+        "record_route_metadata": {"type": "boolean", "description": "Host-export preference for sanitized route metadata. Canonical state retains available provenance independently of this preference."},
+        "record_usage_and_cost": {"type": "boolean", "description": "Host-export preference for usage and cost fields. Canonical budget enforcement and state are not disabled by this preference."},
+        "record_latency": {"type": "boolean", "description": "Host-export preference for role-level latency."},
+        "record_fallbacks": {"type": "boolean", "description": "Host-export preference for retry, fallback, and degraded-mode events."},
+        "record_schema_validation": {"type": "boolean", "description": "Host-export preference for output-contract validation results without hidden reasoning."},
+        "reconcile_usage_by_generation_id": {"type": "boolean", "description": "Host preference for a future delayed-usage reconciliation job. v0.1 records generation identifiers but does not poll a reconciliation endpoint."},
+        "content_logging": {"type": "string", "enum": ["none", "metadata_only", "redacted", "full"], "description": "Desired host-export content ceiling. It does not alter the canonical private response artifacts required for fusion and resume in v0.1."}
       }
     },
     "profile": {
       "type": "object",
       "additionalProperties": false,
       "description": "A complete named operating policy for one class of Relentless Inception run.",
-      "required": ["display_name", "description", "fusion", "gates", "budgets", "privacy", "evidence", "rescue", "execution", "observability"],
+      "required": ["display_name", "description", "objective", "fusion", "gates", "budgets", "privacy", "evidence", "rescue", "execution", "observability"],
       "properties": {
         "display_name": {"type": "string", "minLength": 1, "description": "Human-readable profile label shown by configuration and status commands."},
         "description": {"type": "string", "minLength": 1, "description": "Plain-language explanation of the profile's intelligence, cost, privacy, and execution posture."},
+        "objective": {"type": "string", "minLength": 20, "description": "Shared optimization target inserted into panel, judge, synthesis, and gate system instructions. It cannot override user scope, evidence, or execution permissions."},
         "fusion": {"$ref": "#/$defs/fusion"},
         "gates": {"$ref": "#/$defs/gates"},
         "budgets": {"$ref": "#/$defs/budgets"},

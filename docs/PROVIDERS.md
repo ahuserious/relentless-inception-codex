@@ -110,7 +110,7 @@ The plugin also supports an optional `openrouter_fusion` transport. It delegates
 
 ### Native Codex through OpenRouter
 
-Codex custom model providers currently support only the Responses wire protocol. OpenRouter offers an OpenAI-compatible Responses endpoint at `https://openrouter.ai/api/v1/responses`, but OpenRouter documents it as **beta and stateless-only**. A native Codex configuration is therefore experimental: it must pass streaming and multi-turn function-call continuation tests on the installed Codex build. See the [OpenRouter Responses documentation](https://openrouter.ai/docs/api/reference/responses/overview).
+Codex custom model providers currently support only the Responses wire protocol; the former Chat Completions wire is no longer a fallback. OpenRouter offers an OpenAI-compatible Responses endpoint at `https://openrouter.ai/api/v1/responses`, but OpenRouter documents it as **beta and stateless-only**. Codex 0.145 custom providers also advertise namespace tools, so a native OpenRouter configuration is experimental: the routed endpoint must accept the emitted tool types and pass streaming and multi-turn function-call continuation tests on the installed Codex build. See the [OpenRouter Responses documentation](https://openrouter.ai/docs/api/reference/responses/overview).
 
 The example `native-codex-openrouter-provider.toml.example` is a candidate configuration, not a compatibility guarantee.
 
@@ -173,18 +173,44 @@ Use this sequence after any provider or seat change:
 
 ## Native Codex provider setup
 
-Codex user-level provider definitions live in `~/.codex/config.toml`. Project `.codex/config.toml` cannot override machine-local provider or authentication fields. Codex's custom-provider `wire_api` currently accepts only `responses`. Refer to the official [configuration reference](https://developers.openai.com/codex/config-reference/).
+Codex user-level provider definitions live in `~/.codex/config.toml`. Project `.codex/config.toml` cannot override machine-local provider or authentication fields. Codex's custom-provider `wire_api` currently accepts only `responses`; Chat Completions is not a supported fallback. Refer to the official [configuration reference](https://developers.openai.com/codex/config-reference/) and [configuration schema](https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json).
 
 The examples directory contains:
 
+- `native-codex-agent-limits.toml.example`;
 - `native-codex-xai-provider.toml.example`;
 - `native-codex-openrouter-provider.toml.example`;
 - `native-codex-trusted-router-provider.toml.example`;
 - `native-codex-grok-reviewer-agent.toml.example`.
 
-Provider snippets must be manually merged into `~/.codex/config.toml`; do not overwrite the file. The agent example belongs at `~/.codex/agents/grok45_reviewer.toml`. Keep the reviewer read-only and keep `model_reasoning_effort = "high"` for Grok 4.5.
+Provider snippets must be manually merged into `~/.codex/config.toml`; do not overwrite the file. Codex 0.145 uses this shape for limits and role registration:
 
-After restarting Codex, verify:
+```toml
+[agents]
+max_concurrent_threads_per_session = 4
+max_depth = 1
+job_max_runtime_seconds = 1800
+interrupt_message = true
+
+[agents.grok45_reviewer]
+description = "Independent read-only Grok 4.5 adversarial reviewer."
+config_file = "/absolute/path/to/.codex/agents/grok45_reviewer.toml"
+nickname_candidates = ["Axiom", "Kepler", "Turing"]
+```
+
+Replace the placeholder with the absolute path to `~/.codex/agents/grok45_reviewer.toml`. The referenced file is a Codex config layer: keep model/provider selection, reasoning effort, the read-only/no-approval posture, tool-feature and inherited-MCP disables, and `developer_instructions` there, while keeping `description`, `config_file`, and `nickname_candidates` in the main role table. The bundled `native-codex-agent-limits.toml.example` and `native-codex-grok-reviewer-agent.toml.example` show the two halves.
+
+### Verified Codex 0.145 xAI boundary
+
+Codex 0.145 custom Responses providers advertise/send tools with `type: "namespace"` by default. xAI rejects that tool type with HTTP 422; its accepted tool types include `function`, `web_search`, and `x_search`. Changing `wire_api` to Chat Completions is not a workaround because current Codex removed that wire option. See [openai/codex#14242](https://github.com/openai/codex/issues/14242) and the current Codex [provider capability source](https://github.com/openai/codex/blob/main/codex-rs/model-provider/src/provider.rs).
+
+A local live probe found one useful but deliberately narrow exception. With web search disabled, skill instructions omitted, all known tool-producing features disabled, and every inherited MCP server disabled in the role's config layer, native Grok 4.5 returned a correct streamed text response. It can therefore act as a **single-turn, reasoning-only reviewer** when the parent includes the complete artifact and evidence in its prompt. The role requires `XAI_API_KEY` in the environment that launched Codex.
+
+That result does not establish tool compatibility. In a separate probe Grok selected a shell function and Codex executed it, but xAI rejected the continuation with `Could not decode the compaction blob`. Disabling remote compaction and raising the automatic-compaction threshold did not repair the continuation. Do not let this role call tools, retrieve evidence, inspect the workspace, or implement changes on Codex 0.145. Direct xAI seats inside the Relentless Inception MCP runtime remain the operational fusion/tool path because they use the plugin's own Responses adapter.
+
+The custom-agent config layer merges with the parent. Disabling plugins/apps is not enough when the user's main config defines MCP servers: add `[mcp_servers.<id>] enabled = false` for every inherited server, and revisit the list whenever the main configuration changes. The bundled role example shows the required feature posture and an MCP override template.
+
+After upgrading Codex or xAI, verify before granting the native role any tools:
 
 1. a plain streamed response;
 2. a function call issued by the model;
@@ -193,4 +219,4 @@ After restarting Codex, verify:
 5. timeout behavior on a high-reasoning request;
 6. requested and actual model identity.
 
-If any step fails, remove or disable the native agent and use Grok 4.5 through the external MCP panel instead.
+If the text step fails, remove or disable the native role registration and use Grok 4.5 through the external MCP panel. If text passes but any tool step fails, retain reasoning-only mode and keep every tool surface disabled.

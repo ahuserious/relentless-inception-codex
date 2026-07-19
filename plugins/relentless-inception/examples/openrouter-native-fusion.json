@@ -43,24 +43,6 @@
         "native_fusion_seat": "openrouter_native_fusion_seat",
         "native_openrouter_fusion": {
           "enabled": true,
-          "provider": "openrouter_native_fusion",
-          "router_model": "openrouter/fusion",
-          "preset": "general-high",
-          "analysis_models": [
-            "x-ai/grok-4.5",
-            "openai/gpt-5.6-sol-pro",
-            "anthropic/claude-opus-4.7"
-          ],
-          "judge_model": "anthropic/claude-opus-4.7",
-          "max_tool_calls": 16,
-          "max_completion_tokens": 49152,
-          "reasoning": {
-            "effort": "high",
-            "max_tokens": null,
-            "exclude": false
-          },
-          "panel_temperature": 1.0,
-          "tool_choice": "required",
           "fallback_to_client_orchestrated": true
         }
       },

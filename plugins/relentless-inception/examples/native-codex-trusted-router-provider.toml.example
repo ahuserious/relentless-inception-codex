@@ -1,10 +1,12 @@
 # TEMPLATE — replace the example hostname and environment-variable names, then
 # merge this table into user-level ~/.codex/config.toml.
 #
-# Native Codex use requires an OpenAI-compatible Responses API, SSE events, and
-# multi-turn function-call/output continuation. Chat-Completions compatibility
-# alone is enough for an external plugin panelist but not for a native Codex
-# provider. Verify TLS, retention, upstream fallback, and actual-model metadata.
+# Native Codex use requires an OpenAI-compatible Responses API, SSE events,
+# multi-turn function-call/output continuation, and the tool types emitted by the
+# installed Codex build. Codex 0.145 custom providers advertise namespace tools;
+# Chat-Completions compatibility is enough for an external plugin panelist but is
+# no longer a native Codex wire fallback. Verify TLS, retention, upstream
+# fallback, actual-model metadata, and the complete native tool loop.
 
 [model_providers.trusted_router_ri]
 name = "Trusted Router Responses (Relentless Inception)"

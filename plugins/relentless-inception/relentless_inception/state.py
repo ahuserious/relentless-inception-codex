@@ -39,16 +39,25 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 class RunStore:
-    def __init__(self, task: str, config: Mapping[str, Any], run_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        task: str,
+        config: Mapping[str, Any],
+        run_id: Optional[str] = None,
+        *,
+        input_identity: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self._write_lock = threading.RLock()
         self.task_hash = text_hash(task)
         self.config_hash = canonical_hash(config)
+        self.input_hash = canonical_hash(input_identity or {"operation": "task", "task": task})
         if run_id:
             if not run_id.replace("-", "").isalnum():
                 raise ConfigError("run_id may contain only letters, digits, and hyphens")
             self.run_id = run_id
         else:
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            self.run_id = f"{stamp}-{self.task_hash[:10]}"
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            self.run_id = f"{stamp}-{self.input_hash[:10]}"
         self.directory = runtime_data_dir() / "runs" / self.run_id
         self.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(runtime_data_dir(), 0o700)
@@ -57,8 +66,14 @@ class RunStore:
         self.manifest_path = self.directory / "manifest.json"
         if self.manifest_path.exists():
             manifest = self.read_json("manifest.json")
-            if manifest.get("task_hash") != self.task_hash or manifest.get("config_hash") != self.config_hash:
-                raise ConfigError("Resume refused: run_id task/config hash does not match the current request")
+            if (
+                manifest.get("task_hash") != self.task_hash
+                or manifest.get("config_hash") != self.config_hash
+                or manifest.get("input_hash") != self.input_hash
+            ):
+                raise ConfigError(
+                    "Resume refused: run_id task/config/input hash does not match the current request"
+                )
         else:
             self.write_json(
                 "manifest.json",
@@ -66,6 +81,7 @@ class RunStore:
                     "run_id": self.run_id,
                     "task_hash": self.task_hash,
                     "config_hash": self.config_hash,
+                    "input_hash": self.input_hash,
                     "status": "running",
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -80,7 +96,16 @@ class RunStore:
         return candidate
 
     def write_json(self, relative_name: str, value: Mapping[str, Any]) -> None:
-        _atomic_json(self.path(relative_name), value)
+        with self._write_lock:
+            _atomic_json(self.path(relative_name), value)
+
+    def write_budget_snapshot(self, budget: "BudgetTracker") -> Dict[str, Any]:
+        """Serialize snapshot creation and replacement so stale threads cannot regress the ledger."""
+
+        with self._write_lock:
+            snapshot = budget.snapshot()
+            _atomic_json(self.path("ledger.json"), snapshot)
+            return snapshot
 
     def read_json(self, relative_name: str) -> Dict[str, Any]:
         path = self.path(relative_name)
@@ -97,21 +122,23 @@ class RunStore:
         return self.path(relative_name).exists()
 
     def mark_stage(self, stage: str, status: str, artifact: Optional[str] = None) -> None:
-        manifest = self.read_json("manifest.json")
-        stages = manifest.setdefault("stages", {})
-        stages[stage] = {
-            "status": status,
-            "artifact": artifact,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self.write_json("manifest.json", manifest)
+        with self._write_lock:
+            manifest = self.read_json("manifest.json")
+            stages = manifest.setdefault("stages", {})
+            stages[stage] = {
+                "status": status,
+                "artifact": artifact,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.write_json("manifest.json", manifest)
 
     def finish(self, status: str) -> None:
-        manifest = self.read_json("manifest.json")
-        manifest["status"] = status
-        manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self.write_json("manifest.json", manifest)
+        with self._write_lock:
+            manifest = self.read_json("manifest.json")
+            manifest["status"] = status
+            manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.write_json("manifest.json", manifest)
 
     def check_kill(self) -> None:
         # Existence is enough: `touch KILL` must work, unlike the source plugin.
@@ -124,6 +151,7 @@ class BudgetTracker:
     def __init__(self, budget_config: Mapping[str, Any]) -> None:
         self.config = dict(budget_config)
         self.started = time.monotonic()
+        self.restored_wall_seconds = 0.0
         self.lock = threading.Lock()
         self.calls = 0
         self.input_tokens = 0
@@ -134,6 +162,7 @@ class BudgetTracker:
         self.known_cost_usd = 0.0
         self.provider_cost_usd: Dict[str, float] = {}
         self.unknown_cost_calls = 0
+        self.stop_reason: Optional[str] = None
         self.entries: list[Dict[str, Any]] = []
         self.warnings: list[str] = []
 
@@ -150,51 +179,169 @@ class BudgetTracker:
             provider_cost = snapshot.get("provider_cost_usd", {})
             self.provider_cost_usd = {str(key): float(value) for key, value in provider_cost.items()} if isinstance(provider_cost, Mapping) else {}
             self.unknown_cost_calls = int(snapshot.get("unknown_cost_calls", 0))
+            restored_stop_reason = snapshot.get("stop_reason")
+            self.stop_reason = str(restored_stop_reason) if restored_stop_reason else None
             entries = snapshot.get("entries", [])
             self.entries = list(entries) if isinstance(entries, list) else []
             warnings = snapshot.get("warnings", [])
             self.warnings = list(warnings) if isinstance(warnings, list) else []
+            self.restored_wall_seconds = max(0.0, float(snapshot.get("wall_seconds", 0.0)))
 
-    def _check_time(self) -> None:
+    def _elapsed_wall_seconds(self) -> float:
+        return self.restored_wall_seconds + (time.monotonic() - self.started)
+
+    def _enforcement(self) -> str:
+        configured = self.config.get("enforcement", "hard_stop")
+        if configured in {"hard_stop", "approval_then_hard_stop", "warn_only"}:
+            return str(configured)
+        # Configuration validation should reject this. Fail closed if a tracker is
+        # constructed directly with an invalid value.
+        return "hard_stop"
+
+    def _append_warning(self, warning: str) -> None:
+        if warning not in self.warnings:
+            self.warnings.append(warning)
+
+    def _block_dispatch(self, reason: str) -> None:
+        enforcement = self._enforcement()
+        if enforcement == "warn_only":
+            self._append_warning(reason)
+            return
+        if self.stop_reason is None:
+            self.stop_reason = reason
+        if enforcement == "approval_then_hard_stop":
+            raise BudgetExceeded(
+                f"{reason}; host approval and an explicit budget configuration change are required"
+            )
+        raise BudgetExceeded(reason)
+
+    def _check_time_before_dispatch(self) -> None:
         limit = self.config.get("max_wall_seconds")
-        if isinstance(limit, (int, float)) and time.monotonic() - self.started >= float(limit):
-            raise BudgetExceeded(f"Wall-time budget of {limit} seconds exhausted")
+        if isinstance(limit, (int, float)) and self._elapsed_wall_seconds() >= float(limit):
+            self._block_dispatch(f"Wall-time budget of {limit} seconds exhausted before dispatch")
 
-    def reserve_call(self, stage: str, seat_name: str) -> None:
+    def _observed_usage(self) -> Dict[str, float]:
+        return {
+            # Provider usage APIs report cached tokens as an input-token detail
+            # and reasoning tokens as an output-token detail. Adding either
+            # breakdown again would double-count billed tokens.
+            "total_tokens": float(self.input_tokens + self.output_tokens),
+            "input_tokens": float(self.input_tokens),
+            "output_tokens": float(self.output_tokens),
+            "reasoning_tokens": float(self.reasoning_tokens),
+            "tool_calls": float(self.tool_calls),
+            "cost_usd": self.known_cost_usd,
+        }
+
+    def _check_observed_thresholds_before_dispatch(self) -> None:
+        if self.stop_reason is not None:
+            self._block_dispatch(self.stop_reason)
+
+        observed = self._observed_usage()
+        configured_limits = (
+            ("total_tokens", "max_total_tokens", "Total token"),
+            ("input_tokens", "max_input_tokens", "Input token"),
+            ("output_tokens", "max_output_tokens", "Output token"),
+            ("reasoning_tokens", "max_reasoning_tokens", "Reasoning token"),
+            ("tool_calls", "max_tool_calls", "Server-tool call"),
+            ("cost_usd", "max_cost_usd", "Known cost"),
+        )
+        for observed_key, config_key, label in configured_limits:
+            limit = self.config.get(config_key)
+            if isinstance(limit, (int, float)) and observed[observed_key] >= float(limit):
+                rendered_limit = f"${float(limit):.2f}" if config_key == "max_cost_usd" else str(limit)
+                self._block_dispatch(
+                    f"{label} threshold of {rendered_limit} exhausted before dispatch"
+                )
+
+        per_provider_limits = self.config.get("per_provider_max_cost_usd", {})
+        if isinstance(per_provider_limits, Mapping):
+            for provider, limit in per_provider_limits.items():
+                observed_cost = self.provider_cost_usd.get(str(provider), 0.0)
+                if isinstance(limit, (int, float)) and observed_cost >= float(limit):
+                    self._block_dispatch(
+                        f"Provider {provider} cost threshold of ${float(limit):.2f} exhausted before dispatch"
+                    )
+
+        if self.unknown_cost_calls and self.config.get("unknown_cost_policy", "fail_closed") == "fail_closed":
+            self._block_dispatch("A prior model call has unknown cost; further dispatch is blocked")
+
+    def reserve_attempt(self, stage: str, seat_name: str) -> None:
+        """Atomically reserve one actual provider HTTP attempt before dispatch.
+
+        Transport retries and model fallbacks must each call this method. A
+        failed or timed-out attempt remains counted because it may have reached
+        the provider and may still be billable.
+        """
+
         with self.lock:
-            self._check_time()
+            self._check_time_before_dispatch()
+            self._check_observed_thresholds_before_dispatch()
             max_calls = self.config.get("max_calls")
             if isinstance(max_calls, int) and self.calls >= max_calls:
-                raise BudgetExceeded(f"Call budget of {max_calls} exhausted before seat {seat_name}")
+                self._block_dispatch(f"Call-attempt budget of {max_calls} exhausted before seat {seat_name}")
             reserve_fraction = self.config.get("reserve_fraction_for_synthesis_and_gates", 0)
             if stage == "panel" and isinstance(max_calls, int) and isinstance(reserve_fraction, (int, float)):
                 reserved_calls = math.ceil(max_calls * float(reserve_fraction))
                 if self.calls >= max_calls - reserved_calls:
-                    raise BudgetExceeded(
-                        f"Panel call blocked to preserve {reserved_calls} calls for synthesis and verification"
+                    self._block_dispatch(
+                        f"Panel attempt blocked to preserve {reserved_calls} attempts for synthesis and verification"
                     )
             self.calls += 1
+
+    def reserve_call(self, stage: str, seat_name: str) -> None:
+        """Compatibility alias; one call here means one provider HTTP attempt."""
+
+        self.reserve_attempt(stage, seat_name)
+
+    @staticmethod
+    def _nonnegative_usage_integer(value: Any, label: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BudgetExceeded(f"Provider returned invalid {label} usage: expected a nonnegative integer")
+        return value
+
+    @staticmethod
+    def _known_cost(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise BudgetExceeded("Provider returned invalid cost usage: expected a nonnegative finite number")
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized < 0:
+            raise BudgetExceeded("Provider returned invalid cost usage: expected a nonnegative finite number")
+        return normalized
 
     def record(self, stage: str, seat_name: str, response: ModelResponse) -> None:
         with self.lock:
             usage = response.usage
-            self.input_tokens += usage.input_tokens
-            self.output_tokens += usage.output_tokens
-            self.reasoning_tokens += usage.reasoning_tokens
-            self.cached_tokens += usage.cached_tokens
-            self.tool_calls += usage.tool_calls
+            input_tokens = self._nonnegative_usage_integer(usage.input_tokens, "input token")
+            output_tokens = self._nonnegative_usage_integer(usage.output_tokens, "output token")
+            reasoning_tokens = self._nonnegative_usage_integer(usage.reasoning_tokens, "reasoning token")
+            cached_tokens = self._nonnegative_usage_integer(usage.cached_tokens, "cached token")
+            tool_calls = self._nonnegative_usage_integer(usage.tool_calls, "tool call")
+            cost_usd = self._known_cost(usage.cost_usd)
+
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.reasoning_tokens += reasoning_tokens
+            self.cached_tokens += cached_tokens
+            self.tool_calls += tool_calls
             unknown_cost_failure: Optional[str] = None
-            if usage.cost_usd is None:
+            if cost_usd is None:
                 self.unknown_cost_calls += 1
                 if usage.unknown_cost_fail_closed:
                     unknown_cost_failure = (
                         f"Seat {seat_name} exceeded its base-rate context threshold without configured long-context pricing"
                     )
-                elif self.config.get("unknown_cost_policy", "warn") == "fail_closed":
+                elif self.config.get("unknown_cost_policy", "fail_closed") == "fail_closed":
                     unknown_cost_failure = f"Seat {seat_name} did not report cost and has no configured pricing"
+                else:
+                    self._append_warning(
+                        f"Seat {seat_name} did not report cost; dollar thresholds exclude this call"
+                    )
             else:
-                self.known_cost_usd += usage.cost_usd
-                self.provider_cost_usd[response.provider] = self.provider_cost_usd.get(response.provider, 0.0) + usage.cost_usd
+                self.known_cost_usd += cost_usd
+                self.provider_cost_usd[response.provider] = self.provider_cost_usd.get(response.provider, 0.0) + cost_usd
             self.entries.append(
                 {
                     "stage": stage,
@@ -209,52 +356,102 @@ class BudgetTracker:
                 }
             )
             if unknown_cost_failure:
+                if self.stop_reason is None:
+                    self.stop_reason = unknown_cost_failure
                 raise BudgetExceeded(unknown_cost_failure)
             total_tokens = self.input_tokens + self.output_tokens
+            exceeded_limits: list[str] = []
+            exhausted_limits: list[str] = []
             max_tokens = self.config.get("max_total_tokens")
-            if isinstance(max_tokens, int) and total_tokens > max_tokens:
-                raise BudgetExceeded(f"Token budget of {max_tokens} exceeded")
+            if isinstance(max_tokens, int):
+                if total_tokens > max_tokens:
+                    exceeded_limits.append(f"Total token threshold of {max_tokens} exceeded")
+                elif total_tokens == max_tokens:
+                    exhausted_limits.append(f"Total token threshold of {max_tokens} exhausted")
             token_limits = {
                 "input": (self.input_tokens, self.config.get("max_input_tokens")),
                 "output": (self.output_tokens, self.config.get("max_output_tokens")),
                 "reasoning": (self.reasoning_tokens, self.config.get("max_reasoning_tokens")),
             }
             for token_kind, (actual, limit) in token_limits.items():
-                if isinstance(limit, int) and actual > limit:
-                    raise BudgetExceeded(f"{token_kind.capitalize()} token budget of {limit} exceeded")
+                if isinstance(limit, int):
+                    if actual > limit:
+                        exceeded_limits.append(f"{token_kind.capitalize()} token threshold of {limit} exceeded")
+                    elif actual == limit:
+                        exhausted_limits.append(f"{token_kind.capitalize()} token threshold of {limit} exhausted")
             max_tool_calls = self.config.get("max_tool_calls")
-            if isinstance(max_tool_calls, int) and self.tool_calls > max_tool_calls:
-                raise BudgetExceeded(f"Server-tool call budget of {max_tool_calls} exceeded")
+            if isinstance(max_tool_calls, int):
+                if self.tool_calls > max_tool_calls:
+                    exceeded_limits.append(f"Server-tool call threshold of {max_tool_calls} exceeded")
+                elif self.tool_calls == max_tool_calls:
+                    exhausted_limits.append(f"Server-tool call threshold of {max_tool_calls} exhausted")
             max_cost = self.config.get("max_cost_usd")
-            if isinstance(max_cost, (int, float)) and self.known_cost_usd > float(max_cost):
-                raise BudgetExceeded(f"Known cost budget of ${float(max_cost):.2f} exceeded")
+            if isinstance(max_cost, (int, float)):
+                if self.known_cost_usd > float(max_cost):
+                    exceeded_limits.append(f"Known cost threshold of ${float(max_cost):.2f} exceeded")
+                elif self.known_cost_usd == float(max_cost):
+                    exhausted_limits.append(f"Known cost threshold of ${float(max_cost):.2f} exhausted")
             per_provider_limits = self.config.get("per_provider_max_cost_usd", {})
             provider_limit = per_provider_limits.get(response.provider) if isinstance(per_provider_limits, Mapping) else None
-            if isinstance(provider_limit, (int, float)) and self.provider_cost_usd.get(response.provider, 0.0) > float(provider_limit):
-                raise BudgetExceeded(
-                    f"Provider {response.provider} cost budget of ${float(provider_limit):.2f} exceeded"
-                )
+            if isinstance(provider_limit, (int, float)):
+                provider_cost = self.provider_cost_usd.get(response.provider, 0.0)
+                if provider_cost > float(provider_limit):
+                    exceeded_limits.append(
+                        f"Provider {response.provider} cost threshold of ${float(provider_limit):.2f} exceeded"
+                    )
+                elif provider_cost == float(provider_limit):
+                    exhausted_limits.append(
+                        f"Provider {response.provider} cost threshold of ${float(provider_limit):.2f} exhausted"
+                    )
             warning_fraction = self.config.get("warning_fraction")
             if isinstance(warning_fraction, (int, float)) and isinstance(max_cost, (int, float)):
                 threshold = float(max_cost) * float(warning_fraction)
                 warning = f"Known cost reached {float(warning_fraction):.0%} of the configured maximum"
                 if self.known_cost_usd >= threshold and warning not in self.warnings:
                     self.warnings.append(warning)
-            self._check_time()
+
+            all_thresholds = exceeded_limits + exhausted_limits
+            if all_thresholds:
+                if self._enforcement() == "warn_only":
+                    for threshold_message in all_thresholds:
+                        self._append_warning(threshold_message)
+                else:
+                    if self.stop_reason is None:
+                        self.stop_reason = all_thresholds[0]
+                    if exceeded_limits:
+                        if self._enforcement() == "approval_then_hard_stop":
+                            raise BudgetExceeded(
+                                "; ".join(exceeded_limits)
+                                + "; host approval and an explicit budget configuration change are required"
+                            )
+                        raise BudgetExceeded("; ".join(exceeded_limits))
+
+            wall_limit = self.config.get("max_wall_seconds")
+            if isinstance(wall_limit, (int, float)) and self._elapsed_wall_seconds() >= float(wall_limit):
+                wall_message = f"Wall-time threshold of {wall_limit} seconds exhausted after response"
+                if self._enforcement() == "warn_only":
+                    self._append_warning(wall_message)
+                elif self.stop_reason is None:
+                    self.stop_reason = wall_message
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
             return {
                 "calls": self.calls,
+                "attempts": self.calls,
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
                 "reasoning_tokens": self.reasoning_tokens,
                 "cached_tokens": self.cached_tokens,
+                "total_tokens": self.input_tokens + self.output_tokens,
                 "tool_calls": self.tool_calls,
-                "known_cost_usd": round(self.known_cost_usd, 8),
-                "provider_cost_usd": {key: round(value, 8) for key, value in self.provider_cost_usd.items()},
+                # Persist full numeric precision: rounding a tiny charge or a
+                # short elapsed interval down would reopen budget on resume.
+                "known_cost_usd": self.known_cost_usd,
+                "provider_cost_usd": dict(self.provider_cost_usd),
                 "unknown_cost_calls": self.unknown_cost_calls,
-                "wall_seconds": round(time.monotonic() - self.started, 3),
+                "stop_reason": self.stop_reason,
+                "wall_seconds": self._elapsed_wall_seconds(),
                 "entries": list(self.entries),
                 "warnings": list(self.warnings),
             }

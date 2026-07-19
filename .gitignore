@@ -15,3 +15,8 @@ secrets.*
 *.secret
 .env
 .env.*
+
+# The Codex plugin manifest references this registration file. A parent
+# workspace ignore rule excludes generic .mcp.json files, so re-include only
+# the reviewed plugin-local descriptor.
+!plugins/relentless-inception/.mcp.json

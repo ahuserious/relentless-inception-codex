@@ -75,7 +75,6 @@ def orchestration_config(
             "max_cost_usd": 10.0,
         }
     )
-    profile["rescue"]["allow_degraded_single_provider"] = allow_degradation
     return config
 
 
@@ -109,8 +108,16 @@ class FakeProviderRegistry:
         ),
     }
 
-    def __init__(self, *, fail_seats: Iterable[str] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        fail_seats: Iterable[str] = (),
+        verdict_blind_spots: Iterable[str] = (),
+        invalid_verdict_seats: Iterable[str] = (),
+    ) -> None:
         self.fail_seats = set(fail_seats)
+        self.verdict_blind_spots = list(verdict_blind_spots)
+        self.invalid_verdict_seats = set(invalid_verdict_seats)
         self._calls: list[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self._sequence = 0
@@ -128,7 +135,10 @@ class FakeProviderRegistry:
         prompt: str,
         response_schema: Optional[Mapping[str, Any]] = None,
         schema_name: str = "structured_response",
+        before_attempt: Optional[Any] = None,
     ) -> ModelResponse:
+        if before_attempt is not None:
+            before_attempt()
         with self._lock:
             self._sequence += 1
             request_number = self._sequence
@@ -146,34 +156,41 @@ class FakeProviderRegistry:
             raise ProviderError(f"synthetic provider failure for {seat_name}")
 
         if schema_name == "fusion_judgment":
-            text = json.dumps(
-                {
-                    "consensus": ["Use deterministic verification."],
-                    "contradictions": ["The panel differs on how aggressively to degrade."],
-                    "partial_coverage": ["Live provider discovery is outside this offline test."],
-                    "unique_insights": ["An empty kill file must be sufficient."],
-                    "minority_findings": ["HTTP success can still be semantic failure."],
-                    "blind_spots": ["External provider behavior remains untested here."],
-                    "verification_priorities": ["Bind both verdicts to the exact synthesis hash."],
-                    "final_guidance": ["Fuse evidence, then require two independent passes."],
-                }
-            )
+            judgment = {
+                "consensus": ["Use deterministic verification."],
+                "contradictions": ["The panel differs on how aggressively to degrade."],
+                "partial_coverage": ["Live provider discovery is outside this offline test."],
+                "unique_insights": ["An empty kill file must be sufficient."],
+                "minority_findings": ["HTTP success can still be semantic failure."],
+                "blind_spots": ["External provider behavior remains untested here."],
+                "verification_priorities": ["Bind both verdicts to the exact synthesis hash."],
+                "final_guidance": ["Fuse evidence, then require two independent passes."],
+            }
+            required_fields = response_schema.get("required", []) if isinstance(response_schema, Mapping) else []
+            if required_fields:
+                judgment = {field: judgment[field] for field in required_fields}
+            text = json.dumps(judgment)
         elif schema_name == "adversarial_verdict":
-            hash_match = re.search(r"Candidate artifact SHA-256: ([0-9a-f]{64})", prompt)
-            if hash_match is None:
-                raise AssertionError("Gate prompt did not supply an exact artifact SHA-256")
-            text = json.dumps(
-                {
-                    "verdict": "PASS",
-                    "artifact_sha256": hash_match.group(1),
-                    "summary": "The candidate is bound to the supplied hash and meets the test goal.",
-                    "blocking_findings": [],
-                    "non_blocking_findings": [],
-                    "evidence": ["Deterministic fake-provider evidence."],
-                    "required_actions": [],
-                }
-            )
-        elif seat_name == "grok45_synthesizer":
+            if seat_name in self.invalid_verdict_seats:
+                text = "not a JSON verdict"
+            else:
+                hash_match = re.search(r"Candidate artifact SHA-256: ([0-9a-f]{64})", prompt)
+                if hash_match is None:
+                    raise AssertionError("Gate prompt did not supply an exact artifact SHA-256")
+                text = json.dumps(
+                    {
+                        "verdict": "PASS",
+                        "artifact_sha256": hash_match.group(1),
+                        "summary": "The candidate is bound to the supplied hash and meets the test goal.",
+                        "criteria_reviewed": ["Original requirements", "mechanical evidence", "artifact identity"],
+                        "blind_spots": list(self.verdict_blind_spots),
+                        "blocking_findings": [],
+                        "non_blocking_findings": [],
+                        "evidence": ["Deterministic fake-provider evidence."],
+                        "required_actions": [],
+                    }
+                )
+        elif seat_name in {"grok45_synthesizer", "openrouter_native_fusion_seat"}:
             text = self.SYNTHESIS_TEXT
         else:
             try:
