@@ -143,21 +143,54 @@ class PluginPackageIntegrityTests(unittest.TestCase):
         self.assertEqual(default_config["native_codex"]["reviewer_roles"], [])
         self.assertEqual(default_config["native_codex"]["reasoning_only_roles"], [])
 
-    def test_grok45_cached_input_pricing_matches_documented_default(self) -> None:
+    def test_direct_xai_pricing_matches_documented_short_and_long_context_rates(self) -> None:
         default_config = load_config(include_user=False)
-        grok45_seats = {
+        expected_pricing_by_model = {
+            "grok-4.5": {
+                "input_per_million_usd": 2.0,
+                "cached_input_per_million_usd": 0.5,
+                "output_per_million_usd": 6.0,
+                "long_context_input_per_million_usd": 4.0,
+                "long_context_cached_input_per_million_usd": 1.0,
+                "long_context_output_per_million_usd": 12.0,
+                "base_rate_input_limit_tokens": 200_000,
+                "above_base_rate_behavior": "unknown_cost_fail_closed",
+            },
+            "grok-4.3": {
+                "input_per_million_usd": 1.25,
+                "cached_input_per_million_usd": 0.2,
+                "output_per_million_usd": 2.5,
+                "long_context_input_per_million_usd": 2.5,
+                "long_context_cached_input_per_million_usd": 0.4,
+                "long_context_output_per_million_usd": 5.0,
+                "base_rate_input_limit_tokens": 200_000,
+                "above_base_rate_behavior": "unknown_cost_fail_closed",
+            },
+        }
+        direct_xai_seats = {
             seat_name: seat
             for seat_name, seat in default_config["seats"].items()
-            if seat.get("model") == "grok-4.5"
+            if seat.get("provider") == "xai_direct"
         }
 
-        self.assertTrue(grok45_seats)
-        for seat_name, seat in grok45_seats.items():
+        self.assertEqual(
+            {seat["model"] for seat in direct_xai_seats.values()},
+            set(expected_pricing_by_model),
+        )
+        for seat_name, seat in direct_xai_seats.items():
             with self.subTest(seat=seat_name):
-                self.assertEqual(seat["pricing"]["cached_input_per_million_usd"], 0.5)
+                self.assertEqual(seat["pricing"], expected_pricing_by_model[seat["model"]])
 
         configuration_doc = (REPOSITORY_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
-        self.assertIn("| Grok 4.5 | $2.00 | $0.50 | $6.00 |", configuration_doc)
+        self.assertIn(
+            "| Grok 4.5 | $2.00 | $0.50 | $6.00 | $4.00 | $1.00 | $12.00 |",
+            configuration_doc,
+        )
+        self.assertIn(
+            "| Grok 4.3 | $1.25 | $0.20 | $2.50 | $2.50 | $0.40 | $5.00 |",
+            configuration_doc,
+        )
+        self.assertIn("https://docs.x.ai/developers/pricing", configuration_doc)
 
 
 if __name__ == "__main__":

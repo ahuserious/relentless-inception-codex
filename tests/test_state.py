@@ -8,12 +8,18 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from tests.support import PLUGIN_ROOT  # noqa: F401  (adds the plugin package to sys.path)
 
 from relentless_inception.errors import BudgetExceeded, ConfigError
-from relentless_inception.state import BudgetTracker, RunStore
+from relentless_inception.state import (
+    BudgetTracker,
+    RunStore,
+    call_receipt_entry_id,
+    canonical_json_hash,
+)
 from relentless_inception.types import ModelResponse, Usage
 
 
@@ -177,6 +183,210 @@ class BudgetTrackerTests(unittest.TestCase):
         with self.assertRaisesRegex(BudgetExceeded, "Call-attempt budget of 2 exhausted"):
             resumed.reserve_attempt("judge", "third")
         self.assertEqual(resumed.snapshot()["calls"], 2)
+
+    def test_attempt_and_response_receipts_form_a_deterministic_hash_chain(self) -> None:
+        tracker = BudgetTracker(budget_config())
+        invocation_sha256 = canonical_json_hash(
+            {
+                "stage": "panel",
+                "seat": "receipt-seat",
+                "system": "independent analysis",
+                "prompt": "evaluate",
+            }
+        )
+        reservation = tracker.reserve_attempt(
+            "panel",
+            "receipt-seat",
+            invocation_sha256,
+        )
+        model_response = response(
+            usage=Usage(input_tokens=2, output_tokens=3, cost_usd=0.25)
+        )
+        response_sha256 = canonical_json_hash(model_response.to_dict())
+        entry_id = call_receipt_entry_id(
+            reservation["attempt_id"],
+            invocation_sha256,
+            response_sha256,
+        )
+        response_artifact = f"responses/{entry_id}.json"
+
+        recorded_entry_index = tracker.record(
+            "panel",
+            "receipt-seat",
+            model_response,
+            attempt_index=reservation["attempt_index"],
+            attempt_id=reservation["attempt_id"],
+            invocation_sha256=invocation_sha256,
+            response_sha256=response_sha256,
+            response_artifact=response_artifact,
+        )
+
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["schema_version"], 3)
+        self.assertEqual(recorded_entry_index, 0)
+        self.assertEqual(
+            snapshot["attempt_entries"],
+            [
+                {
+                    "attempt_index": 0,
+                    "attempt_id": reservation["attempt_id"],
+                    "stage": "panel",
+                    "seat": "receipt-seat",
+                    "invocation_sha256": invocation_sha256,
+                }
+            ],
+        )
+        self.assertEqual(snapshot["entries"][0]["attempt_index"], 0)
+        self.assertEqual(snapshot["entries"][0]["attempt_id"], reservation["attempt_id"])
+        self.assertEqual(snapshot["entries"][0]["entry_id"], entry_id)
+        self.assertEqual(snapshot["entries"][0]["response_sha256"], response_sha256)
+        self.assertEqual(snapshot["entries"][0]["response_artifact"], response_artifact)
+        self.assertEqual(snapshot["entries"][0]["raw_status"], "completed")
+
+        resumed = BudgetTracker(budget_config())
+        resumed.restore(snapshot)
+        self.assertEqual(resumed.snapshot()["entries"][0]["entry_id"], entry_id)
+
+    def test_record_rejects_receipt_mismatch_without_consuming_the_attempt(self) -> None:
+        tracker = BudgetTracker(budget_config())
+        invocation_sha256 = canonical_json_hash({"fixture": "record-mismatch"})
+        reservation = tracker.reserve_call(
+            "judge",
+            "receipt-seat",
+            invocation_sha256,
+        )
+        model_response = response(
+            usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.1)
+        )
+
+        with self.assertRaisesRegex(ConfigError, "response_sha256 does not match"):
+            tracker.record(
+                "judge",
+                "receipt-seat",
+                model_response,
+                attempt_index=reservation["attempt_index"],
+                attempt_id=reservation["attempt_id"],
+                invocation_sha256=invocation_sha256,
+                response_sha256="0" * 64,
+            )
+        self.assertEqual(tracker.snapshot()["entries"], [])
+
+        response_sha256 = canonical_json_hash(model_response.to_dict())
+        entry_id = call_receipt_entry_id(
+            reservation["attempt_id"],
+            invocation_sha256,
+            response_sha256,
+        )
+        with self.assertRaisesRegex(ConfigError, "response_artifact does not match"):
+            tracker.record(
+                "judge",
+                "receipt-seat",
+                model_response,
+                attempt_index=reservation["attempt_index"],
+                attempt_id=reservation["attempt_id"],
+                invocation_sha256=invocation_sha256,
+                response_sha256=response_sha256,
+                response_artifact=f"responses/{'f' * 64}.json",
+            )
+        self.assertEqual(tracker.snapshot()["entries"], [])
+
+        tracker.record(
+            "judge",
+            "receipt-seat",
+            model_response,
+            attempt_index=reservation["attempt_index"],
+            attempt_id=reservation["attempt_id"],
+            invocation_sha256=invocation_sha256,
+            response_sha256=response_sha256,
+            response_artifact=f"responses/{entry_id}.json",
+        )
+        with self.assertRaisesRegex(ConfigError, "unrecorded reserved attempt"):
+            tracker.record(
+                "judge",
+                "receipt-seat",
+                model_response,
+                attempt_index=reservation["attempt_index"],
+                attempt_id=reservation["attempt_id"],
+                invocation_sha256=invocation_sha256,
+                response_sha256=response_sha256,
+                response_artifact=f"responses/{entry_id}.json",
+            )
+
+    def test_restore_rejects_tampered_attempt_and_response_receipts(self) -> None:
+        source = BudgetTracker(budget_config())
+        for fixture_index in range(2):
+            invocation_sha256 = canonical_json_hash(
+                {"fixture": "restore-tamper", "index": fixture_index}
+            )
+            reservation = source.reserve_attempt(
+                "panel",
+                f"seat-{fixture_index}",
+                invocation_sha256,
+            )
+            source.record(
+                "panel",
+                f"seat-{fixture_index}",
+                response(
+                    usage=Usage(
+                        input_tokens=1,
+                        output_tokens=1,
+                        cost_usd=0.1,
+                    )
+                ),
+                attempt_index=reservation["attempt_index"],
+                attempt_id=reservation["attempt_id"],
+                invocation_sha256=invocation_sha256,
+            )
+        valid_snapshot = source.snapshot()
+
+        def delete_last_attempt(candidate: dict[str, Any]) -> None:
+            candidate["attempt_entries"].pop()
+
+        def reverse_attempts(candidate: dict[str, Any]) -> None:
+            candidate["attempt_entries"].reverse()
+
+        def corrupt_attempt_invocation(candidate: dict[str, Any]) -> None:
+            candidate["attempt_entries"][0]["invocation_sha256"] = "X" * 64
+
+        def corrupt_attempt_id(candidate: dict[str, Any]) -> None:
+            candidate["attempt_entries"][0]["attempt_id"] = "0" * 64
+
+        def duplicate_recorded_attempt(candidate: dict[str, Any]) -> None:
+            candidate["entries"][1]["attempt_index"] = 0
+
+        def mismatch_entry_invocation(candidate: dict[str, Any]) -> None:
+            candidate["entries"][0]["invocation_sha256"] = "0" * 64
+
+        def corrupt_response_hash(candidate: dict[str, Any]) -> None:
+            candidate["entries"][0]["response_sha256"] = "not-a-hash"
+
+        def corrupt_entry_id(candidate: dict[str, Any]) -> None:
+            candidate["entries"][0]["entry_id"] = "0" * 64
+
+        def redirect_response_artifact(candidate: dict[str, Any]) -> None:
+            candidate["entries"][0]["response_artifact"] = "../forged.json"
+
+        def empty_raw_status(candidate: dict[str, Any]) -> None:
+            candidate["entries"][0]["raw_status"] = ""
+
+        tamper_cases = (
+            (delete_last_attempt, "attempt_entries length must equal attempts"),
+            (reverse_attempts, "zero-based attempt_index order"),
+            (corrupt_attempt_invocation, "lowercase SHA-256 digest"),
+            (corrupt_attempt_id, "attempt_id does not match its invocation"),
+            (duplicate_recorded_attempt, "more than one recorded response"),
+            (mismatch_entry_invocation, "receipt does not match its reserved attempt"),
+            (corrupt_response_hash, "lowercase SHA-256 digest"),
+            (corrupt_entry_id, "entry_id does not match its receipt"),
+            (redirect_response_artifact, "response_artifact does not match its entry_id"),
+            (empty_raw_status, "raw_status must be a nonempty string"),
+        )
+        for tamper, expected_error in tamper_cases:
+            with self.subTest(expected_error=expected_error):
+                candidate = copy.deepcopy(valid_snapshot)
+                tamper(candidate)
+                with self.assertRaisesRegex(ConfigError, expected_error):
+                    BudgetTracker(budget_config()).restore(candidate)
 
     def test_total_tokens_do_not_double_count_reasoning_and_cached_details(self) -> None:
         tracker = BudgetTracker(budget_config(max_total_tokens=10))
@@ -501,7 +711,7 @@ class BudgetTrackerTests(unittest.TestCase):
         invalid_cases = (
             ("missing fields", {}, "Unsupported budget snapshot schema"),
             ("boolean schema", {"schema_version": True}, "Unsupported budget snapshot schema"),
-            ("fractional schema", {"schema_version": 2.0}, "Unsupported budget snapshot schema"),
+            ("fractional schema", {"schema_version": 3.0}, "Unsupported budget snapshot schema"),
             ("negative counter", {"calls": -1}, "calls"),
             ("boolean counter", {"input_tokens": True}, "input_tokens"),
             ("fractional counter", {"output_tokens": 1.5}, "output_tokens"),
@@ -545,7 +755,7 @@ class BudgetTrackerTests(unittest.TestCase):
             ("invalid accounting failure", {"accounting_failure": []}, "accounting_failure"),
             (
                 "late validation failure",
-                {"calls": 9, "attempts": 9, "warnings": [1]},
+                {"warnings": [1]},
                 "warnings",
             ),
         )

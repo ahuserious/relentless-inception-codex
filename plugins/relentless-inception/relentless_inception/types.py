@@ -46,6 +46,7 @@ class SeatResult:
     role: str
     status: str
     response: Optional[ModelResponse] = None
+    response_evidence: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:

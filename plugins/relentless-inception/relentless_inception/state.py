@@ -34,6 +34,69 @@ def text_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def canonical_json_hash(value: Any) -> str:
+    """Return the SHA-256 digest of a value's canonical JSON representation."""
+
+    try:
+        canonical_json = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Receipt evidence must be valid canonical JSON") from exc
+    return text_hash(canonical_json)
+
+
+def _validated_sha256(value: Any, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ConfigError(
+            f"Invalid budget receipt: {field_name} must be a lowercase SHA-256 digest"
+        )
+    return value
+
+
+def attempt_receipt_id(invocation_sha256: str, attempt_index: int) -> str:
+    """Derive the stable identifier for one reserved provider attempt."""
+
+    _validated_sha256(invocation_sha256, "invocation_sha256")
+    if not isinstance(attempt_index, int) or isinstance(attempt_index, bool) or attempt_index < 0:
+        raise ConfigError("Invalid budget receipt: attempt_index must be a nonnegative integer")
+    return canonical_json_hash(
+        {
+            "schema_version": BudgetTracker.RECEIPT_SCHEMA_VERSION,
+            "invocation_sha256": invocation_sha256,
+            "attempt_index": attempt_index,
+        }
+    )
+
+
+def call_receipt_entry_id(
+    attempt_id: str,
+    invocation_sha256: str,
+    response_sha256: str,
+) -> str:
+    """Derive the stable identifier binding an attempt to its raw response."""
+
+    _validated_sha256(attempt_id, "attempt_id")
+    _validated_sha256(invocation_sha256, "invocation_sha256")
+    _validated_sha256(response_sha256, "response_sha256")
+    return canonical_json_hash(
+        {
+            "schema_version": BudgetTracker.RECEIPT_SCHEMA_VERSION,
+            "attempt_id": attempt_id,
+            "invocation_sha256": invocation_sha256,
+            "response_sha256": response_sha256,
+        }
+    )
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -239,7 +302,8 @@ class RunStore:
 
 
 class BudgetTracker:
-    SNAPSHOT_SCHEMA_VERSION = 2
+    SNAPSHOT_SCHEMA_VERSION = 3
+    RECEIPT_SCHEMA_VERSION = 1
 
     def __init__(self, budget_config: Mapping[str, Any]) -> None:
         self.config = dict(budget_config)
@@ -257,6 +321,7 @@ class BudgetTracker:
         self.unknown_cost_calls = 0
         self.accounting_failure: Optional[str] = None
         self.stop_reason: Optional[str] = None
+        self.attempt_entries: list[Dict[str, Any]] = []
         self.entries: list[Dict[str, Any]] = []
         self.warnings: list[str] = []
 
@@ -330,6 +395,7 @@ class BudgetTracker:
                 "accounting_failure",
                 "stop_reason",
                 "wall_seconds",
+                "attempt_entries",
                 "entries",
                 "warnings",
             }
@@ -353,6 +419,63 @@ class BudgetTracker:
             attempts = self._snapshot_nonnegative_integer(snapshot, "attempts")
             if attempts != calls:
                 raise ConfigError("Invalid budget snapshot: attempts must equal calls")
+            attempt_entries = snapshot.get("attempt_entries")
+            if not isinstance(attempt_entries, list) or any(
+                not isinstance(attempt_entry, Mapping)
+                for attempt_entry in attempt_entries
+            ):
+                raise ConfigError(
+                    "Invalid budget snapshot: attempt_entries must be an array of objects"
+                )
+            if len(attempt_entries) != attempts:
+                raise ConfigError(
+                    "Invalid budget snapshot: attempt_entries length must equal attempts"
+                )
+            required_attempt_fields = {
+                "attempt_index",
+                "attempt_id",
+                "stage",
+                "seat",
+                "invocation_sha256",
+            }
+            for expected_attempt_index, attempt_entry in enumerate(attempt_entries):
+                if required_attempt_fields.difference(attempt_entry):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: attempt entry {expected_attempt_index} "
+                        "is missing required fields"
+                    )
+                attempt_index = attempt_entry["attempt_index"]
+                if (
+                    not isinstance(attempt_index, int)
+                    or isinstance(attempt_index, bool)
+                    or attempt_index != expected_attempt_index
+                ):
+                    raise ConfigError(
+                        "Invalid budget snapshot: attempt_entries must be in zero-based "
+                        "attempt_index order"
+                    )
+                for field_name in ("stage", "seat"):
+                    if (
+                        not isinstance(attempt_entry[field_name], str)
+                        or not attempt_entry[field_name]
+                    ):
+                        raise ConfigError(
+                            f"Invalid budget snapshot: attempt entry {attempt_index} "
+                            f"{field_name} must be a nonempty string"
+                        )
+                invocation_sha256 = _validated_sha256(
+                    attempt_entry["invocation_sha256"],
+                    f"attempt_entries[{attempt_index}].invocation_sha256",
+                )
+                attempt_id = _validated_sha256(
+                    attempt_entry["attempt_id"],
+                    f"attempt_entries[{attempt_index}].attempt_id",
+                )
+                if attempt_id != attempt_receipt_id(invocation_sha256, attempt_index):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: attempt entry {attempt_index} "
+                        "attempt_id does not match its invocation"
+                    )
             total_tokens = self._snapshot_nonnegative_integer(snapshot, "total_tokens")
             if total_tokens != input_tokens + output_tokens:
                 raise ConfigError(
@@ -396,6 +519,12 @@ class BudgetTracker:
             recomputed_unknown_cost_calls = 0
             entry_accounting_failures: list[str] = []
             required_entry_fields = {
+                "attempt_index",
+                "attempt_id",
+                "entry_id",
+                "invocation_sha256",
+                "response_sha256",
+                "response_artifact",
                 "stage",
                 "seat",
                 "provider",
@@ -403,6 +532,7 @@ class BudgetTracker:
                 "actual_model",
                 "request_id",
                 "route",
+                "raw_status",
                 "latency_seconds",
                 "usage",
             }
@@ -418,12 +548,32 @@ class BudgetTracker:
                 "raw_usage_invalid",
                 "accounting_error",
             }
+            recorded_attempt_indices: set[int] = set()
             for entry_index, entry in enumerate(entries):
                 missing_entry_fields = required_entry_fields.difference(entry)
                 if missing_entry_fields:
                     raise ConfigError(
                         f"Invalid budget snapshot: entry {entry_index} is missing required fields"
                     )
+                entry_attempt_index = entry["attempt_index"]
+                if (
+                    not isinstance(entry_attempt_index, int)
+                    or isinstance(entry_attempt_index, bool)
+                    or entry_attempt_index < 0
+                    or entry_attempt_index >= len(attempt_entries)
+                ):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} attempt_index "
+                        "must identify a reserved attempt"
+                    )
+                if entry_attempt_index in recorded_attempt_indices:
+                    raise ConfigError(
+                        f"Invalid budget snapshot: reserved attempt {entry_attempt_index} "
+                        "has more than one recorded response"
+                    )
+                recorded_attempt_indices.add(entry_attempt_index)
+                reserved_attempt = attempt_entries[entry_attempt_index]
+
                 for field_name in (
                     "stage",
                     "seat",
@@ -436,6 +586,58 @@ class BudgetTracker:
                             f"Invalid budget snapshot: entry {entry_index} {field_name} "
                             "must be a nonempty string"
                         )
+                if (
+                    entry["stage"] != reserved_attempt["stage"]
+                    or entry["seat"] != reserved_attempt["seat"]
+                ):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} does not match "
+                        "its reserved attempt stage and seat"
+                    )
+                invocation_sha256 = _validated_sha256(
+                    entry["invocation_sha256"],
+                    f"entries[{entry_index}].invocation_sha256",
+                )
+                attempt_id = _validated_sha256(
+                    entry["attempt_id"],
+                    f"entries[{entry_index}].attempt_id",
+                )
+                if (
+                    invocation_sha256 != reserved_attempt["invocation_sha256"]
+                    or attempt_id != reserved_attempt["attempt_id"]
+                ):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} receipt does not "
+                        "match its reserved attempt"
+                    )
+                response_sha256 = _validated_sha256(
+                    entry["response_sha256"],
+                    f"entries[{entry_index}].response_sha256",
+                )
+                entry_id = _validated_sha256(
+                    entry["entry_id"],
+                    f"entries[{entry_index}].entry_id",
+                )
+                if entry_id != call_receipt_entry_id(
+                    attempt_id,
+                    invocation_sha256,
+                    response_sha256,
+                ):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} entry_id does not "
+                        "match its receipt"
+                    )
+                expected_response_artifact = f"responses/{entry_id}.json"
+                if entry["response_artifact"] != expected_response_artifact:
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} response_artifact "
+                        "does not match its entry_id"
+                    )
+                if not isinstance(entry["raw_status"], str) or not entry["raw_status"]:
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} raw_status "
+                        "must be a nonempty string"
+                    )
                 request_id = entry["request_id"]
                 if request_id is not None and (
                     not isinstance(request_id, str) or not request_id
@@ -566,6 +768,7 @@ class BudgetTracker:
             # Copy untrusted containers before assignment as custom Mapping or
             # list subclasses may raise while being copied.
             try:
+                restored_attempt_entries = copy.deepcopy(attempt_entries)
                 restored_entries = copy.deepcopy(entries)
                 restored_warnings = list(warnings)
             except Exception as exc:
@@ -585,6 +788,7 @@ class BudgetTracker:
             self.unknown_cost_calls = unknown_cost_calls
             self.accounting_failure = accounting_failure
             self.stop_reason = stop_reason
+            self.attempt_entries = restored_attempt_entries
             self.entries = restored_entries
             self.warnings = restored_warnings
             self.restored_wall_seconds = restored_wall_seconds
@@ -672,7 +876,12 @@ class BudgetTracker:
         if self.unknown_cost_calls and self.config.get("unknown_cost_policy", "fail_closed") == "fail_closed":
             self._block_dispatch("A prior model call has unknown cost; further dispatch is blocked")
 
-    def reserve_attempt(self, stage: str, seat_name: str) -> None:
+    def reserve_attempt(
+        self,
+        stage: str,
+        seat_name: str,
+        invocation_sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Atomically reserve one actual provider HTTP attempt before dispatch.
 
         Transport retries and model fallbacks must each call this method. A
@@ -681,6 +890,10 @@ class BudgetTracker:
         """
 
         with self.lock:
+            if not isinstance(stage, str) or not stage:
+                raise ConfigError("Invalid budget receipt: stage must be a nonempty string")
+            if not isinstance(seat_name, str) or not seat_name:
+                raise ConfigError("Invalid budget receipt: seat must be a nonempty string")
             self._check_time_before_dispatch()
             self._check_observed_thresholds_before_dispatch()
             max_calls = self.config.get("max_calls")
@@ -693,12 +906,44 @@ class BudgetTracker:
                     self._block_dispatch(
                         f"Panel attempt blocked to preserve {reserved_calls} attempts for synthesis and verification"
                     )
+            attempt_index = self.calls
+            if invocation_sha256 is None:
+                invocation_sha256 = canonical_json_hash(
+                    {
+                        "schema_version": self.RECEIPT_SCHEMA_VERSION,
+                        "kind": "budget_tracker_default_invocation",
+                        "attempt_index": attempt_index,
+                        "stage": stage,
+                        "seat": seat_name,
+                    }
+                )
+            else:
+                invocation_sha256 = _validated_sha256(
+                    invocation_sha256,
+                    "invocation_sha256",
+                )
+            attempt_id = attempt_receipt_id(invocation_sha256, attempt_index)
+            self.attempt_entries.append(
+                {
+                    "attempt_index": attempt_index,
+                    "attempt_id": attempt_id,
+                    "stage": stage,
+                    "seat": seat_name,
+                    "invocation_sha256": invocation_sha256,
+                }
+            )
             self.calls += 1
+            return {"attempt_index": attempt_index, "attempt_id": attempt_id}
 
-    def reserve_call(self, stage: str, seat_name: str) -> None:
+    def reserve_call(
+        self,
+        stage: str,
+        seat_name: str,
+        invocation_sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Compatibility alias; one call here means one provider HTTP attempt."""
 
-        self.reserve_attempt(stage, seat_name)
+        return self.reserve_attempt(stage, seat_name, invocation_sha256)
 
     @staticmethod
     def _nonnegative_usage_integer(value: Any, label: str) -> int:
@@ -722,8 +967,100 @@ class BudgetTracker:
             raise BudgetExceeded("Provider returned invalid cost usage: expected a nonnegative finite number")
         return normalized
 
-    def record(self, stage: str, seat_name: str, response: ModelResponse) -> None:
+    def record(
+        self,
+        stage: str,
+        seat_name: str,
+        response: ModelResponse,
+        *,
+        attempt_index: Optional[int] = None,
+        attempt_id: Optional[str] = None,
+        invocation_sha256: Optional[str] = None,
+        response_sha256: Optional[str] = None,
+        response_artifact: Optional[str] = None,
+    ) -> int:
         with self.lock:
+            if not isinstance(stage, str) or not stage:
+                raise ConfigError("Invalid budget receipt: stage must be a nonempty string")
+            if not isinstance(seat_name, str) or not seat_name:
+                raise ConfigError("Invalid budget receipt: seat must be a nonempty string")
+            if attempt_index is not None and (
+                not isinstance(attempt_index, int)
+                or isinstance(attempt_index, bool)
+                or attempt_index < 0
+            ):
+                raise ConfigError(
+                    "Invalid budget receipt: attempt_index must be a nonnegative integer"
+                )
+            if attempt_id is not None:
+                attempt_id = _validated_sha256(attempt_id, "attempt_id")
+            if invocation_sha256 is not None:
+                invocation_sha256 = _validated_sha256(
+                    invocation_sha256,
+                    "invocation_sha256",
+                )
+
+            recorded_attempt_indices = {
+                entry["attempt_index"] for entry in self.entries
+            }
+            matching_attempts = [
+                reserved_attempt
+                for reserved_attempt in self.attempt_entries
+                if reserved_attempt["attempt_index"] not in recorded_attempt_indices
+                and reserved_attempt["stage"] == stage
+                and reserved_attempt["seat"] == seat_name
+                and (
+                    attempt_index is None
+                    or reserved_attempt["attempt_index"] == attempt_index
+                )
+                and (
+                    attempt_id is None
+                    or reserved_attempt["attempt_id"] == attempt_id
+                )
+                and (
+                    invocation_sha256 is None
+                    or reserved_attempt["invocation_sha256"] == invocation_sha256
+                )
+            ]
+            if not matching_attempts:
+                raise ConfigError(
+                    "Invalid budget receipt: response does not match an unrecorded "
+                    "reserved attempt"
+                )
+            reserved_attempt = matching_attempts[0]
+            resolved_attempt_index = int(reserved_attempt["attempt_index"])
+            resolved_attempt_id = str(reserved_attempt["attempt_id"])
+            resolved_invocation_sha256 = str(reserved_attempt["invocation_sha256"])
+
+            expected_response_sha256 = canonical_json_hash(response.to_dict())
+            if response_sha256 is None:
+                response_sha256 = expected_response_sha256
+            else:
+                response_sha256 = _validated_sha256(
+                    response_sha256,
+                    "response_sha256",
+                )
+                if response_sha256 != expected_response_sha256:
+                    raise ConfigError(
+                        "Invalid budget receipt: response_sha256 does not match the response"
+                    )
+            entry_id = call_receipt_entry_id(
+                resolved_attempt_id,
+                resolved_invocation_sha256,
+                response_sha256,
+            )
+            expected_response_artifact = f"responses/{entry_id}.json"
+            if response_artifact is None:
+                response_artifact = expected_response_artifact
+            elif response_artifact != expected_response_artifact:
+                raise ConfigError(
+                    "Invalid budget receipt: response_artifact does not match the entry_id"
+                )
+            if not isinstance(response.raw_status, str) or not response.raw_status:
+                raise ConfigError(
+                    "Invalid budget receipt: raw_status must be a nonempty string"
+                )
+
             usage = response.usage
             response_accounting_failure: Optional[str] = None
             if usage.accounting_error is not None:
@@ -845,8 +1182,15 @@ class BudgetTracker:
                 # integrity latch, even when threshold enforcement is warn-only.
                 response_accounting_failure = unknown_cost_failure
                 recorded_usage.accounting_error = unknown_cost_failure
+            recorded_entry_index = len(self.entries)
             self.entries.append(
                 {
+                    "attempt_index": resolved_attempt_index,
+                    "attempt_id": resolved_attempt_id,
+                    "entry_id": entry_id,
+                    "invocation_sha256": resolved_invocation_sha256,
+                    "response_sha256": response_sha256,
+                    "response_artifact": response_artifact,
                     "stage": stage,
                     "seat": seat_name,
                     "provider": response.provider,
@@ -854,6 +1198,7 @@ class BudgetTracker:
                     "actual_model": response.actual_model,
                     "request_id": response.request_id,
                     "route": response.route,
+                    "raw_status": response.raw_status,
                     "latency_seconds": response.latency_seconds,
                     "usage": recorded_usage.to_dict(),
                 }
@@ -942,6 +1287,7 @@ class BudgetTracker:
                     self._append_warning(wall_message)
                 elif self.stop_reason is None:
                     self.stop_reason = wall_message
+            return recorded_entry_index
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
@@ -963,6 +1309,7 @@ class BudgetTracker:
                 "accounting_failure": self.accounting_failure,
                 "stop_reason": self.stop_reason,
                 "wall_seconds": self._elapsed_wall_seconds(),
+                "attempt_entries": list(self.attempt_entries),
                 "entries": list(self.entries),
                 "warnings": list(self.warnings),
             }

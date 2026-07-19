@@ -11,6 +11,7 @@ from unittest import mock
 
 from tests.support import PLUGIN_ROOT  # noqa: F401 - ensures the plugin package is importable
 
+from relentless_inception.config import load_config
 from relentless_inception.errors import ConfigError, ProviderError
 from relentless_inception.providers import (
     MAX_USAGE_INTEGER,
@@ -290,6 +291,62 @@ class ProviderParsingTests(unittest.TestCase):
         }
         self.assertIsNone(_calculate_cost(usage, seat))
         self.assertTrue(usage.unknown_cost_fail_closed)
+
+    def test_every_direct_xai_seat_uses_short_rates_at_200k_and_long_rates_above(self) -> None:
+        config = load_config(include_user=False)
+        direct_xai_seats = {
+            seat_name: seat
+            for seat_name, seat in config["seats"].items()
+            if seat.get("provider") == "xai_direct"
+        }
+        self.assertTrue(direct_xai_seats)
+
+        for seat_name, seat in direct_xai_seats.items():
+            pricing = seat["pricing"]
+            with self.subTest(seat=seat_name, input_tokens=200_000):
+                boundary_usage = Usage(
+                    input_tokens=200_000,
+                    cached_tokens=50_000,
+                    output_tokens=10_000,
+                )
+                expected_boundary_cost = (
+                    150_000 * pricing["input_per_million_usd"]
+                    + 50_000 * pricing["cached_input_per_million_usd"]
+                    + 10_000 * pricing["output_per_million_usd"]
+                ) / 1_000_000
+                self.assertAlmostEqual(
+                    _calculate_cost(boundary_usage, seat),
+                    expected_boundary_cost,
+                )
+                self.assertFalse(boundary_usage.unknown_cost_fail_closed)
+
+            with self.subTest(seat=seat_name, input_tokens=200_001):
+                long_context_usage = Usage(
+                    input_tokens=200_001,
+                    cached_tokens=50_000,
+                    output_tokens=10_000,
+                )
+                expected_long_context_cost = (
+                    150_001 * pricing["long_context_input_per_million_usd"]
+                    + 50_000 * pricing["long_context_cached_input_per_million_usd"]
+                    + 10_000 * pricing["long_context_output_per_million_usd"]
+                ) / 1_000_000
+                self.assertAlmostEqual(
+                    _calculate_cost(long_context_usage, seat),
+                    expected_long_context_cost,
+                )
+                self.assertFalse(long_context_usage.unknown_cost_fail_closed)
+
+            for missing_rate in (
+                "long_context_input_per_million_usd",
+                "long_context_output_per_million_usd",
+            ):
+                with self.subTest(seat=seat_name, missing_rate=missing_rate):
+                    incomplete_seat = copy.deepcopy(seat)
+                    del incomplete_seat["pricing"][missing_rate]
+                    incomplete_usage = Usage(input_tokens=200_001, output_tokens=1)
+                    self.assertIsNone(_calculate_cost(incomplete_usage, incomplete_seat))
+                    self.assertTrue(incomplete_usage.unknown_cost_fail_closed)
 
     def test_calculated_cost_keeps_sub_cent_precision(self) -> None:
         usage = Usage(input_tokens=1, output_tokens=0)

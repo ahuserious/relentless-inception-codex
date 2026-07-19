@@ -60,6 +60,7 @@ For a shell-level diagnostic without installation:
 - xAI/OpenAI Responses retention defaults to `store: false`.
 - Model outputs are untrusted data and are fenced in downstream prompts.
 - During `fuse` or `adversarial_gate`, every HTTP-success response that fails semantic validation is persisted and accounted before fallback; its usage, cost, or unknown-cost status can latch a stop and prevent fallback.
+- Every reusable model result participates in the schema-v3 run-ledger receipt chain binding the run and hashed prompt, reserved HTTP attempt, complete visible response, private raw artifact, and exact ledger entry; incomplete crash state fails closed without redispatch.
 - Panel, call, token, tool-call, provider-cost, total-cost, wall-time, and concurrency limits are enforced within a run/process. A cross-process lease permits only one active owner for a run ID, but it does not globally coordinate provider concurrency across distinct run IDs or processes.
 - Duplicate panel, optional-panel, or reviewer entries and required/optional panel overlap are rejected. Any completed `NEEDS_WORK` or `FAIL` verdict blocks a gate even when the numeric `PASS` quorum is met.
 - Maximum-intelligence mode fails closed on panel collapse, schema failure, gate failure, or budget exhaustion.

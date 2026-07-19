@@ -103,16 +103,16 @@ Common controls include:
 
 ### Direct xAI pricing
 
-The fallback cost estimator uses the current published base rates when xAI does not report a request cost:
+The fallback cost estimator uses xAI's current published rates when xAI does not report a request cost:
 
-| Model | Input / 1M | Cached input / 1M | Output / 1M |
-|---|---:|---:|---:|
-| Grok 4.5 | $2.00 | $0.50 | $6.00 |
-| Grok 4.3 | $1.25 | $0.20 | $2.50 |
+| Model | Short input / 1M | Short cached / 1M | Short output / 1M | Input above 200K / 1M | Cached above 200K / 1M | Output above 200K / 1M |
+|---|---:|---:|---:|---:|---:|---:|
+| Grok 4.5 | $2.00 | $0.50 | $6.00 | $4.00 | $1.00 | $12.00 |
+| Grok 4.3 | $1.25 | $0.20 | $2.50 | $2.50 | $0.40 | $5.00 |
 
-Grok 4.5 documents higher pricing above 200,000 input tokens. The shipped seats set `base_rate_input_limit_tokens: 200000` and `above_base_rate_behavior: unknown_cost_fail_closed`. When the provider reports exact cost, that value wins. Otherwise the runtime refuses to treat the lower base rate as authoritative above the threshold. You can instead configure explicit `long_context_*_per_million_usd` rates or deliberately select `use_base_rate`, but the latter is not a safe upper bound.
+Both models use higher long-context rates above 200,000 input tokens. Every shipped direct xAI seat sets `base_rate_input_limit_tokens: 200000`, supplies all three `long_context_*_per_million_usd` rates, and keeps `above_base_rate_behavior: unknown_cost_fail_closed`. Exactly 200,000 input tokens uses the short-context rates; a larger request uses the long-context rates. Provider-reported exact cost still wins. If the configured long-context input or output rate becomes unavailable, the fallback estimator refuses to invent a price and marks the cost unknown instead of reusing a lower short-context rate.
 
-Pricing changes over time. Verify rates against the [xAI model catalog](https://docs.x.ai/developers/models) before relying on configured estimates.
+Pricing changes over time. Verify rates against the official [xAI pricing table](https://docs.x.ai/developers/pricing) before relying on configured estimates.
 
 ### OpenRouter provider routing
 
@@ -264,7 +264,7 @@ External API seats are data egress. The default:
 
 Raw visible provider responses **are persisted locally** because the synthesizer needs the original evidence, gates bind to the exact artifact, and crash resume must not silently re-run costly calls. They live only under the private plugin run directory: directories are mode `0700`, files are mode `0600`. Ordinary observability logging remains `metadata_only`; the private response artifact is a separate required run-state object. Provider retention is independent and governed by provider policy.
 
-The 0.1.1 runtime accepts only internal budget-ledger snapshot schema v2 and synthesis artifacts with explicit orchestration-mode and author-seat provenance. Pre-0.1.1 run directories remain preserved, but cannot be resumed or safely migrated; start the work again with a new run ID. This internal ledger version does not change the user configuration's required `schema_version: 1`. The [architecture compatibility note](ARCHITECTURE.md#run-state-compatibility) explains the fail-closed boundary.
+The 0.1.1 runtime accepts only internal budget-ledger snapshot schema v3. Each cached model result must carry a receipt that binds its hashed prompt invocation, reserved attempt, complete visible response, private raw-response artifact, and exact ledger entry. Synthesis artifacts also identify their orchestration mode and author seat. Pre-0.1.1 run directories remain preserved, but cannot be resumed or safely migrated; start the work again with a new run ID. This internal ledger version does not change the user configuration's required `schema_version: 1`. The [architecture compatibility note](ARCHITECTURE.md#run-state-compatibility) explains the fail-closed boundary.
 
 Do not select a metadata-only/non-resumable response mode until the runtime explicitly implements one. Deleting local run state does not delete provider logs.
 

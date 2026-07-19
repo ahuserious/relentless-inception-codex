@@ -76,6 +76,8 @@ Default privacy posture for the maximum-intelligence profile:
 
 These settings cannot override a provider's real policy. Review each direct provider and each possible router upstream for retention, training, abuse monitoring, jurisdiction, and subprocessors. A router's zero-data-retention flag may restrict eligible upstreams or fail when no matching upstream is available; verify the actual route.
 
+The private run state uses canonical SHA-256 receipts to detect mismatched, corrupted, swapped, or partially written invocation, attempt, response, cache, and ledger artifacts. These are unkeyed integrity links, not signatures: a process with arbitrary write access to the entire private run directory can rewrite every linked artifact and recompute the hashes. Protect the runtime directory as part of the local trust boundary; defending against a fully compromised local account would require an external append-only or keyed trust anchor.
+
 ### xAI storage
 
 The xAI Responses API supports stored responses and documents 30-day retention for stored responses. The plugin requires `store: false` for the default xAI provider. Change it only after informed consent. `store: false` is not a promise that every operational log vanishes; xAI's current terms and data controls remain authoritative.
