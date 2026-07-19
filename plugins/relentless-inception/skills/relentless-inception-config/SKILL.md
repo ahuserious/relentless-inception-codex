@@ -50,12 +50,14 @@ For each requested change:
 4. Call `config_set` for the smallest dotted-path change accepted by the tool schema.
 5. Call `config_validate`.
 6. Call `doctor`.
-7. Use `provider_models` to confirm the live model id and `provider_test` to test every new load-bearing seat.
+7. Use `provider_models` to confirm the live model id and `provider_test` to test every ordinary new load-bearing seat. `provider_test` refuses OpenRouter Fusion because one request can fan out; verify that path only with an explicitly budgeted disposable fusion run.
 8. Show the redacted final value and state what was not tested.
 
 Never write a credential value through `config_set`. Store only an environment-variable name such as `XAI_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or a router-specific key name.
 
 Supply the actual API key through the MCP process environment or the plugin's credential-file bridge. The bridge accepts paths from top-level `secret_env_files` and from the path-list environment variable `RELENTLESS_INCEPTION_SECRETS_FILE`. Each path must resolve to a regular file owned by the current user with mode `0600`. Files contain static `NAME=value` entries; blank lines, comments, optional `export ` prefixes, and matching quote pairs are accepted, while shell expansion and command substitution are rejected. The files are parsed as data and are never sourced or executed. Process-environment values take precedence over file values, and credential values are never returned by the settings tools. Use a user-local path outside the repository and do not put an actual key in a native Codex example or agent file.
+
+Authenticated completion and model-discovery requests refuse redirects. Configure the final intended HTTPS `base_url`; do not rely on a redirect to move credentials or task material to another origin.
 
 ## Provider choices
 
@@ -108,7 +110,7 @@ Explain these choices when present in the schema:
 - same-artifact hash enforcement;
 - maximum review iterations and timeouts.
 
-`required_passes` is a same-run reviewer quorum: for example, `2` means two separate reviewer seats must independently pass the identical artifact SHA-256. It is not two sequential whole-gate rounds. A higher-level release workflow may deliberately run the whole gate twice on the same unchanged commit hash, but that is an additional host policy. Any edit, regenerated output, changed dependency lockfile, or replaced evidence log invalidates the prior quorum and any host-level round count.
+Validation rejects duplicate names within required panels, optional panels, and reviewer lists, plus overlap between the required and optional panel. For a `fuse` artifact, enabled author exclusion compares reviewers with the actual synthesis author. `required_passes` is a same-run reviewer quorum: for example, `2` means two separate reviewer seats must independently pass the identical artifact SHA-256. Every completed `NEEDS_WORK` or `FAIL` blocks even when that numeric quorum is met. It is not two sequential whole-gate rounds. A higher-level release workflow may deliberately run the whole gate twice on the same unchanged commit hash, but that is an additional host policy. Any edit, regenerated output, changed dependency lockfile, or replaced evidence log invalidates the prior quorum and any host-level round count.
 
 ## Native Codex opt-in setup
 
@@ -121,7 +123,7 @@ Only offer native setup when the user explicitly wants Grok or another provider 
 5. Ask before writing either path.
 6. After setup, restart or reload Codex and smoke-test a text response. Before exposing any tool, separately pass a streamed two-turn function-call/output continuation.
 
-Native xAI/OpenRouter/trusted-router compatibility is protocol-level and version-sensitive. On the locally tested Codex 0.145/xAI combination, a foreground tool-free Grok 4.5 turn succeeded, but a real parent-spawned custom-agent turn failed with HTTP 422 because its input did not match xAI's accepted `ModelInput`; a function-result continuation failed separately. Do not register native Grok on that build. Use external MCP seats as the operational Grok subagents. For future retesting, disable every tool surface; an MCP override must repeat the matching `command` or `url` transport with `enabled = false` because Codex rejects enabled-only partial role tables. Require strict-config diagnostics and a successful parent-spawned text probe before registration, then test the complete tool loop before granting tools.
+Native xAI/OpenRouter/trusted-router compatibility is protocol-level and version-sensitive. On the locally tested Codex 0.145/xAI combination, a foreground tool-free Grok 4.5 turn succeeded, but a real parent-spawned custom-agent turn failed with HTTP 422 because its input did not match xAI's accepted `ModelInput`; a function-result continuation failed separately. Do not register native Grok on that build. Use external MCP seats as the operational Grok deliberation path. For future retesting, disable every tool surface; an MCP override must repeat the matching `command` or `url` transport with `enabled = false` because Codex rejects enabled-only partial role tables. Require strict-config diagnostics and a successful parent-spawned text probe before registration, then test the complete tool loop before granting tools.
 
 ## Finish
 

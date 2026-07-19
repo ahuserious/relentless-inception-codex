@@ -198,6 +198,48 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(any("requests reasoning" in error for error in errors), errors)
         self.assertTrue(any("capabilities.structured_outputs=true" in error for error in errors), errors)
 
+    def test_validation_rejects_duplicate_or_overlapping_independent_seats(self) -> None:
+        cases = (
+            (
+                "duplicate panel",
+                "fusion",
+                "panel",
+                ["grok45_researcher", "grok45_researcher"],
+                "fusion.panel must not contain duplicate seat names",
+            ),
+            (
+                "duplicate optional panel",
+                "fusion",
+                "optional_panel",
+                ["openrouter_sol_pro_panel", "openrouter_sol_pro_panel"],
+                "fusion.optional_panel must not contain duplicate seat names",
+            ),
+            (
+                "panel overlap",
+                "fusion",
+                "optional_panel",
+                ["grok45_researcher"],
+                "fusion.panel and optional_panel must not overlap",
+            ),
+            (
+                "duplicate reviewers",
+                "gates",
+                "reviewers",
+                ["grok45_verifier", "grok45_verifier"],
+                "gates.reviewers must not contain duplicate seat names",
+            ),
+        )
+
+        for label, section, field, value, expected_error in cases:
+            with self.subTest(case=label):
+                config = load_config(include_user=False)
+                profile = config["profiles"]["maximum_intelligence"]
+                profile[section][field] = value
+
+                errors = validate_config(config)
+
+                self.assertTrue(any(expected_error in error for error in errors), errors)
+
     def test_malformed_cross_reference_values_report_errors_without_crashing(self) -> None:
         malformed_cases = []
 

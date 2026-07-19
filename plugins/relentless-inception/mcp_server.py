@@ -60,7 +60,12 @@ TOOLS = [
     ),
     _tool(
         "provider_test",
-        "Send a tiny PONG completion through one configured seat. This is opt-in and can incur API cost.",
+        (
+            "Send a tiny, tool-free PONG completion through one ordinary configured seat with local "
+            "seat-level model fallback disabled. "
+            "This is opt-in and billable; OpenRouter Fusion seats are refused because one request can "
+            "fan out to multiple inner models."
+        ),
         {"seat": {"type": "string"}},
         ["seat"],
     ),

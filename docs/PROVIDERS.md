@@ -39,6 +39,8 @@ Every credential file must be a regular file owned by the current user with mode
 
 For example, a private file may contain `XAI_API_KEY=...`, while the provider configuration contains only `"api_key_env": "XAI_API_KEY"`. The key value is never returned by `config_show`, `config_get`, `doctor`, or `provider_test`. Keep credential files outside repositories and native agent files. The bridge supplies the primary API key only; provider-specific extra headers still follow the installed schema's environment-backed header contract.
 
+Authenticated completion and model-discovery requests do not follow redirects. A redirect fails at the configured origin before the adapter can forward `Authorization` or environment-backed headers to another URL. Configure `base_url` as the final intended HTTPS origin rather than relying on redirection.
+
 ## Direct xAI and Grok 4.5
 
 The current xAI values are:
@@ -159,6 +161,8 @@ A seat can list fallback models, but fallback occurs only when the seat explicit
 
 Never present a fallback response under the original model's name. For high-assurance review, prefer a failed required seat over a silent substitution.
 
+During `fuse` or `adversarial_gate`, an HTTP-success response that fails JSON or semantic validation is still potentially billable. Before considering model fallback, the runtime persists a failure response artifact and records returned usage/cost, or unknown cost when the response cannot be decoded. That accounting can latch a blocking budget stop; when it does, no fallback request is sent.
+
 ## Provider preflight
 
 Use this sequence after any provider or seat change:
@@ -169,7 +173,7 @@ Use this sequence after any provider or seat change:
 4. `provider_test`
 5. one small structured-output fusion or gate in a disposable task
 
-`provider_test` proves a basic completion path only. It does not prove cost reporting, long-context behavior, structured output, every reasoning effort, tool calling, or native Codex compatibility.
+`provider_test` is a tiny, tool-free `PONG` probe for ordinary seats with local seat-level model fallback disabled. It proves a basic completion path only; it does not prove cost reporting, long-context behavior, structured output, every reasoning effort, tool calling, router-level routing behavior, or native Codex compatibility. The tool refuses `openrouter_fusion` seats before dispatch because one Fusion request can invoke multiple inner models and is not a bounded low-cost connectivity probe. Test that path only with an explicitly budgeted disposable fusion run.
 
 ## Native Codex provider setup
 
@@ -206,7 +210,7 @@ Codex 0.145 custom Responses providers advertise/send tools with `type: "namespa
 
 A direct foreground probe found one narrow partial success. With web search disabled, skill instructions omitted, all known tool-producing features disabled, and every inherited MCP server disabled, Grok 4.5 returned a correct streamed text response. That did **not** establish custom-agent compatibility. An end-to-end Codex parent→`grok45_reviewer` spawn subsequently failed with HTTP 422 even in an isolated, tool-minimal configuration; xAI reported that the request body did not match any accepted `ModelInput` variant.
 
-The spawned-text failure is already blocking. In a separate probe Grok selected a shell function and Codex executed it, but xAI also rejected the continuation with `Could not decode the compaction blob`. Disabling remote compaction and raising the automatic-compaction threshold did not repair the continuation. Do not register or select this native role on the tested Codex 0.145 build. Direct xAI seats inside the Relentless Inception MCP runtime remain the operational Grok-subagent, fusion, and provider-tool path because they use the plugin's own Responses adapter.
+The spawned-text failure is already blocking. In a separate probe Grok selected a shell function and Codex executed it, but xAI also rejected the continuation with `Could not decode the compaction blob`. Disabling remote compaction and raising the automatic-compaction threshold did not repair the continuation. Do not register or select this native role on the tested Codex 0.145 build. Direct xAI seats inside the Relentless Inception MCP runtime remain the operational Grok deliberation, fusion, and provider-tool path because they use the plugin's own Responses adapter.
 
 The custom-agent config layer merges with the parent, but Codex first deserializes the role file on its own. Disabling plugins/apps is not enough when the user's main config defines MCP servers. For every inherited server, repeat the matching transport discriminator (`command` for stdio or `url` for HTTP) alongside `enabled = false`; an enabled-only partial table fails with `invalid transport`. Do not copy literal credentials. Revisit the list whenever the main configuration changes, run `codex --strict-config doctor --json`, and refuse to register the role if the standalone layer is malformed or any inherited tool remains exposed. The bundled role example shows both transport shapes.
 

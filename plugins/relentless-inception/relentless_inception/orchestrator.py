@@ -185,6 +185,18 @@ def _validate_string_list(value: Any, field: str) -> List[str]:
     return value
 
 
+def _duplicate_seat_names(seat_names: Sequence[Any]) -> List[str]:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for seat_name in seat_names:
+        if not isinstance(seat_name, str):
+            continue
+        if seat_name in seen:
+            duplicates.add(seat_name)
+        seen.add(seat_name)
+    return sorted(duplicates)
+
+
 def validate_judgment(value: Mapping[str, Any], required_fields: Sequence[str] = JUDGE_FIELDS) -> Dict[str, Any]:
     expected_fields = tuple(str(field) for field in required_fields)
     unexpected = set(value) - set(expected_fields)
@@ -237,6 +249,10 @@ def validate_verdict(value: Mapping[str, Any], artifact_hash: str) -> Dict[str, 
         validated[field] = _validate_string_list(value[field], field)
     if not validated["criteria_reviewed"]:
         raise ProviderError("Verdict criteria_reviewed must identify at least one checked criterion")
+    if verdict == "PASS" and validated["blocking_findings"]:
+        raise ProviderError("PASS verdict cannot include blocking_findings")
+    if verdict == "PASS" and validated["required_actions"]:
+        raise ProviderError("PASS verdict cannot include required_actions")
     return validated
 
 
@@ -284,6 +300,30 @@ class FusionOrchestrator:
             # failed retry or process restart cannot erase it.
             store.write_budget_snapshot(budget)
 
+        def persist_and_record_response(response: ModelResponse) -> None:
+            # This callback also handles paid HTTP-success responses that fail
+            # provider semantics before a model fallback can be attempted.
+            response_artifact = {
+                "stage": stage,
+                "seat_name": seat_name,
+                "response": response.to_dict(),
+            }
+            response_artifact_hash = text_hash(
+                json.dumps(
+                    response_artifact,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+            )
+            store.write_json(f"responses/{response_artifact_hash}.json", response_artifact)
+            try:
+                budget.record(stage, seat_name, response)
+            finally:
+                # An over-threshold response is already billable evidence.
+                # Persist its usage and stop latch even when record() fails.
+                store.write_budget_snapshot(budget)
+
         response = self.registry.complete(
             seat_name,
             system=system,
@@ -291,25 +331,9 @@ class FusionOrchestrator:
             response_schema=response_schema,
             schema_name=schema_name,
             before_attempt=reserve_and_persist_attempt,
+            on_semantic_failure_response=persist_and_record_response,
         )
-        # Persist every normalized visible provider response before any budget,
-        # schema, or quality-floor check can reject it. Paid-but-invalid evidence
-        # must survive failure and resume just as successful evidence does.
-        response_artifact = {
-            "stage": stage,
-            "seat_name": seat_name,
-            "response": response.to_dict(),
-        }
-        response_artifact_hash = text_hash(
-            json.dumps(response_artifact, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        )
-        store.write_json(f"responses/{response_artifact_hash}.json", response_artifact)
-        try:
-            budget.record(stage, seat_name, response)
-        finally:
-            # An over-threshold response is already billable evidence. Persist its
-            # usage and stop latch even when record() fails closed.
-            store.write_budget_snapshot(budget)
+        persist_and_record_response(response)
         store.check_kill()
         return response
 
@@ -323,8 +347,30 @@ class FusionOrchestrator:
         store: RunStore,
     ) -> List[Dict[str, Any]]:
         fusion = profile["fusion"]
-        seat_names = list(fusion["panel"])
-        for optional_seat_name in fusion.get("optional_panel", []):
+        panel_seat_names = list(fusion["panel"])
+        optional_seat_names = list(fusion.get("optional_panel", []))
+        duplicate_panel_seats = _duplicate_seat_names(panel_seat_names)
+        duplicate_optional_seats = _duplicate_seat_names(optional_seat_names)
+        overlapping_seats = sorted(
+            {seat_name for seat_name in panel_seat_names if isinstance(seat_name, str)}
+            & {seat_name for seat_name in optional_seat_names if isinstance(seat_name, str)}
+        )
+        if duplicate_panel_seats:
+            raise ConfigError(
+                f"fusion.panel must not contain duplicate seat names {duplicate_panel_seats}"
+            )
+        if duplicate_optional_seats:
+            raise ConfigError(
+                "fusion.optional_panel must not contain duplicate seat names "
+                f"{duplicate_optional_seats}"
+            )
+        if overlapping_seats:
+            raise ConfigError(
+                f"fusion.panel and optional_panel must not overlap {overlapping_seats}"
+            )
+
+        seat_names = list(panel_seat_names)
+        for optional_seat_name in optional_seat_names:
             optional_seat = self._seat_config(str(optional_seat_name))
             provider = self.config.get("providers", {}).get(optional_seat.get("provider"), {})
             if optional_seat.get("enabled", True) is True and isinstance(provider, Mapping) and provider.get("enabled", True) is True:
@@ -554,6 +600,7 @@ class FusionOrchestrator:
         store: RunStore,
         mechanical_evidence: str,
         round_index: int,
+        artifact_author_seat: Optional[str],
     ) -> Dict[str, Any]:
         gates = profile.get("gates", {})
         artifact_hash = text_hash(artifact)
@@ -566,18 +613,46 @@ class FusionOrchestrator:
                 "required_passes": 0,
             }
         artifact_name = f"gate-{round_index}.json"
+        reviewer_names = list(gates.get("reviewers", []))
+        if not reviewer_names:
+            raise ConfigError("Adversarial gates are enabled but no reviewers are configured")
+        duplicate_reviewers = _duplicate_seat_names(reviewer_names)
+        if duplicate_reviewers:
+            raise ConfigError(
+                f"gates.reviewers must not contain duplicate seat names {duplicate_reviewers}"
+            )
+        require_author_separation = gates.get("exclude_artifact_author", True)
+        if (
+            require_author_separation
+            and artifact_author_seat is not None
+            and artifact_author_seat in reviewer_names
+        ):
+            raise ConfigError(
+                "Gate author separation requires reviewer seats distinct from the actual artifact author "
+                f"{artifact_author_seat!r}"
+            )
         if store.exists(artifact_name):
             saved = store.read_json(artifact_name)
             if saved.get("artifact_sha256") != artifact_hash:
                 raise ConfigError("Stored gate artifact hash does not match the current synthesis")
+            saved_reviews = saved.get("reviewers", [])
+            if not isinstance(saved_reviews, list):
+                raise ConfigError("Stored gate reviewers must be an array")
+            for saved_review in saved_reviews:
+                if not isinstance(saved_review, Mapping) or saved_review.get("status") != "completed":
+                    continue
+                saved_verdict = saved_review.get("verdict")
+                if not isinstance(saved_verdict, Mapping):
+                    raise ConfigError("Stored completed gate review is missing its verdict")
+                try:
+                    validated_saved_verdict = validate_verdict(saved_verdict, artifact_hash)
+                except ProviderError as exc:
+                    raise ConfigError(f"Stored gate reviewer verdict is invalid: {exc}") from exc
+                if saved.get("passed") is True and validated_saved_verdict["verdict"] != "PASS":
+                    raise ConfigError(
+                        "Stored gate cannot pass while a completed reviewer returned a blocking negative verdict"
+                    )
             return saved
-        reviewer_names = list(gates.get("reviewers", []))
-        if not reviewer_names:
-            raise ConfigError("Adversarial gates are enabled but no reviewers are configured")
-        synthesizer = str(profile["fusion"]["synthesizer"])
-        require_author_separation = gates.get("exclude_artifact_author", True)
-        if require_author_separation and synthesizer in reviewer_names:
-            raise ConfigError("Gate author separation requires reviewer seats distinct from the synthesizer")
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
         max_concurrency = min(int(gates.get("max_concurrency", 2)), len(reviewer_names))
 
@@ -636,6 +711,20 @@ class FusionOrchestrator:
         pass_count = sum(
             1 for review in reviews if review.get("status") == "completed" and review["verdict"]["verdict"] == "PASS"
         )
+        negative_verdicts = [
+            {
+                "seat_name": str(review.get("seat_name", "unknown")),
+                "verdict": str(review["verdict"]["verdict"]),
+                "summary": str(review["verdict"]["summary"]),
+                "blocking_findings": list(review["verdict"]["blocking_findings"]),
+                "required_actions": list(review["verdict"]["required_actions"]),
+                "evidence": list(review["verdict"]["evidence"]),
+            }
+            for review in reviews
+            if review.get("status") == "completed"
+            and review["verdict"]["verdict"] in {"FAIL", "NEEDS_WORK"}
+        ]
+        negative_verdict_blocked = bool(negative_verdicts)
         required_passes = int(gates.get("required_passes", len(reviewer_names)))
         fail_closed = gates.get("fail_closed", True) is True
         failed_reviews = any(review.get("status") != "completed" for review in reviews)
@@ -664,6 +753,14 @@ class FusionOrchestrator:
             and gates.get("blind_spot_requires_targeted_review", True) is True
         )
         deterministic_blockers = []
+        if negative_verdict_blocked:
+            deterministic_blockers.append(
+                "At least one reviewer returned a blocking negative verdict: "
+                + "; ".join(
+                    f"{review['seat_name']}: {review['verdict']}"
+                    for review in negative_verdicts
+                )
+            )
         if mechanical_blocked:
             deterministic_blockers.append(
                 "Mechanical evidence reports failure: " + "; ".join(mechanical_failures)
@@ -687,6 +784,7 @@ class FusionOrchestrator:
             and not mechanical_blocked
             and not blind_spot_blocked
             and not schema_blocked
+            and not negative_verdict_blocked
         )
         result = {
             "enabled": True,
@@ -699,6 +797,8 @@ class FusionOrchestrator:
             "mechanical_blocked": mechanical_blocked,
             "schema_failures": schema_failures,
             "schema_blocked": schema_blocked,
+            "negative_verdicts": negative_verdicts,
+            "negative_verdict_blocked": negative_verdict_blocked,
             "unresolved_blind_spots": unresolved_blind_spots,
             "blind_spot_blocked": blind_spot_blocked,
             "deterministic_blockers": deterministic_blockers,
@@ -758,11 +858,14 @@ class FusionOrchestrator:
             },
         )
         budget = BudgetTracker(profile.get("budgets", {}))
-        if store.exists("ledger.json"):
-            budget.restore(store.read_json("ledger.json"))
-        store.check_kill()
+        accounting_initialized = False
         try:
+            if store.exists("ledger.json"):
+                budget.restore(store.read_json("ledger.json"))
+            accounting_initialized = True
+            store.check_kill()
             fusion_config = profile["fusion"]
+            artifact_author_seat = str(fusion_config["synthesizer"])
             configured_engine = str(fusion_config.get("engine", "client_orchestrated"))
             fusion_mode = {
                 "client_orchestrated": "client",
@@ -797,6 +900,7 @@ class FusionOrchestrator:
                 elif store.exists("synthesis.json"):
                     saved_synthesis = store.read_json("synthesis.json")
                     synthesis = str(saved_synthesis["text"])
+                    artifact_author_seat = str(seat_name)
                     reports = []
                     judgment = _native_openrouter_judgment()
                 else:
@@ -817,6 +921,7 @@ class FusionOrchestrator:
                         reports = []
                         judgment = _native_openrouter_judgment()
                         synthesis = response.text
+                        artifact_author_seat = str(seat_name)
                         quality_floor = fusion_config.get("quality_floor", {})
                         if isinstance(quality_floor, Mapping):
                             _validate_quality_floor(
@@ -837,6 +942,7 @@ class FusionOrchestrator:
                     except ProviderError as exc:
                         if not allow_fallback:
                             raise
+                        artifact_author_seat = str(fusion_config["synthesizer"])
                         store.write_json(
                             "native-openrouter-failure.json",
                             {"status": "failed", "error": str(exc), "fallback": "client_orchestrated"},
@@ -856,13 +962,23 @@ class FusionOrchestrator:
             else:
                 raise ConfigError(f"Unsupported fusion mode: {fusion_mode}")
 
-            gate = self._review_artifact(task, synthesis, profile, budget, store, mechanical_evidence, 0)
+            gate = self._review_artifact(
+                task,
+                synthesis,
+                profile,
+                budget,
+                store,
+                mechanical_evidence,
+                0,
+                artifact_author_seat,
+            )
             gate_config = profile.get("gates", {})
             max_amendments = int(gate_config.get("max_revision_cycles", 0))
             amendment_round = 0
             while not gate.get("passed") and amendment_round < max_amendments:
                 amendment_round += 1
                 prior_artifact_hash = str(gate.get("artifact_sha256", text_hash(synthesis)))
+                artifact_author_seat = str(fusion_config["synthesizer"])
                 synthesis, _ = self._run_synthesis(
                     task,
                     context,
@@ -897,7 +1013,14 @@ class FusionOrchestrator:
                     store.mark_stage(f"gate-{amendment_round}", "rejected", amendment_gate_name)
                 else:
                     gate = self._review_artifact(
-                        task, synthesis, profile, budget, store, mechanical_evidence, amendment_round
+                        task,
+                        synthesis,
+                        profile,
+                        budget,
+                        store,
+                        mechanical_evidence,
+                        amendment_round,
+                        artifact_author_seat,
                     )
 
             status = "completed" if gate.get("passed") else "rejected"
@@ -933,13 +1056,17 @@ class FusionOrchestrator:
             store.finish(status)
             return result
         except RunAborted:
-            store.write_budget_snapshot(budget)
+            if accounting_initialized:
+                store.write_budget_snapshot(budget)
             store.finish("aborted")
             raise
         except Exception:
-            store.write_budget_snapshot(budget)
+            if accounting_initialized:
+                store.write_budget_snapshot(budget)
             store.finish("failed")
             raise
+        finally:
+            store.close()
 
     def adversarial_gate(
         self,
@@ -970,11 +1097,25 @@ class FusionOrchestrator:
             },
         )
         budget = BudgetTracker(profile.get("budgets", {}))
-        if store.exists("ledger.json"):
-            budget.restore(store.read_json("ledger.json"))
-        store.check_kill()
+        accounting_initialized = False
         try:
-            gate = self._review_artifact(task, artifact, profile, budget, store, mechanical_evidence, 0)
+            if store.exists("ledger.json"):
+                budget.restore(store.read_json("ledger.json"))
+            accounting_initialized = True
+            store.check_kill()
+            # Standalone artifacts are caller-supplied, so no configured seat can
+            # truthfully be attributed as their author. Generated Fusion artifacts
+            # pass the concrete author seat through fuse() instead.
+            gate = self._review_artifact(
+                task,
+                artifact,
+                profile,
+                budget,
+                store,
+                mechanical_evidence,
+                0,
+                None,
+            )
             ledger = store.write_budget_snapshot(budget)
             store.finish("completed" if gate.get("passed") else "rejected")
             return {
@@ -984,13 +1125,17 @@ class FusionOrchestrator:
                 "ledger": ledger,
             }
         except RunAborted:
-            store.write_budget_snapshot(budget)
+            if accounting_initialized:
+                store.write_budget_snapshot(budget)
             store.finish("aborted")
             raise
         except Exception:
-            store.write_budget_snapshot(budget)
+            if accounting_initialized:
+                store.write_budget_snapshot(budget)
             store.finish("failed")
             raise
+        finally:
+            store.close()
 
     def run_status(self, run_id: str) -> Dict[str, Any]:
         if not run_id.replace("-", "").isalnum():

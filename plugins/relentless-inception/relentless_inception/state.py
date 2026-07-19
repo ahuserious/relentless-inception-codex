@@ -1,7 +1,8 @@
-"""Atomic run persistence, kill checks, and thread-safe budget accounting."""
+"""Atomic persistence, single-owner run leasing, and thread-safe budgets."""
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -16,6 +17,16 @@ from typing import Any, Dict, Mapping, Optional
 from .config import canonical_hash, runtime_data_dir
 from .errors import BudgetExceeded, ConfigError, RunAborted
 from .types import ModelResponse
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    _fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised only on non-Windows hosts
+    _msvcrt = None  # type: ignore[assignment]
 
 
 def text_hash(value: str) -> str:
@@ -64,30 +75,109 @@ class RunStore:
         os.chmod(runtime_data_dir() / "runs", 0o700)
         os.chmod(self.directory, 0o700)
         self.manifest_path = self.directory / "manifest.json"
-        if self.manifest_path.exists():
-            manifest = self.read_json("manifest.json")
-            if (
-                manifest.get("task_hash") != self.task_hash
-                or manifest.get("config_hash") != self.config_hash
-                or manifest.get("input_hash") != self.input_hash
-            ):
-                raise ConfigError(
-                    "Resume refused: run_id task/config/input hash does not match the current request"
+        self._lease_handle: Optional[Any] = None
+        self._acquire_run_lease()
+        try:
+            if self.manifest_path.exists():
+                manifest = self.read_json("manifest.json")
+                if (
+                    manifest.get("task_hash") != self.task_hash
+                    or manifest.get("config_hash") != self.config_hash
+                    or manifest.get("input_hash") != self.input_hash
+                ):
+                    raise ConfigError(
+                        "Resume refused: run_id task/config/input hash does not match the current request"
+                    )
+            else:
+                self.write_json(
+                    "manifest.json",
+                    {
+                        "run_id": self.run_id,
+                        "task_hash": self.task_hash,
+                        "config_hash": self.config_hash,
+                        "input_hash": self.input_hash,
+                        "status": "running",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "stages": {},
+                    },
                 )
-        else:
-            self.write_json(
-                "manifest.json",
-                {
-                    "run_id": self.run_id,
-                    "task_hash": self.task_hash,
-                    "config_hash": self.config_hash,
-                    "input_hash": self.input_hash,
-                    "status": "running",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "stages": {},
-                },
+        except BaseException:
+            self.close()
+            raise
+
+    def _acquire_run_lease(self) -> None:
+        if _fcntl is None and _msvcrt is None:
+            raise ConfigError(
+                "RunStore requires OS file locking; this platform cannot safely resume runs"
             )
+        lease_path = self.directory / ".run.lock"
+        lease_handle = None
+        try:
+            lease_handle = lease_path.open("a+b")
+            os.chmod(lease_path, 0o600)
+            os.set_inheritable(lease_handle.fileno(), False)
+            if _fcntl is not None:
+                _fcntl.flock(lease_handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            else:
+                # Windows byte-range locks require the byte to exist and lock
+                # from the current file position.
+                lease_handle.seek(0, os.SEEK_END)
+                if lease_handle.tell() == 0:
+                    lease_handle.write(b"\0")
+                    lease_handle.flush()
+                    os.fsync(lease_handle.fileno())
+                lease_handle.seek(0)
+                _msvcrt.locking(lease_handle.fileno(), _msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if lease_handle is not None:
+                lease_handle.close()
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ConfigError(
+                    f"Run {self.run_id!r} is already active; concurrent resume refused"
+                ) from exc
+            raise ConfigError(
+                f"Unable to acquire the run lease for {self.run_id!r}: {exc}"
+            ) from exc
+        self._lease_handle = lease_handle
+
+    def close(self) -> None:
+        """Explicitly release this run's single-active-owner lease."""
+
+        with self._write_lock:
+            lease_handle = getattr(self, "_lease_handle", None)
+            self._lease_handle = None
+            if lease_handle is None:
+                return
+            try:
+                if _fcntl is not None:
+                    _fcntl.flock(lease_handle.fileno(), _fcntl.LOCK_UN)
+                elif _msvcrt is not None:
+                    lease_handle.seek(0)
+                    _msvcrt.locking(lease_handle.fileno(), _msvcrt.LK_UNLCK, 1)
+            except OSError:
+                # Closing the descriptor still releases the lease. Cleanup must
+                # not mask the orchestration result or its original exception.
+                pass
+            try:
+                lease_handle.close()
+            except OSError:
+                pass
+
+    def __enter__(self) -> "RunStore":
+        return self
+
+    def __exit__(self, exception_type: Any, exception: Any, traceback: Any) -> None:
+        del exception_type, exception, traceback
+        self.close()
+
+    def __del__(self) -> None:
+        # Defensive fallback for direct library callers. Orchestration entry
+        # points release the lease explicitly in finally blocks.
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def path(self, relative_name: str) -> Path:
         candidate = (self.directory / relative_name).resolve()
@@ -314,12 +404,19 @@ class BudgetTracker:
     def record(self, stage: str, seat_name: str, response: ModelResponse) -> None:
         with self.lock:
             usage = response.usage
-            input_tokens = self._nonnegative_usage_integer(usage.input_tokens, "input token")
-            output_tokens = self._nonnegative_usage_integer(usage.output_tokens, "output token")
-            reasoning_tokens = self._nonnegative_usage_integer(usage.reasoning_tokens, "reasoning token")
-            cached_tokens = self._nonnegative_usage_integer(usage.cached_tokens, "cached token")
-            tool_calls = self._nonnegative_usage_integer(usage.tool_calls, "tool call")
-            cost_usd = self._known_cost(usage.cost_usd)
+            try:
+                input_tokens = self._nonnegative_usage_integer(usage.input_tokens, "input token")
+                output_tokens = self._nonnegative_usage_integer(usage.output_tokens, "output token")
+                reasoning_tokens = self._nonnegative_usage_integer(usage.reasoning_tokens, "reasoning token")
+                cached_tokens = self._nonnegative_usage_integer(usage.cached_tokens, "cached token")
+                tool_calls = self._nonnegative_usage_integer(usage.tool_calls, "tool call")
+                cost_usd = self._known_cost(usage.cost_usd)
+            except BudgetExceeded as exc:
+                # Invalid provider accounting is a persistent fail-closed state,
+                # not a one-call exception that a resume may silently bypass.
+                if self.stop_reason is None:
+                    self.stop_reason = str(exc)
+                raise
 
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens

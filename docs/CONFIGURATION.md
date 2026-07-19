@@ -107,7 +107,7 @@ The fallback cost estimator uses the current published base rates when xAI does 
 
 | Model | Input / 1M | Cached input / 1M | Output / 1M |
 |---|---:|---:|---:|
-| Grok 4.5 | $2.00 | $0.30 | $6.00 |
+| Grok 4.5 | $2.00 | $0.50 | $6.00 |
 | Grok 4.3 | $1.25 | $0.20 | $2.50 |
 
 Grok 4.5 documents higher pricing above 200,000 input tokens. The shipped seats set `base_rate_input_limit_tokens: 200000` and `above_base_rate_behavior: unknown_cost_fail_closed`. When the provider reports exact cost, that value wins. Otherwise the runtime refuses to treat the lower base rate as authoritative above the threshold. You can instead configure explicit `long_context_*_per_million_usd` rates or deliberately select `use_base_rate`, but the latter is not a safe upper bound.
@@ -158,7 +158,7 @@ Fallback models should not have a higher unknown price than the seat's estimate.
 
 `profiles.<name>.fusion.engine` selects:
 
-- `client_orchestrated` — canonical path with arbitrary direct providers, raw response preservation, individual validation, and per-seat provenance;
+- `client_orchestrated` — canonical path with arbitrary direct providers, verbatim response-text preservation, individual validation, and per-seat provenance;
 - `openrouter_native` — optional OpenRouter-managed fast path using `native_fusion_seat`.
 
 The client path performs:
@@ -207,10 +207,12 @@ The profile declares fail-closed plan, pre-execution, post-execution, final, and
 Gate rules include:
 
 - two independent valid reviewer passes over the same artifact hash;
+- duplicate entries in `fusion.panel`, `fusion.optional_panel`, or `gates.reviewers` are invalid, and required/optional panel lists cannot overlap;
+- every completed `NEEDS_WORK` or `FAIL` verdict blocks the gate even when the numeric `PASS` quorum is met;
 - a confirmed mechanical failure blocks regardless of model agreement;
 - any reviewer-reported blind spot blocks the current gate; the host must arrange targeted review and call the gate again rather than expecting the runtime to spawn a specialist;
 - malformed verdicts are rejected by the always-on fail-closed parser; `schema_failure_is_blocking: true` displays that invariant rather than enabling it;
-- the artifact author is excluded from independent review;
+- for a `fuse`-produced artifact, enabled author separation excludes the actual synthesis seat; a standalone caller-supplied artifact has no configured-seat author to infer;
 - after synthesis-gate failure, amendment uses a fresh generation call, rejects a byte-identical candidate, and submits the replacement to fresh gate calls against the original blocking issues; this is structural independence, not proof that provider generations reasoned independently;
 - revision cycles are bounded.
 
@@ -236,7 +238,7 @@ Every profile exposes controls for:
 - a known-USD warning fraction;
 - a synthesis/gate reserve drawn only from the `max_calls` attempt budget.
 
-These controls have two deliberately different enforcement points. `max_calls` is reserved atomically before each HTTP attempt, so `hard_stop` is a true pre-dispatch attempt ceiling even when panel workers run concurrently. Token, tool, wall-time, and dollar values are observed-response stop thresholds: after a response reaches or crosses one, blocking enforcement rejects every later dispatch. They cannot prevent that response—or other requests already in flight—from crossing the configured value. Provider-side request token limits remain the only way to bound one accepted generation before its usage is known.
+These controls have two deliberately different enforcement points. `max_calls` is reserved atomically before each HTTP attempt, so `hard_stop` is a true pre-dispatch attempt ceiling even when panel workers run concurrently. Token, tool, wall-time, and dollar values are observed-response stop thresholds: after a response reaches or crosses one, blocking enforcement rejects every later dispatch. They cannot prevent that response—or other requests already in flight—from crossing the configured value. Provider-side request token limits remain the only way to bound one accepted generation before its usage is known. Each run ID has a single cross-process active-owner lease, but distinct run IDs/processes do not share a global coordinator for provider concurrency.
 
 The aggregate token counter is `input + output`. Cached tokens are a detail already contained in input, and reasoning tokens are a detail already contained in output, so adding either again would double-count usage. The ledger preserves input, output, cached, and reasoning values separately; `max_reasoning_tokens` can stop on that output subset independently.
 
@@ -274,7 +276,7 @@ Self-reported model confidence is disabled because it is not calibrated across p
 
 ## Rescue
 
-Transport retry and semantic rescue are separate. Provider `max_retries` is the adapter's HTTP-attempt ceiling; `backoff_initial_seconds` and `backoff_max_seconds` delay those HTTP transport retries when rescue is enabled. With `rescue.enabled: true`, the runtime also applies explicit same-seat model fallback, router fallback controls, the optional native-Fusion-to-client fallback, and a per-provider circuit breaker. `fallback_on` is the runtime allowlist of semantic categories eligible for local model fallback, additionally requiring the seat's `allow_model_fallbacks`; it does not launch `fallback_seats`. With rescue disabled, bounded provider transport retries remain but receive no rescue delay, and all configured model/router/Fusion fallback plus circuit breaking are disabled. Semantic response validation and sanitized failure preservation are mandatory fail-closed invariants. The `retry_on` taxonomy, `retry_attempts`, `fallback_seats`, targeted specialist strategy, and human-handoff thresholds are host workflow policy rather than hidden autonomous loops:
+Transport retry and semantic rescue are separate. Provider `max_retries` is the adapter's HTTP-attempt ceiling; `backoff_initial_seconds` and `backoff_max_seconds` delay those HTTP transport retries when rescue is enabled. With `rescue.enabled: true`, the runtime also applies explicit same-seat model fallback, router fallback controls, the optional native-Fusion-to-client fallback, and a per-provider circuit breaker. `fallback_on` is the runtime allowlist of semantic categories eligible for local model fallback, additionally requiring the seat's `allow_model_fallbacks`; it does not launch `fallback_seats`. With rescue disabled, bounded provider transport retries remain but receive no rescue delay, and all configured model/router/Fusion fallback plus circuit breaking are disabled. Semantic response validation and sanitized failure preservation are mandatory fail-closed invariants. During an orchestrated run, every HTTP-success semantic failure is persisted and accounted before fallback; a blocking usage, cost, or unknown-cost latch prevents rescue from dispatching another model. The `retry_on` taxonomy, `retry_attempts`, `fallback_seats`, targeted specialist strategy, and human-handoff thresholds are host workflow policy rather than hidden autonomous loops:
 
 - retry the same route only for connection, timeout, rate-limit, or server errors;
 - use model/provider fallback for empty content, invalid schema, unsupported parameters, explicit policy refusal, context overflow, or provider-tool failure;

@@ -136,7 +136,9 @@ class FakeProviderRegistry:
         response_schema: Optional[Mapping[str, Any]] = None,
         schema_name: str = "structured_response",
         before_attempt: Optional[Any] = None,
+        on_semantic_failure_response: Optional[Any] = None,
     ) -> ModelResponse:
+        del on_semantic_failure_response
         if before_attempt is not None:
             before_attempt()
         with self._lock:

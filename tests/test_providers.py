@@ -14,8 +14,9 @@ from tests.support import PLUGIN_ROOT  # noqa: F401 - ensures the plugin package
 from relentless_inception.errors import ConfigError, ProviderError
 from relentless_inception.providers import (
     ProviderRegistry,
-    _calculate_cost,
     _ClassifiedProviderError,
+    _RejectRedirectHandler,
+    _calculate_cost,
     parse_json_object,
 )
 from relentless_inception.types import ModelResponse, Usage
@@ -95,7 +96,6 @@ class ProviderParsingTests(unittest.TestCase):
             "openai_responses": "low",
             "openai_compatible_chat": "low",
             "openrouter_chat": "low",
-            "openrouter_fusion": "low",
             "anthropic_messages": "none",
         }
 
@@ -168,6 +168,25 @@ class ProviderParsingTests(unittest.TestCase):
                 self.assertEqual(config, original_config_snapshot)
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["text"], "PONG")
+
+    def test_openrouter_fusion_probe_refuses_before_serializing_a_request(self) -> None:
+        config = provider_test_config()
+        config["providers"]["responses"]["type"] = "openrouter_fusion"
+        config["seats"]["responses_seat"]["fusion"] = {
+            "analysis_models": ["vendor/expensive-a", "vendor/expensive-b"],
+            "max_tool_calls": 8,
+            "max_completion_tokens": 32768,
+        }
+        registry = ProviderRegistry(config)
+
+        with mock.patch.object(ProviderRegistry, "_post_json", autospec=True) as post_json:
+            with self.assertRaisesRegex(
+                ProviderError,
+                "Fusion request can invoke multiple inner models",
+            ):
+                registry.test_seat("responses_seat")
+
+        post_json.assert_not_called()
 
     def test_provider_circuit_breaker_opens_after_configured_failures(self) -> None:
         config = provider_test_config()
@@ -489,7 +508,7 @@ class ProviderParsingTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"TEST_RESPONSES_KEY": "test-key"}),
             mock.patch(
-                "relentless_inception.providers.urllib.request.urlopen",
+                "relentless_inception.providers._authenticated_urlopen",
                 side_effect=[first_failure, FakeResponse()],
             ) as urlopen,
             mock.patch("relentless_inception.providers.time.sleep") as sleep,
@@ -505,6 +524,73 @@ class ProviderParsingTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(before_attempt.call_count, 2)
         self.assertEqual(sleep.call_count, 1)
+
+    def test_authenticated_post_and_model_discovery_redirects_are_refused(self) -> None:
+        config = provider_test_config()
+        config["providers"]["responses"]["max_retries"] = 0
+        config["providers"]["responses"]["header_env"] = {
+            "X-Route-Secret": "TEST_ROUTER_HEADER"
+        }
+        registry = ProviderRegistry(config)
+        opened_requests = []
+
+        class RedirectingOpener:
+            def __init__(self, redirect_handler: _RejectRedirectHandler) -> None:
+                self.redirect_handler = redirect_handler
+
+            def open(self, request, *, timeout):
+                del timeout
+                opened_requests.append(request)
+                return self.redirect_handler.redirect_request(
+                    request,
+                    None,
+                    302,
+                    "Found",
+                    {"Location": "https://attacker.invalid/collect"},
+                    "https://attacker.invalid/collect",
+                )
+
+        def redirecting_opener_factory(*handlers):
+            redirect_handlers = [
+                handler for handler in handlers if isinstance(handler, _RejectRedirectHandler)
+            ]
+            self.assertEqual(len(redirect_handlers), 1)
+            return RedirectingOpener(redirect_handlers[0])
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "TEST_RESPONSES_KEY": "post-and-get-api-secret",
+                    "TEST_ROUTER_HEADER": "post-and-get-header-secret",
+                },
+            ),
+            mock.patch(
+                "relentless_inception.providers.urllib.request.build_opener",
+                side_effect=redirecting_opener_factory,
+            ) as build_opener,
+        ):
+            with self.assertRaisesRegex(ProviderError, "redirect 302 was refused") as post_error:
+                registry.complete("responses_seat", system="system", prompt="prompt")
+            with self.assertRaisesRegex(ProviderError, "redirect 302 was refused") as get_error:
+                registry.list_models("responses")
+
+        self.assertEqual(build_opener.call_count, 2)
+        self.assertEqual(
+            [request.full_url for request in opened_requests],
+            [
+                "https://api.x.ai/v1/responses",
+                "https://api.x.ai/v1/models",
+            ],
+        )
+        for request in opened_requests:
+            headers = {key.lower(): value for key, value in request.header_items()}
+            self.assertEqual(headers["authorization"], "Bearer post-and-get-api-secret")
+            self.assertEqual(headers["x-route-secret"], "post-and-get-header-secret")
+        rendered_errors = str(post_error.exception) + str(get_error.exception)
+        self.assertNotIn("attacker.invalid", rendered_errors)
+        self.assertNotIn("post-and-get-api-secret", rendered_errors)
+        self.assertNotIn("post-and-get-header-secret", rendered_errors)
 
     def test_successful_retry_provenance_is_sanitized_ordered_and_never_stale(self) -> None:
         class FakeResponse:
@@ -536,7 +622,7 @@ class ProviderParsingTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"TEST_RESPONSES_KEY": "request-secret"}),
             mock.patch(
-                "relentless_inception.providers.urllib.request.urlopen",
+                "relentless_inception.providers._authenticated_urlopen",
                 side_effect=[
                     rate_limit_error,
                     urllib.error.URLError("request-secret"),
@@ -610,7 +696,7 @@ class ProviderParsingTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"TEST_RESPONSES_KEY": "request-secret"}),
             mock.patch(
-                "relentless_inception.providers.urllib.request.urlopen",
+                "relentless_inception.providers._authenticated_urlopen",
                 side_effect=urllib.error.URLError("synthetic failure"),
             ) as failed_urlopen,
         ):
@@ -625,7 +711,7 @@ class ProviderParsingTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"TEST_RESPONSES_KEY": "request-secret"}),
             mock.patch(
-                "relentless_inception.providers.urllib.request.urlopen",
+                "relentless_inception.providers._authenticated_urlopen",
                 return_value=FakeModelsResponse(),
             ) as models_urlopen,
         ):
@@ -662,7 +748,7 @@ class ProviderParsingTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"TEST_RESPONSES_KEY": "test-key"}),
             mock.patch(
-                "relentless_inception.providers.urllib.request.urlopen",
+                "relentless_inception.providers._authenticated_urlopen",
                 side_effect=[urllib.error.URLError("temporary"), FakeResponse()],
             ) as urlopen,
             mock.patch("relentless_inception.providers.time.sleep") as sleep,
@@ -775,6 +861,118 @@ class ProviderParsingTests(unittest.TestCase):
             response.route["model_fallback"]["failed_attempts"][0]["category"],
             "empty_response",
         )
+
+    def test_paid_semantic_failure_is_reported_before_model_fallback(self) -> None:
+        config = provider_test_config()
+        config["active_profile"] = "test_profile"
+        config["profiles"] = {
+            "test_profile": {
+                "rescue": {
+                    "enabled": True,
+                    "fallback_on": ["empty_response"],
+                }
+            }
+        }
+        config["seats"]["responses_seat"].update(
+            {
+                "allow_model_fallbacks": True,
+                "fallback_models": ["fallback-model"],
+            }
+        )
+        registry = ProviderRegistry(config)
+        failed_responses = []
+        primary_payload = {
+            "id": "paid-primary-request",
+            "status": "completed",
+            "model": "paid-primary-live",
+            "output": [],
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 2000,
+                "cost": 12.34,
+            },
+        }
+        fallback_payload = {
+            "id": "fallback-request",
+            "status": "completed",
+            "model": "fallback-model-live",
+            "output_text": "fallback answer",
+            "usage": {"input_tokens": 10, "output_tokens": 2, "cost": 0.01},
+        }
+
+        with mock.patch.object(
+            registry,
+            "_post_json",
+            side_effect=[(primary_payload, {}, 0.2), (fallback_payload, {}, 0.1)],
+        ) as post_json:
+            response = registry.complete(
+                "responses_seat",
+                system="system",
+                prompt="prompt",
+                on_semantic_failure_response=failed_responses.append,
+            )
+
+        self.assertEqual(post_json.call_count, 2)
+        self.assertEqual(response.text, "fallback answer")
+        self.assertEqual(len(failed_responses), 1)
+        failed_response = failed_responses[0]
+        self.assertEqual(failed_response.request_id, "paid-primary-request")
+        self.assertEqual(failed_response.actual_model, "paid-primary-live")
+        self.assertEqual(failed_response.usage.input_tokens, 1000)
+        self.assertEqual(failed_response.usage.output_tokens, 2000)
+        self.assertEqual(failed_response.usage.cost_usd, 12.34)
+        self.assertEqual(
+            failed_response.route["semantic_failure"]["category"],
+            "empty_response",
+        )
+
+    def test_semantic_failure_without_usage_is_reported_with_unknown_cost(self) -> None:
+        registry = ProviderRegistry(provider_test_config())
+        failed_responses = []
+
+        with mock.patch.object(
+            registry,
+            "_post_json",
+            return_value=({"id": "missing-usage", "status": "completed", "output": []}, {}, 0.1),
+        ):
+            with self.assertRaises(ProviderError):
+                registry.complete(
+                    "responses_seat",
+                    system="system",
+                    prompt="prompt",
+                    on_semantic_failure_response=failed_responses.append,
+                )
+
+        self.assertEqual(len(failed_responses), 1)
+        self.assertIsNone(failed_responses[0].usage.cost_usd)
+        self.assertEqual(failed_responses[0].request_id, "missing-usage")
+
+    def test_valid_response_without_usage_remains_unknown_cost(self) -> None:
+        registry = ProviderRegistry(provider_test_config())
+
+        with mock.patch.object(
+            registry,
+            "_post_json",
+            return_value=(
+                {
+                    "id": "valid-missing-usage",
+                    "status": "completed",
+                    "model": "live-model",
+                    "output_text": "valid answer",
+                },
+                {},
+                0.1,
+            ),
+        ):
+            response = registry.complete(
+                "responses_seat",
+                system="system",
+                prompt="prompt",
+            )
+
+        self.assertEqual(response.text, "valid answer")
+        self.assertIsNone(response.usage.cost_usd)
+        self.assertEqual(response.request_id, "valid-missing-usage")
 
     def test_model_fallback_rejects_unconfigured_or_unclassified_failure_categories(self) -> None:
         cases = (

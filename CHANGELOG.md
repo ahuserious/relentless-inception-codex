@@ -7,6 +7,10 @@
 - Independent panel, anonymous structured judge, minority-preserving synthesis, exact-hash adversarial gates, and amendment loop.
 - Enforced concurrency, call/token/tool/cost/time budgets, retries, quality floor, degradation policy, kill switch, atomic evidence, and hash-checked resume.
 - Displayable JSON Schema, validated private user overrides, safe environment/0600 secret indirection, provider diagnostics, and native Codex setup templates.
-- Provider probes disable seat tools and tool policies so a connectivity test cannot accidentally exercise hosted tools.
+- Provider probes disable seat tools, tool policies, and local seat-level model fallback; OpenRouter Fusion probes are refused because one request can fan out to multiple inner models.
+- Authenticated completion/model-discovery redirects are refused, and orchestrated HTTP-success semantic failures are persisted and accounted before fallback so budget latches remain authoritative.
+- Each run ID has one cross-process active-owner lease; provider concurrency is not globally coordinated across distinct runs or processes.
+- Profile and runtime validation reject duplicate panel, optional-panel, and reviewer entries plus required/optional panel overlap; every completed negative gate verdict overrides numeric quorum.
 - Native Grok custom-agent templates are retained only as future-compatibility examples; tested Codex 0.145 defaults use Codex-native OpenAI executors/reviewers and external xAI Grok fusion seats.
+- External Grok API/MCP participants are consistently described as seats rather than native Codex subagents, and Grok 4.5 cached-input fallback pricing is corrected to $0.50 per million tokens.
 - Network-free unit suite and CI workflow.

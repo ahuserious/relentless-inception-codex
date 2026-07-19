@@ -13,7 +13,7 @@
 # HTTP 422 due an unsupported xAI `ModelInput` shape. Tool-result continuation
 # also failed with a compaction-blob error. Do not register native Grok on the
 # tested Codex 0.145 build. Use the plugin's direct external xAI seats for Grok
-# subagents, fusion, provider-hosted tools, and review.
+# deliberation, fusion, provider-hosted tools, and review.
 
 [model_providers.xai]
 name = "xAI Responses"

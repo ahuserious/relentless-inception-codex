@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
+import multiprocessing
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests.support import PLUGIN_ROOT  # noqa: F401  (adds the plugin package to sys.path)
 
-from relentless_inception.errors import BudgetExceeded
+from relentless_inception.errors import BudgetExceeded, ConfigError
 from relentless_inception.state import BudgetTracker, RunStore
 from relentless_inception.types import ModelResponse, Usage
 
@@ -44,6 +47,33 @@ def response(*, usage: Usage) -> ModelResponse:
     )
 
 
+def _race_run_reservation(
+    data_directory: str,
+    start_event,
+    release_event,
+    outcome_queue,
+) -> None:
+    os.environ["RELENTLESS_INCEPTION_DATA_DIR"] = data_directory
+    try:
+        start_event.wait(timeout=10)
+        with RunStore(
+            "Multiprocess max-calls fixture",
+            {"fixture": True},
+            "multiprocess-max-calls",
+        ) as store:
+            tracker = BudgetTracker(budget_config(max_calls=1))
+            if store.exists("ledger.json"):
+                tracker.restore(store.read_json("ledger.json"))
+            tracker.reserve_attempt("gate", "shared-seat")
+            store.write_budget_snapshot(tracker)
+            outcome_queue.put(("reserved", tracker.snapshot()["calls"]))
+            release_event.wait(timeout=10)
+    except ConfigError as exc:
+        outcome_queue.put(("active", str(exc)))
+    except BaseException as exc:
+        outcome_queue.put(("unexpected", f"{type(exc).__name__}: {exc}"))
+
+
 class BudgetTrackerTests(unittest.TestCase):
     def test_call_attempt_limit_is_atomic_under_concurrency(self) -> None:
         tracker = BudgetTracker(budget_config(max_calls=11))
@@ -70,18 +100,69 @@ class BudgetTrackerTests(unittest.TestCase):
             clear=False,
         ):
             store = RunStore("Concurrent ledger fixture", {"fixture": True}, "concurrent-ledger")
+            try:
+                def reserve_and_persist(_: int) -> None:
+                    tracker.reserve_attempt("gate", "concurrent-seat")
+                    store.write_budget_snapshot(tracker)
 
-            def reserve_and_persist(_: int) -> None:
-                tracker.reserve_attempt("gate", "concurrent-seat")
-                store.write_budget_snapshot(tracker)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+                    list(executor.map(reserve_and_persist, range(64)))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-                list(executor.map(reserve_and_persist, range(64)))
-
-            persisted = store.read_json("ledger.json")
+                persisted = store.read_json("ledger.json")
+            finally:
+                store.close()
 
         self.assertEqual(persisted["calls"], 64)
         self.assertEqual(persisted["attempts"], 64)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX flock regression")
+    def test_multiprocess_resume_has_one_owner_and_one_max_call_reservation(self) -> None:
+        process_context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            start_event = process_context.Event()
+            release_event = process_context.Event()
+            outcome_queue = process_context.Queue()
+            processes = [
+                process_context.Process(
+                    target=_race_run_reservation,
+                    args=(
+                        temporary_directory,
+                        start_event,
+                        release_event,
+                        outcome_queue,
+                    ),
+                )
+                for _ in range(2)
+            ]
+            for process in processes:
+                process.start()
+            start_event.set()
+            try:
+                outcomes = [outcome_queue.get(timeout=15) for _ in processes]
+            finally:
+                release_event.set()
+                for process in processes:
+                    process.join(timeout=15)
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5)
+
+            self.assertEqual([outcome[0] for outcome in outcomes].count("reserved"), 1)
+            self.assertEqual([outcome[0] for outcome in outcomes].count("active"), 1)
+            active_error = next(outcome[1] for outcome in outcomes if outcome[0] == "active")
+            self.assertIn("already active; concurrent resume refused", active_error)
+            self.assertTrue(all(process.exitcode == 0 for process in processes))
+
+            ledger_path = (
+                Path(temporary_directory)
+                / "runs"
+                / "multiprocess-max-calls"
+                / "ledger.json"
+            )
+            persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["calls"], 1)
+            self.assertEqual(persisted["attempts"], 1)
 
     def test_resume_preserves_attempt_exhaustion_before_dispatch(self) -> None:
         config = budget_config(max_calls=2)
@@ -182,6 +263,22 @@ class BudgetTrackerTests(unittest.TestCase):
         with self.assertRaisesRegex(BudgetExceeded, "did not report cost"):
             resumed.reserve_attempt("judge", "later-seat")
         self.assertEqual(resumed.snapshot()["unknown_cost_calls"], 1)
+
+    def test_invalid_provider_usage_latches_across_later_dispatch(self) -> None:
+        tracker = BudgetTracker(budget_config())
+        tracker.reserve_attempt("panel", "invalid-usage-seat")
+
+        with self.assertRaisesRegex(BudgetExceeded, "invalid input token usage"):
+            tracker.record(
+                "panel",
+                "invalid-usage-seat",
+                response(usage=Usage(input_tokens=-1, cost_usd=0.01)),
+            )
+
+        snapshot = tracker.snapshot()
+        self.assertIn("invalid input token usage", snapshot["stop_reason"])
+        with self.assertRaisesRegex(BudgetExceeded, "invalid input token usage"):
+            tracker.reserve_attempt("gate", "later-seat")
 
     def test_resume_does_not_round_a_small_cost_below_its_threshold(self) -> None:
         config = budget_config(

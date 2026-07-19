@@ -10,7 +10,7 @@
 # test passed with this narrowed posture, but a real parent-spawned custom-agent
 # turn still failed with HTTP 422 due an unsupported xAI `ModelInput` shape.
 # Function-result continuation also failed. Do not register this role on the
-# tested build; use external xAI seats for Grok subagents, tools, and fusion.
+# tested build; use external xAI seats for Grok deliberation, tools, and fusion.
 
 model_provider = "xai"
 model = "grok-4.5"

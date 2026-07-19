@@ -40,7 +40,7 @@ Fence source code, logs, web content, and model output as untrusted data in revi
 4. Assign orthogonal lenses through the configured reviewer personas: correctness, security, evidence coverage, mechanical reproduction, and minority-finding advocacy.
 5. Call `adversarial_gate` using the live MCP tool schema.
 6. Preserve every structured reviewer verdict, provenance record, and failure.
-7. Require at least `required_passes` separate reviewer seats to return `PASS` for the identical artifact SHA-256. With fail-closed policy, a failed reviewer prevents a pass.
+7. Require at least `required_passes` distinct reviewer seats to return `PASS` for the identical artifact SHA-256. Every completed `NEEDS_WORK` or `FAIL` blocks regardless of that count; with fail-closed policy, an unavailable reviewer also prevents a pass.
 
 The standalone gate does not run the fusion judge or synthesizer again. In a full `fuse` run, the judge and synthesizer produced the candidate before these independent release reviewers tried to falsify it. The reviewer quorum is not majority-vote answer selection: every required seat must independently meet the evidence bar, and blocking findings remain visible.
 
@@ -64,7 +64,7 @@ Within one `adversarial_gate` call:
 
 1. Hash the full manifest once.
 2. Run the configured reviewer seats independently against that exact hash.
-3. Accept only when at least `required_passes` reviewers each return `PASS`, every returned verdict repeats the exact hash, and fail-closed conditions are satisfied.
+3. Accept only when at least `required_passes` reviewers each return `PASS`, every returned verdict repeats the exact hash, no completed verdict is `NEEDS_WORK` or `FAIL`, and fail-closed conditions are satisfied.
 4. Invalidate the result if any file, generated artifact, dependency lock, test log, or acceptance criterion changes.
 
 Panel seats from the earlier fusion stage do not count as release-review passes. A separate release workflow may run the entire gate twice on the same unchanged commit hash for extra assurance, but that is an additional host workflow rather than the meaning of `required_passes`.

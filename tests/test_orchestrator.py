@@ -3,17 +3,52 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from typing import Any, Mapping
 from unittest import mock
 
 from tests.support import DEFAULT_PANEL, FakeProviderRegistry, orchestration_config
 
-from relentless_inception.errors import ConfigError, ProviderError, RunAborted
+from relentless_inception.errors import BudgetExceeded, ConfigError, ProviderError, RunAborted
 from relentless_inception.orchestrator import FusionOrchestrator, _contains_substantive_claim
-from relentless_inception.state import RunStore, text_hash
+from relentless_inception.providers import ProviderRegistry
+from relentless_inception.state import BudgetTracker, RunStore, text_hash
+
+
+class VerdictOverrideRegistry(FakeProviderRegistry):
+    def __init__(self, verdict_overrides: Mapping[str, Mapping[str, Any]]) -> None:
+        super().__init__()
+        self.verdict_overrides = verdict_overrides
+
+    def complete(self, seat_name: str, **kwargs: Any):
+        response = super().complete(seat_name, **kwargs)
+        if kwargs.get("schema_name") != "adversarial_verdict" or seat_name not in self.verdict_overrides:
+            return response
+
+        hash_match = re.search(
+            r"Candidate artifact SHA-256: ([0-9a-f]{64})",
+            str(kwargs["prompt"]),
+        )
+        if hash_match is None:
+            raise AssertionError("Gate prompt did not supply an exact artifact SHA-256")
+        verdict = {
+            "verdict": "PASS",
+            "artifact_sha256": hash_match.group(1),
+            "summary": "The configured test verdict exercises fail-closed aggregation.",
+            "criteria_reviewed": ["Gate aggregation semantics"],
+            "blind_spots": [],
+            "blocking_findings": [],
+            "non_blocking_findings": [],
+            "evidence": ["Deterministic fake-provider evidence."],
+            "required_actions": [],
+        }
+        verdict.update(copy.deepcopy(dict(self.verdict_overrides[seat_name])))
+        response.text = json.dumps(verdict)
+        return response
 
 
 class OrchestrationTests(unittest.TestCase):
@@ -51,6 +86,59 @@ class OrchestrationTests(unittest.TestCase):
         self.assertFalse((runs_directory / "privacy-denied-fusion").exists())
         self.assertFalse((runs_directory / "privacy-denied-gate").exists())
 
+    def test_runtime_rejects_duplicate_or_overlapping_independent_seats_before_dispatch(self) -> None:
+        duplicate_panel_config = orchestration_config(
+            panel=["grok45_researcher", "grok45_researcher"]
+        )
+        duplicate_panel_registry = FakeProviderRegistry()
+        with self.assertRaisesRegex(ConfigError, "fusion.panel must not contain duplicate seat names"):
+            FusionOrchestrator(duplicate_panel_config, duplicate_panel_registry).fuse(
+                "Duplicate panel seats are not independent.",
+                run_id="duplicate-panel-runtime",
+            )
+        self.assertEqual(duplicate_panel_registry.calls, [])
+
+        duplicate_optional_config = orchestration_config()
+        duplicate_optional_config["profiles"]["maximum_intelligence"]["fusion"][
+            "optional_panel"
+        ] = ["openrouter_sol_pro_panel", "openrouter_sol_pro_panel"]
+        duplicate_optional_registry = FakeProviderRegistry()
+        with self.assertRaisesRegex(
+            ConfigError,
+            "fusion.optional_panel must not contain duplicate seat names",
+        ):
+            FusionOrchestrator(duplicate_optional_config, duplicate_optional_registry).fuse(
+                "Duplicate optional seats are not independent.",
+                run_id="duplicate-optional-panel-runtime",
+            )
+        self.assertEqual(duplicate_optional_registry.calls, [])
+
+        overlapping_panel_config = orchestration_config()
+        overlapping_panel_config["profiles"]["maximum_intelligence"]["fusion"][
+            "optional_panel"
+        ] = [DEFAULT_PANEL[0]]
+        overlapping_panel_registry = FakeProviderRegistry()
+        with self.assertRaisesRegex(ConfigError, "fusion.panel and optional_panel must not overlap"):
+            FusionOrchestrator(overlapping_panel_config, overlapping_panel_registry).fuse(
+                "Required and optional panel seats cannot overlap.",
+                run_id="overlapping-panel-runtime",
+            )
+        self.assertEqual(overlapping_panel_registry.calls, [])
+
+        duplicate_reviewer_config = orchestration_config()
+        duplicate_reviewer_config["profiles"]["maximum_intelligence"]["gates"]["reviewers"] = [
+            "grok45_verifier",
+            "grok45_verifier",
+        ]
+        duplicate_reviewer_registry = FakeProviderRegistry()
+        with self.assertRaisesRegex(ConfigError, "gates.reviewers must not contain duplicate seat names"):
+            FusionOrchestrator(duplicate_reviewer_config, duplicate_reviewer_registry).adversarial_gate(
+                "Duplicate reviewers cannot satisfy quorum.",
+                "Candidate artifact",
+                run_id="duplicate-reviewer-runtime",
+            )
+        self.assertEqual(duplicate_reviewer_registry.calls, [])
+
     def test_substantive_claim_floor_rejects_heading_only_panel_output(self) -> None:
         self.assertFalse(_contains_substantive_claim("# Analysis\n## Risks\n- TBD\n- Unknown"))
         self.assertTrue(
@@ -82,6 +170,170 @@ class OrchestrationTests(unittest.TestCase):
         rejected = [row for row in persisted_responses if row["seat_name"] == "grok45_researcher"]
         self.assertEqual(len(rejected), 1)
         self.assertEqual(rejected[0]["response"]["text"], "# Analysis\n## Risks\n- TBD\n- Unknown")
+
+    def test_billed_semantic_failure_is_ledgered_and_budget_latches_before_fallback(self) -> None:
+        primary_payload = {
+            "id": "paid-primary-request",
+            "status": "completed",
+            "model": "paid-primary-live",
+            "output": [],
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 2000,
+                "cost": 12.34,
+            },
+        }
+        fallback_payload = {
+            "id": "fallback-request",
+            "status": "completed",
+            "model": "fallback-live",
+            "output_text": "fallback answer",
+            "usage": {"input_tokens": 10, "output_tokens": 2, "cost": 0.01},
+        }
+
+        def run_call(max_cost_usd: float, run_id: str):
+            config = orchestration_config()
+            profile = config["profiles"]["maximum_intelligence"]
+            profile["budgets"]["max_cost_usd"] = max_cost_usd
+            seat = config["seats"]["grok45_researcher"]
+            seat["allow_model_fallbacks"] = True
+            seat["fallback_models"] = ["grok-fallback"]
+            registry = ProviderRegistry(config)
+            orchestrator = FusionOrchestrator(config, registry)
+            budget = BudgetTracker(profile["budgets"])
+            payloads = iter((primary_payload, fallback_payload))
+
+            def fake_post_json(
+                _url,
+                _payload,
+                _provider,
+                *,
+                before_attempt=None,
+                on_invalid_response=None,
+            ):
+                del on_invalid_response
+                self.assertIsNotNone(before_attempt)
+                before_attempt()
+                return next(payloads), {}, 0.1
+
+            with RunStore("Billed fallback fixture", config, run_id) as store:
+                with mock.patch.object(
+                    registry,
+                    "_post_json",
+                    side_effect=fake_post_json,
+                ) as post_json:
+                    if max_cost_usd < 12.34:
+                        with self.assertRaisesRegex(BudgetExceeded, "Known cost threshold"):
+                            orchestrator._call(
+                                budget,
+                                store,
+                                "synthesis",
+                                "grok45_researcher",
+                                "system",
+                                "prompt",
+                            )
+                        result = None
+                    else:
+                        result = orchestrator._call(
+                            budget,
+                            store,
+                            "synthesis",
+                            "grok45_researcher",
+                            "system",
+                            "prompt",
+                        )
+                    call_count = post_json.call_count
+                    ledger = store.read_json("ledger.json")
+                    response_artifacts = [
+                        json.loads(path.read_text(encoding="utf-8"))
+                        for path in sorted((store.directory / "responses").glob("*.json"))
+                    ]
+            return result, call_count, ledger, response_artifacts
+
+        blocked_result, blocked_calls, blocked_ledger, blocked_artifacts = run_call(
+            10.0,
+            "paid-failure-blocks-fallback",
+        )
+        self.assertIsNone(blocked_result)
+        self.assertEqual(blocked_calls, 1)
+        self.assertEqual(blocked_ledger["calls"], 1)
+        self.assertEqual(len(blocked_ledger["entries"]), 1)
+        self.assertEqual(blocked_ledger["total_tokens"], 3000)
+        self.assertEqual(blocked_ledger["known_cost_usd"], 12.34)
+        self.assertIn("Known cost threshold", blocked_ledger["stop_reason"])
+        self.assertEqual(blocked_ledger["entries"][0]["request_id"], "paid-primary-request")
+        self.assertEqual(
+            blocked_ledger["entries"][0]["route"]["semantic_failure"]["category"],
+            "empty_response",
+        )
+        self.assertEqual(len(blocked_artifacts), 1)
+        self.assertEqual(
+            blocked_artifacts[0]["response"]["route"]["semantic_failure"]["category"],
+            "empty_response",
+        )
+
+        allowed_result, allowed_calls, allowed_ledger, allowed_artifacts = run_call(
+            20.0,
+            "paid-failure-allows-fallback",
+        )
+        self.assertIsNotNone(allowed_result)
+        self.assertEqual(allowed_result.text, "fallback answer")
+        self.assertEqual(allowed_calls, 2)
+        self.assertEqual(allowed_ledger["calls"], 2)
+        self.assertEqual(len(allowed_ledger["entries"]), 2)
+        self.assertEqual(allowed_ledger["total_tokens"], 3012)
+        self.assertAlmostEqual(allowed_ledger["known_cost_usd"], 12.35)
+        self.assertEqual(
+            [entry["request_id"] for entry in allowed_ledger["entries"]],
+            ["paid-primary-request", "fallback-request"],
+        )
+        self.assertEqual(len(allowed_artifacts), 2)
+        semantic_failures = [
+            artifact
+            for artifact in allowed_artifacts
+            if "semantic_failure" in artifact["response"]["route"]
+        ]
+        self.assertEqual(len(semantic_failures), 1)
+
+    def test_malformed_resume_ledger_is_not_overwritten_and_releases_lease(self) -> None:
+        config = orchestration_config()
+        task = "Preserve malformed accounting evidence."
+        artifact = "Caller supplied artifact."
+        run_id = "malformed-ledger-preserved"
+        selected_profile_name = str(config["active_profile"])
+        composite_task = task + "\n\nARTIFACT-SHA256:" + text_hash(artifact)
+        input_identity = {
+            "operation": "adversarial_gate",
+            "task": task,
+            "artifact_sha256": text_hash(artifact),
+            "mechanical_evidence": "",
+            "profile_name": selected_profile_name,
+        }
+        with RunStore(
+            composite_task,
+            config,
+            run_id,
+            input_identity=input_identity,
+        ) as store:
+            ledger_path = store.path("ledger.json")
+            ledger_path.write_text("{malformed-ledger\n", encoding="utf-8")
+            original_ledger = ledger_path.read_bytes()
+
+        with self.assertRaisesRegex(ConfigError, "Unreadable run artifact"):
+            FusionOrchestrator(config, FakeProviderRegistry()).adversarial_gate(
+                task,
+                artifact,
+                run_id=run_id,
+            )
+
+        self.assertEqual(ledger_path.read_bytes(), original_ledger)
+        with RunStore(
+            composite_task,
+            config,
+            run_id,
+            input_identity=input_identity,
+        ) as reopened_store:
+            self.assertEqual(reopened_store.read_json("manifest.json")["status"], "failed")
 
     def test_full_client_fusion_is_independent_structured_gated_ledgered_and_resumable(self) -> None:
         config = orchestration_config()
@@ -405,6 +657,55 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(resumed.synthesis, first.synthesis)
         self.assertEqual(resumed.ledger["calls"], first.ledger["calls"])
 
+    def test_native_openrouter_fusion_seat_cannot_review_its_own_artifact(self) -> None:
+        config = orchestration_config()
+        profile = config["profiles"]["maximum_intelligence"]
+        fusion = profile["fusion"]
+        fusion["engine"] = "openrouter_native"
+        fusion["native_fusion_seat"] = "openrouter_native_fusion_seat"
+        fusion["native_openrouter_fusion"]["enabled"] = True
+        fusion["native_openrouter_fusion"]["fallback_to_client_orchestrated"] = False
+        profile["gates"]["reviewers"] = ["openrouter_native_fusion_seat"]
+        profile["gates"]["required_passes"] = 1
+        registry = FakeProviderRegistry()
+
+        with self.assertRaisesRegex(
+            ConfigError,
+            "actual artifact author 'openrouter_native_fusion_seat'",
+        ):
+            FusionOrchestrator(config, registry).fuse(
+                "Native Fusion must not review its own synthesis.",
+                run_id="native-openrouter-self-review",
+            )
+
+        self.assertEqual(
+            [call["seat_name"] for call in registry.calls],
+            ["openrouter_native_fusion_seat"],
+        )
+
+    def test_standalone_gate_does_not_attribute_external_artifact_to_native_fusion_seat(self) -> None:
+        config = orchestration_config()
+        profile = config["profiles"]["maximum_intelligence"]
+        fusion = profile["fusion"]
+        fusion["engine"] = "openrouter_native"
+        fusion["native_fusion_seat"] = "openrouter_native_fusion_seat"
+        fusion["native_openrouter_fusion"]["enabled"] = True
+        profile["gates"]["reviewers"] = ["openrouter_native_fusion_seat"]
+        profile["gates"]["required_passes"] = 1
+        registry = FakeProviderRegistry()
+
+        result = FusionOrchestrator(config, registry).adversarial_gate(
+            "Review a caller-supplied artifact.",
+            "This artifact was supplied externally and was not generated by a configured seat.",
+            run_id="standalone-external-author",
+        )
+
+        self.assertTrue(result["gate"]["passed"])
+        self.assertEqual(
+            [call["seat_name"] for call in registry.calls],
+            ["openrouter_native_fusion_seat"],
+        )
+
     def test_mechanical_failure_and_reported_blind_spot_override_pass_votes(self) -> None:
         config = orchestration_config()
         mechanical_registry = FakeProviderRegistry()
@@ -453,6 +754,72 @@ class OrchestrationTests(unittest.TestCase):
             any("invalid structured verdict" in blocker for blocker in result["gate"]["deterministic_blockers"])
         )
 
+    def test_pass_verdict_with_blocking_content_is_rejected_as_schema_invalid(self) -> None:
+        config = orchestration_config()
+        registry = VerdictOverrideRegistry(
+            {
+                "grok45_verifier": {
+                    "blocking_findings": ["The required safety check failed."],
+                    "required_actions": ["Repair and rerun the safety check."],
+                }
+            }
+        )
+
+        result = FusionOrchestrator(config, registry).fuse(
+            "A contradictory pass verdict must fail closed.",
+            run_id="contradictory-pass-verdict",
+        )
+
+        self.assertEqual(result.status, "rejected")
+        self.assertFalse(result.gate["passed"])
+        self.assertEqual(result.gate["pass_count"], 1)
+        self.assertTrue(result.gate["schema_blocked"])
+        self.assertFalse(result.execution_handoff["ready_for_host_workflow"])
+        self.assertFalse(result.execution_handoff["ready"])
+        self.assertFalse(result.execution_handoff["mutation_authorized"])
+
+    def test_minority_blocking_fail_prevents_gate_and_handoff_despite_numeric_quorum(self) -> None:
+        config = orchestration_config()
+        config["profiles"]["maximum_intelligence"]["gates"]["required_passes"] = 1
+        registry = VerdictOverrideRegistry(
+            {
+                "grok45_verifier": {
+                    "verdict": "FAIL",
+                    "summary": "A supported blocking defect remains in the candidate.",
+                    "blocking_findings": ["The candidate omits the required rollback path."],
+                    "required_actions": ["Add and verify a rollback path."],
+                    "evidence": ["The artifact contains no rollback procedure."],
+                }
+            }
+        )
+
+        result = FusionOrchestrator(config, registry).fuse(
+            "A minority blocking failure must override numeric quorum.",
+            run_id="minority-blocking-fail",
+        )
+
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(result.gate["pass_count"], 1)
+        self.assertEqual(result.gate["required_passes"], 1)
+        self.assertTrue(result.gate["negative_verdict_blocked"])
+        self.assertFalse(result.gate["passed"])
+        self.assertEqual(
+            result.gate["negative_verdicts"],
+            [
+                {
+                    "seat_name": "grok45_verifier",
+                    "verdict": "FAIL",
+                    "summary": "A supported blocking defect remains in the candidate.",
+                    "blocking_findings": ["The candidate omits the required rollback path."],
+                    "required_actions": ["Add and verify a rollback path."],
+                    "evidence": ["The artifact contains no rollback procedure."],
+                }
+            ],
+        )
+        self.assertFalse(result.execution_handoff["ready_for_host_workflow"])
+        self.assertFalse(result.execution_handoff["ready"])
+        self.assertFalse(result.execution_handoff["mutation_authorized"])
+
     def test_identical_amendment_is_rejected_without_spending_on_re_review(self) -> None:
         config = orchestration_config()
         profile = config["profiles"]["maximum_intelligence"]
@@ -479,16 +846,16 @@ class OrchestrationTests(unittest.TestCase):
 
     def test_empty_kill_file_aborts_run(self) -> None:
         config = orchestration_config()
-        store = RunStore("Kill fixture", config, "empty-kill-file")
-        kill_file = store.directory / "KILL"
-        kill_file.touch()
-        self.assertEqual(kill_file.stat().st_size, 0)
+        with RunStore("Kill fixture", config, "empty-kill-file") as store:
+            kill_file = store.directory / "KILL"
+            kill_file.touch()
+            self.assertEqual(kill_file.stat().st_size, 0)
 
-        with self.assertRaisesRegex(RunAborted, "stopped by kill switch"):
-            store.check_kill()
+            with self.assertRaisesRegex(RunAborted, "stopped by kill switch"):
+                store.check_kill()
 
-        manifest = store.read_json("manifest.json")
-        self.assertEqual(manifest["status"], "aborted")
+            manifest = store.read_json("manifest.json")
+            self.assertEqual(manifest["status"], "aborted")
 
 
 if __name__ == "__main__":

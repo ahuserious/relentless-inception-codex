@@ -124,6 +124,22 @@ class PluginPackageIntegrityTests(unittest.TestCase):
         self.assertEqual(default_config["native_codex"]["reviewer_roles"], [])
         self.assertEqual(default_config["native_codex"]["reasoning_only_roles"], [])
 
+    def test_grok45_cached_input_pricing_matches_documented_default(self) -> None:
+        default_config = load_config(include_user=False)
+        grok45_seats = {
+            seat_name: seat
+            for seat_name, seat in default_config["seats"].items()
+            if seat.get("model") == "grok-4.5"
+        }
+
+        self.assertTrue(grok45_seats)
+        for seat_name, seat in grok45_seats.items():
+            with self.subTest(seat=seat_name):
+                self.assertEqual(seat["pricing"]["cached_input_per_million_usd"], 0.5)
+
+        configuration_doc = (REPOSITORY_ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+        self.assertIn("| Grok 4.5 | $2.00 | $0.50 | $6.00 |", configuration_doc)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ This is a new runtime-backed implementation inspired by [`ahuserious/relentless-
 
 Version `0.1.0` is an alpha suitable for deliberate, cost-aware use. Direct xAI Grok 4.5, OpenAI Responses, Anthropic Messages, OpenRouter, OpenRouter native Fusion, and generic OpenAI-compatible/TrustedRouter transports are supported. External API seats can use provider-hosted tools when explicitly configured, but they never receive Codex filesystem access.
 
-Codex plugins currently do not auto-register plugin-owned native agents. The bundled skills coordinate compatible native Codex reviewers/executors through the active host; opt-in provider/agent TOML templates are retained for explicit compatibility retesting. On Codex 0.145, a direct foreground Grok 4.5 text turn succeeded only after every tool surface was removed, but an actual spawned custom-agent turn still failed at xAI with HTTP 422 because the Codex subagent input did not match xAI's accepted `ModelInput` variants. A separate tool-result continuation also failed with a compaction-blob error. The shipped default therefore registers no native Grok role. Multiple external Grok 4.5/4.3 seats are the operational Grok subagents for fusion, gates, and xAI-hosted tools.
+Codex plugins currently do not auto-register plugin-owned native agents. The bundled skills coordinate compatible native Codex reviewers/executors through the active host; opt-in provider/agent TOML templates are retained for explicit compatibility retesting. On Codex 0.145, a direct foreground Grok 4.5 text turn succeeded only after every tool surface was removed, but an actual spawned custom-agent turn still failed at xAI with HTTP 422 because the Codex subagent input did not match xAI's accepted `ModelInput` variants. A separate tool-result continuation also failed with a compaction-blob error. The shipped default therefore registers no native Grok role. Multiple external Grok 4.5/4.3 seats provide the operational Grok path for fusion, gates, and xAI-hosted tools.
 
 ## Install from this checkout
 
@@ -39,7 +39,7 @@ Ask Codex:
 The plugin exposes MCP tools for:
 
 - `config_show`, `config_schema`, `config_get`, `config_set`, and `config_validate`;
-- `doctor`, `provider_models`, and the opt-in, billable `provider_test`;
+- `doctor`, `provider_models`, and the opt-in, billable `provider_test` for ordinary seats (OpenRouter Fusion probes are refused because they can fan out);
 - `fuse` and standalone `adversarial_gate`;
 - `run_status`, `run_abort`, and `execution_handoff`.
 
@@ -54,10 +54,12 @@ For a shell-level diagnostic without installation:
 
 ## Safety and cost boundaries
 
-- Provider credentials are read from named environment variables or explicitly listed 0600 files; values are never printed.
+- Provider credentials are read from named environment variables or explicitly listed 0600 files; values are never printed, and authenticated completion/model-discovery redirects are refused.
 - xAI/OpenAI Responses retention defaults to `store: false`.
 - Model outputs are untrusted data and are fenced in downstream prompts.
-- Panel, call, token, tool-call, provider-cost, total-cost, wall-time, and concurrency limits are enforced.
+- During `fuse` or `adversarial_gate`, every HTTP-success response that fails semantic validation is persisted and accounted before fallback; its usage, cost, or unknown-cost status can latch a stop and prevent fallback.
+- Panel, call, token, tool-call, provider-cost, total-cost, wall-time, and concurrency limits are enforced within a run/process. A cross-process lease permits only one active owner for a run ID, but it does not globally coordinate provider concurrency across distinct run IDs or processes.
+- Duplicate panel, optional-panel, or reviewer entries and required/optional panel overlap are rejected. Any completed `NEEDS_WORK` or `FAIL` verdict blocks a gate even when the numeric `PASS` quorum is met.
 - Maximum-intelligence mode fails closed on panel collapse, schema failure, gate failure, or budget exhaustion.
 - The ordinary execution backend is `active_codex`. Its packet freezes the selected profile and execution settings; enabled plan/pre-execution gates keep mutation readiness false until the visible host records their passing receipts.
 - Recursive `codex exec` is disabled unless both config and an explicit command confirmation enable it; it requires the separately reviewed schema-v2 packet hash and refuses pending host gates or any packet mismatch.

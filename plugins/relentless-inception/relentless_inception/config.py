@@ -107,6 +107,18 @@ def _required_string(mapping: Mapping[str, Any], key: str, path: str, errors: Li
         errors.append(f"{path}.{key} must be a non-empty string")
 
 
+def _duplicate_strings(values: Iterable[Any]) -> List[str]:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        if value in seen:
+            duplicates.add(value)
+        seen.add(value)
+    return sorted(duplicates)
+
+
 def _json_equal(left: Any, right: Any) -> bool:
     return json.dumps(left, sort_keys=True, separators=(",", ":")) == json.dumps(
         right, sort_keys=True, separators=(",", ":")
@@ -408,11 +420,31 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
         if not isinstance(panel, list) or not panel:
             errors.append(f"{path}.fusion.panel must be a non-empty array")
             panel = []
+        duplicate_panel_seats = _duplicate_strings(panel)
+        if duplicate_panel_seats:
+            errors.append(
+                f"{path}.fusion.panel must not contain duplicate seat names {duplicate_panel_seats}"
+            )
         for seat_name in panel:
             if not isinstance(seat_name, str) or seat_name not in seats:
                 errors.append(f"{path}.fusion.panel references unknown seat {seat_name!r}")
         optional_panel = fusion.get("optional_panel", [])
         if isinstance(optional_panel, list):
+            duplicate_optional_seats = _duplicate_strings(optional_panel)
+            if duplicate_optional_seats:
+                errors.append(
+                    f"{path}.fusion.optional_panel must not contain duplicate seat names "
+                    f"{duplicate_optional_seats}"
+                )
+            overlapping_panel_seats = sorted(
+                {seat_name for seat_name in panel if isinstance(seat_name, str)}
+                & {seat_name for seat_name in optional_panel if isinstance(seat_name, str)}
+            )
+            if overlapping_panel_seats:
+                errors.append(
+                    f"{path}.fusion.panel and optional_panel must not overlap "
+                    f"{overlapping_panel_seats}"
+                )
             for seat_name in optional_panel:
                 if not isinstance(seat_name, str) or seat_name not in seats:
                     errors.append(f"{path}.fusion.optional_panel references unknown seat {seat_name!r}")
@@ -486,6 +518,12 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
             if not isinstance(reviewers, list) or not reviewers:
                 errors.append(f"{path}.gates.reviewers must be non-empty when gates are enabled")
             else:
+                duplicate_reviewers = _duplicate_strings(reviewers)
+                if duplicate_reviewers:
+                    errors.append(
+                        f"{path}.gates.reviewers must not contain duplicate seat names "
+                        f"{duplicate_reviewers}"
+                    )
                 for seat_name in reviewers:
                     if not isinstance(seat_name, str) or seat_name not in seats:
                         errors.append(f"{path}.gates.reviewers references unknown seat {seat_name!r}")

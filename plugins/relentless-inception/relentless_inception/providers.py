@@ -33,6 +33,39 @@ class _ClassifiedProviderError(ProviderError):
         self.category = category
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects before urllib can copy authentication headers."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        response: Any,
+        code: int,
+        message: str,
+        headers: Mapping[str, str],
+        new_url: str,
+    ) -> None:
+        del request, response, message, headers, new_url
+        raise _ClassifiedProviderError(
+            "redirect_refused",
+            f"Authenticated provider HTTP redirect {code} was refused",
+        )
+
+
+def _authenticated_urlopen(
+    request: urllib.request.Request,
+    *,
+    timeout: float,
+) -> Any:
+    """Open an authenticated provider request without following redirects."""
+
+    opener = urllib.request.build_opener(
+        _RejectRedirectHandler(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
+    return opener.open(request, timeout=timeout)
+
+
 def _safe_error_text(value: str, limit: int = 800) -> str:
     value = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+", r"\1<redacted>", value)
     value = re.sub(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"']+", r"\1<redacted>", value)
@@ -463,6 +496,12 @@ class ProviderRegistry:
         provider: Mapping[str, Any],
         *,
         before_attempt: Optional[Callable[[], None]] = None,
+        on_invalid_response: Optional[
+            Callable[
+                [Optional[Mapping[str, Any]], Mapping[str, str], float, ProviderError],
+                None,
+            ]
+        ] = None,
     ) -> Tuple[Dict[str, Any], Mapping[str, str], float]:
         self._reset_transport_failures()
         request = urllib.request.Request(
@@ -480,15 +519,24 @@ class ProviderRegistry:
         for attempt in range(retry_count + 1):
             if before_attempt is not None:
                 before_attempt()
+            response_headers: Mapping[str, str] = {}
             try:
-                with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl.create_default_context()) as response:
+                with _authenticated_urlopen(request, timeout=timeout_seconds) as response:
                     response_bytes = response.read()
                     response_headers = dict(response.headers.items())
                 decoded = json.loads(response_bytes.decode("utf-8"))
                 if not isinstance(decoded, dict):
-                    raise _ClassifiedProviderError(
+                    invalid_response_error = _ClassifiedProviderError(
                         "schema_invalid", "Provider response root was not an object"
                     )
+                    if on_invalid_response is not None:
+                        on_invalid_response(
+                            None,
+                            response_headers,
+                            time.monotonic() - started,
+                            invalid_response_error,
+                        )
+                    raise invalid_response_error
                 return decoded, response_headers, time.monotonic() - started
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -512,6 +560,13 @@ class ProviderRegistry:
                     "schema_invalid",
                     f"Provider returned malformed JSON: {_safe_error_text(str(exc))}",
                 )
+                if on_invalid_response is not None:
+                    on_invalid_response(
+                        None,
+                        response_headers,
+                        time.monotonic() - started,
+                        last_error,
+                    )
                 if attempt >= retry_count:
                     raise last_error from exc
                 self._record_transport_failure(
@@ -571,6 +626,7 @@ class ProviderRegistry:
         response_schema: Optional[Mapping[str, Any]] = None,
         schema_name: str = "structured_response",
         before_attempt: Optional[Callable[[], None]] = None,
+        on_semantic_failure_response: Optional[Callable[[ModelResponse], None]] = None,
     ) -> ModelResponse:
         seats = self.config.get("seats", {})
         seat = seats.get(seat_name) if isinstance(seats, Mapping) else None
@@ -623,6 +679,7 @@ class ProviderRegistry:
                         response_schema,
                         schema_name,
                         before_attempt,
+                        on_semantic_failure_response,
                     )
                     with self._circuit_lock:
                         self._provider_failures[provider_name] = 0
@@ -638,7 +695,7 @@ class ProviderRegistry:
                     return response
                 except ProviderError as exc:
                     category = _failure_category(exc)
-                    sanitized_error = _safe_error_text(str(exc))
+                    sanitized_error = self._safe_provider_error_text(str(exc), provider)
                     failed_attempts.append(
                         {
                             "model": model,
@@ -670,6 +727,7 @@ class ProviderRegistry:
         response_schema: Optional[Mapping[str, Any]],
         schema_name: str,
         before_attempt: Optional[Callable[[], None]],
+        on_semantic_failure_response: Optional[Callable[[ModelResponse], None]],
     ) -> ModelResponse:
         # A transport call can report its successful retry history through this
         # thread-local slot. Reset here as well so mocked transports and failures
@@ -683,6 +741,97 @@ class ProviderRegistry:
         reasoning_max_tokens = seat.get("reasoning_max_tokens")
         max_tokens = int(seat.get("max_output_tokens", 8192))
         temperature = seat.get("temperature")
+
+        def normalized_response(
+            response_payload: Mapping[str, Any],
+            response_headers: Mapping[str, str],
+            latency: float,
+            text: str,
+            *,
+            force_unknown_cost: bool = False,
+            normalized_usage: Optional[Usage] = None,
+            semantic_failure: Optional[ProviderError] = None,
+            recorded_transport_failures: Sequence[Mapping[str, Any]] = (),
+        ) -> ModelResponse:
+            raw_usage = response_payload.get("usage")
+            has_billable_usage = isinstance(raw_usage, Mapping) and any(
+                field_name in raw_usage
+                for field_name in (
+                    "input_tokens",
+                    "prompt_tokens",
+                    "output_tokens",
+                    "completion_tokens",
+                    "cost",
+                    "cost_in_usd_ticks",
+                )
+            )
+            # A successful HTTP status does not make an unreported charge zero.
+            # Without any recognizable usage/cost field, both valid and invalid
+            # responses remain unknown-cost evidence.
+            if not has_billable_usage:
+                force_unknown_cost = True
+            try:
+                if normalized_usage is not None:
+                    usage = normalized_usage
+                else:
+                    usage = _usage_from_payload(response_payload)
+            except (OverflowError, TypeError, ValueError):
+                if semantic_failure is None:
+                    raise
+                usage = Usage(cost_usd=None)
+                force_unknown_cost = True
+            if force_unknown_cost:
+                usage.cost_usd = None
+            else:
+                usage.cost_usd = _calculate_cost(usage, seat)
+            route = _openrouter_route(response_payload, response_headers)
+            if recorded_transport_failures:
+                route["transport_failures"] = copy.deepcopy(list(recorded_transport_failures))
+            citations = response_payload.get("citations")
+            if isinstance(citations, list):
+                route["citations"] = [
+                    citation for citation in citations if isinstance(citation, (str, Mapping))
+                ]
+            if semantic_failure is not None:
+                route["semantic_failure"] = {
+                    "category": _failure_category(semantic_failure),
+                    "error": self._safe_provider_error_text(
+                        str(semantic_failure), effective_provider
+                    ),
+                }
+            actual_model = str(response_payload.get("model") or model)
+            request_id = response_payload.get("id")
+            return ModelResponse(
+                text=text,
+                provider=provider_name,
+                requested_model=model,
+                actual_model=actual_model,
+                usage=usage,
+                latency_seconds=latency,
+                request_id=str(request_id) if request_id else None,
+                route=route,
+                raw_status=str(response_payload.get("status") or "completed"),
+            )
+
+        def record_unparseable_response(
+            response_payload: Optional[Mapping[str, Any]],
+            response_headers: Mapping[str, str],
+            latency: float,
+            error: ProviderError,
+        ) -> None:
+            if on_semantic_failure_response is None:
+                return
+            on_semantic_failure_response(
+                normalized_response(
+                    response_payload or {},
+                    response_headers,
+                    latency,
+                    "",
+                    force_unknown_cost=response_payload is None,
+                    semantic_failure=error,
+                )
+            )
+
         provider_capabilities = provider.get("capabilities", {})
         if (
             effort not in (None, "none") or reasoning_max_tokens is not None
@@ -748,9 +897,8 @@ class ProviderRegistry:
                 payload,
                 effective_provider,
                 before_attempt=before_attempt,
+                on_invalid_response=record_unparseable_response,
             )
-            transport_failures = self._consume_transport_failures()
-            text = _extract_responses_text(response_payload)
         elif provider_type in {"openai_compatible_chat", "openrouter_chat", "openrouter_fusion"}:
             payload = {
                 "model": model,
@@ -828,9 +976,8 @@ class ProviderRegistry:
                 payload,
                 effective_provider,
                 before_attempt=before_attempt,
+                on_invalid_response=record_unparseable_response,
             )
-            transport_failures = self._consume_transport_failures()
-            text = _extract_chat_text(response_payload)
         elif provider_type == "anthropic_messages":
             if reasoning_max_tokens is not None:
                 raise ConfigError(
@@ -852,58 +999,88 @@ class ProviderRegistry:
                 payload,
                 effective_provider,
                 before_attempt=before_attempt,
+                on_invalid_response=record_unparseable_response,
             )
-            transport_failures = self._consume_transport_failures()
-            stop_reason = response_payload.get("stop_reason")
-            if stop_reason not in (None, "end_turn", "stop_sequence"):
-                category = "policy_refusal" if stop_reason == "refusal" else "unclassified"
-                raise _ClassifiedProviderError(
-                    category,
-                    f"Anthropic returned non-terminal or truncated stop reason {stop_reason!r}",
-                )
-            content = response_payload.get("content")
-            if not isinstance(content, list):
-                raise _ClassifiedProviderError(
-                    "schema_invalid", "Anthropic response did not contain a content array"
-                )
-            fragments = [part.get("text", "") for part in content if isinstance(part, Mapping) and part.get("type") == "text"]
-            text = "\n".join(fragment for fragment in fragments if isinstance(fragment, str) and fragment.strip()).strip()
-            if not text:
-                raise _ClassifiedProviderError(
-                    "empty_response", "Anthropic returned HTTP success but no usable text"
-                )
         else:
             raise ConfigError(f"Unsupported provider type: {provider_type}")
 
-        if len(text.strip()) < int(seat.get("minimum_response_characters", 1)):
-            raise _ClassifiedProviderError(
-                "empty_response", "Provider response failed the configured semantic minimum length"
-            )
-        usage = _usage_from_payload(response_payload)
-        if seat.get("first_tool_required", False) is True and usage.tool_calls < 1:
-            raise _ClassifiedProviderError(
-                "tool_failure",
-                "Provider returned without the required server-tool call",
-            )
-        usage.cost_usd = _calculate_cost(usage, seat)
-        actual_model = str(response_payload.get("model") or model)
-        request_id = response_payload.get("id")
-        route = _openrouter_route(response_payload, headers)
-        if transport_failures:
-            route["transport_failures"] = transport_failures
-        citations = response_payload.get("citations")
-        if isinstance(citations, list):
-            route["citations"] = [citation for citation in citations if isinstance(citation, (str, Mapping))]
-        return ModelResponse(
-            text=text,
-            provider=provider_name,
-            requested_model=model,
-            actual_model=actual_model,
-            usage=usage,
-            latency_seconds=latency,
-            request_id=str(request_id) if request_id else None,
-            route=route,
-            raw_status=str(response_payload.get("status") or "completed"),
+        transport_failures = self._consume_transport_failures()
+        text = ""
+        usage: Optional[Usage] = None
+        try:
+            if provider_type in {"xai_responses", "openai_responses"}:
+                text = _extract_responses_text(response_payload)
+            elif provider_type in {
+                "openai_compatible_chat",
+                "openrouter_chat",
+                "openrouter_fusion",
+            }:
+                text = _extract_chat_text(response_payload)
+            else:
+                stop_reason = response_payload.get("stop_reason")
+                if stop_reason not in (None, "end_turn", "stop_sequence"):
+                    category = "policy_refusal" if stop_reason == "refusal" else "unclassified"
+                    raise _ClassifiedProviderError(
+                        category,
+                        f"Anthropic returned non-terminal or truncated stop reason {stop_reason!r}",
+                    )
+                content = response_payload.get("content")
+                if not isinstance(content, list):
+                    raise _ClassifiedProviderError(
+                        "schema_invalid", "Anthropic response did not contain a content array"
+                    )
+                fragments = [
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, Mapping) and part.get("type") == "text"
+                ]
+                text = "\n".join(
+                    fragment
+                    for fragment in fragments
+                    if isinstance(fragment, str) and fragment.strip()
+                ).strip()
+                if not text:
+                    raise _ClassifiedProviderError(
+                        "empty_response", "Anthropic returned HTTP success but no usable text"
+                    )
+
+            if len(text.strip()) < int(seat.get("minimum_response_characters", 1)):
+                raise _ClassifiedProviderError(
+                    "empty_response", "Provider response failed the configured semantic minimum length"
+                )
+            try:
+                usage = _usage_from_payload(response_payload)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise _ClassifiedProviderError(
+                    "schema_invalid", "Provider returned malformed usage fields"
+                ) from exc
+            if seat.get("first_tool_required", False) is True and usage.tool_calls < 1:
+                raise _ClassifiedProviderError(
+                    "tool_failure",
+                    "Provider returned without the required server-tool call",
+                )
+        except _ClassifiedProviderError as exc:
+            if on_semantic_failure_response is not None:
+                on_semantic_failure_response(
+                    normalized_response(
+                        response_payload,
+                        headers,
+                        latency,
+                        text,
+                        normalized_usage=usage,
+                        semantic_failure=exc,
+                        recorded_transport_failures=transport_failures,
+                    )
+                )
+            raise
+
+        return normalized_response(
+            response_payload,
+            headers,
+            latency,
+            text,
+            normalized_usage=usage,
+            recorded_transport_failures=transport_failures,
         )
 
     def list_models(self, provider_name: str, *, limit: int = 200) -> List[Dict[str, Any]]:
@@ -912,7 +1089,7 @@ class ProviderRegistry:
         request = urllib.request.Request(url, headers=self._headers(provider), method="GET")
         timeout_seconds = float(provider.get("request_timeout_seconds", 60))
         try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl.create_default_context()) as response:
+            with _authenticated_urlopen(request, timeout=timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             raise ProviderError(f"Model discovery failed for {provider_name}: {_safe_error_text(str(exc))}") from exc
@@ -943,12 +1120,16 @@ class ProviderRegistry:
         provider = probe_config.get("providers", {}).get(probe_seat.get("provider"), {})
         if isinstance(provider, Mapping):
             provider_type = provider.get("type")
+            if provider_type == "openrouter_fusion":
+                raise ProviderError(
+                    "OpenRouter Fusion seat tests are refused because a Fusion request can invoke "
+                    "multiple inner models and is not a bounded low-cost connectivity probe"
+                )
             if provider_type in {
                 "xai_responses",
                 "openai_responses",
                 "openai_compatible_chat",
                 "openrouter_chat",
-                "openrouter_fusion",
             }:
                 probe_seat["reasoning_effort"] = "low"
             elif provider_type == "anthropic_messages":

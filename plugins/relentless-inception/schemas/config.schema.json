@@ -326,7 +326,7 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 32,
-          "description": "Per-provider concurrent request cap used to avoid router throttling and accidental spend bursts."
+          "description": "Per-provider concurrent request cap within one orchestration process. Distinct processes and run IDs are not a machine-wide provider semaphore."
         },
         "retry_statuses": {
           "type": "array",
@@ -792,11 +792,13 @@
           "type": "array",
           "minItems": 1,
           "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
           "description": "Required independent panel seat names in launch order before anonymized order randomization."
         },
         "optional_panel": {
           "type": "array",
           "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
           "description": "Additional seats included only when both the seat and its provider are enabled and budgets permit."
         },
         "judge": {
@@ -963,6 +965,7 @@
           "type": "array",
           "minItems": 1,
           "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
           "description": "Independent verifier seat names. The runtime checks that they exist and are not the artifact-author instance."
         },
         "max_concurrency": {

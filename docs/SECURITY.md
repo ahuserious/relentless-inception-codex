@@ -33,6 +33,7 @@ The implementation:
 - rejects plaintext values under secret-like configuration keys;
 - redacts secret-like fields from displayed configuration and configuration hashes;
 - reads bearer tokens from the named process environment or an approved owner-only credential file only when making a provider request;
+- refuses authenticated completion and model-discovery redirects before credentials or environment-backed headers can be forwarded to another URL;
 - redacts bearer tokens and API-key-shaped text from surfaced transport errors;
 - writes user configuration atomically with mode `0600`;
 - does not scan shell profiles or repository `.env` files for keys.
@@ -67,7 +68,7 @@ Default privacy posture for the maximum-intelligence profile:
 - deny common secret paths such as `.env`, credentials, private keys, and `.ssh`;
 - require user approval for other sensitive paths;
 - treat all supplied artifacts as untrusted data;
-- persist raw model responses locally because synthesis, adversarial evidence, and deterministic resume depend on them;
+- persist verbatim returned model text and normalized response metadata locally because synthesis, adversarial evidence, and deterministic resume depend on them;
 - do not persist constructed outbound prompts or hidden reasoning as separate artifacts;
 - retain metadata, hashes, usage, route, and verdict artifacts needed for audit;
 - request zero-data-retention routing where available;
@@ -144,8 +145,10 @@ An adversarial gate is reliable only if every reviewer evaluates the same artifa
 - Invalidate the reviewer quorum after any artifact or evidence change.
 - Preserve raw independent reviews until synthesis completes.
 - Keep judge and synthesizer roles distinct.
+- Reject duplicate required-panel, optional-panel, and reviewer seat names, plus overlap between required and optional panels.
 - Preserve minority findings and document their resolution.
 - Treat reproducible mechanical failure as blocking regardless of vote count.
+- Treat every completed `NEEDS_WORK` or `FAIL` reviewer verdict as blocking regardless of numeric quorum.
 - Fail closed on malformed verdicts, blind criteria, insufficient live seats, or required-provider failure.
 
 Two reviews of two different diffs cannot satisfy one quorum. The configured verifier seats—not the earlier fusion panelists—must independently pass the identical SHA-256. A higher-level release process may run the entire gate twice on an unchanged commit, but that is separate from the core `required_passes` reviewer count.
@@ -180,7 +183,7 @@ Never raise a hard cap merely to satisfy "maximum intelligence" without the user
 
 ## Persistence and deletion
 
-Run state defaults to `PLUGIN_DATA`, `RELENTLESS_INCEPTION_DATA_DIR`, or `~/.codex/relentless-inception/`. It contains raw model responses, task and artifact hashes, evidence, errors, usage, route metadata, and verdicts. Treat the directory as sensitive even when outbound task content was redacted.
+Run state defaults to `PLUGIN_DATA`, `RELENTLESS_INCEPTION_DATA_DIR`, or `~/.codex/relentless-inception/`. It contains verbatim model text, normalized response envelopes, task and artifact hashes, evidence, errors, usage, route metadata, and verdicts. Treat the directory as sensitive even when outbound task content was redacted.
 
 - Run paths are confined beneath the run directory.
 - Runtime directories use mode `0700`; files use mode `0600`; writes are atomic.

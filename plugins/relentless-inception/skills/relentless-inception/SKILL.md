@@ -51,7 +51,7 @@ Use the MCP tools in this order:
 
 1. `config_show` to inspect the redacted active configuration.
 2. `doctor` to check local configuration, paths, Python/runtime information, and credentials by presence without making a network request.
-3. `provider_test` for any load-bearing seat that has not been tested in the current environment.
+3. `provider_test` for any ordinary load-bearing seat that has not been tested in the current environment. It intentionally refuses OpenRouter Fusion because one request can fan out to multiple inner models; verify that path only with an explicitly budgeted disposable fusion run.
 
 The live MCP tool schemas are authoritative for arguments. Do not invent arguments from this skill file. If a provider or required seat is unavailable, surface the exact missing capability. Do not silently substitute a weaker model, lower effort, smaller panel, or different provider unless the selected profile explicitly permits that degradation.
 
@@ -125,7 +125,7 @@ After execution, invoke the `relentless-inception-review` skill and the enabled 
 
 Include the acceptance criteria and a hash for every reviewed artifact at every stage. Refuse a pass when a named evidence item is missing.
 
-All reviewers in a gate must review the same snapshot. `required_passes` is the number of independent reviewer seats that must each return `PASS` for that one SHA-256. A changed artifact invalidates the quorum. A reproducible mechanical failure overrides the pass count. A missing criterion is a blind spot, not a pass.
+All reviewers in a gate must review the same snapshot. Reviewer seat names must be unique; for a `fuse`-produced artifact, configured author separation applies to the actual synthesis author. `required_passes` is the number of independent reviewer seats that must each return `PASS` for that one SHA-256. A changed artifact invalidates the quorum. Any completed `NEEDS_WORK` or `FAIL`, a reproducible mechanical failure, or a missing criterion blocks regardless of the numeric pass count.
 
 When the gate fails and the user authorized implementation, repair only the blocking issue, rerun relevant verification, produce a new artifact hash, and gate again. When the user requested review only, report findings without modifying files.
 
