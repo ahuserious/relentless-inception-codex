@@ -825,7 +825,7 @@
           "type": "integer",
           "minimum": 2,
           "maximum": 8,
-          "description": "Hard panel-size cap. Benchmark evidence shows diminishing returns beyond roughly four to seven strong responses."
+          "description": "Hard panel-size cap after all required seats and any enabled optional seats are assembled. It must be at least the required panel length. Benchmark evidence shows diminishing returns beyond roughly four to seven strong responses."
         },
         "max_concurrency": {
           "type": "integer",

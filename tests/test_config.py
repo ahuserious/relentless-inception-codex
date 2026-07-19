@@ -240,6 +240,22 @@ class ConfigTests(unittest.TestCase):
 
                 self.assertTrue(any(expected_error in error for error in errors), errors)
 
+    def test_validation_rejects_panel_cap_smaller_than_required_roster(self) -> None:
+        config = load_config(include_user=False)
+        fusion = config["profiles"]["maximum_intelligence"]["fusion"]
+        fusion["max_panel_seats"] = len(fusion["panel"]) - 1
+
+        errors = validate_config(config)
+
+        self.assertTrue(
+            any(
+                "fusion.max_panel_seats cannot be smaller than required panel length"
+                in error
+                for error in errors
+            ),
+            errors,
+        )
+
     def test_malformed_cross_reference_values_report_errors_without_crashing(self) -> None:
         malformed_cases = []
 

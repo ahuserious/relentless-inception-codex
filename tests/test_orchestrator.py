@@ -148,6 +148,24 @@ class OrchestrationTests(unittest.TestCase):
             )
         self.assertEqual(duplicate_reviewer_registry.calls, [])
 
+        undersized_cap_config = orchestration_config()
+        undersized_cap_config["profiles"]["maximum_intelligence"]["fusion"][
+            "max_panel_seats"
+        ] = len(DEFAULT_PANEL) - 1
+        undersized_cap_registry = FakeProviderRegistry()
+        with self.assertRaisesRegex(
+            ConfigError,
+            "fusion.max_panel_seats cannot be smaller than the required panel length",
+        ):
+            FusionOrchestrator(
+                undersized_cap_config,
+                undersized_cap_registry,
+            ).fuse(
+                "Every required panel seat must remain required.",
+                run_id="undersized-panel-cap-runtime",
+            )
+        self.assertEqual(undersized_cap_registry.calls, [])
+
     def test_substantive_claim_floor_rejects_heading_only_panel_output(self) -> None:
         self.assertFalse(_contains_substantive_claim("# Analysis\n## Risks\n- TBD\n- Unknown"))
         self.assertTrue(
@@ -946,6 +964,88 @@ class OrchestrationTests(unittest.TestCase):
 
                 self.assertEqual(len(registry.calls), call_count)
 
+    def test_raw_response_without_ledger_entry_fails_before_redispatch(self) -> None:
+        cases = (
+            ("panel", "panel.json", "omits paid response evidence"),
+            ("judge", "judge.json", "Persisted judge response evidence exists"),
+            ("synthesis", "synthesis.json", "Persisted synthesis response evidence exists"),
+            ("gate", "gate-0.json", "Persisted gate response evidence exists"),
+        )
+        for stage, cache_name, expected_error in cases:
+            with self.subTest(stage=stage):
+                config = orchestration_config()
+                registry = FakeProviderRegistry()
+                orchestrator = FusionOrchestrator(config, registry)
+                task = (
+                    "Do not repay a response orphaned between raw persistence and "
+                    f"the {stage} ledger commit."
+                )
+                run_id = f"orphan-raw-{stage}"
+
+                first = orchestrator.fuse(task, run_id=run_id)
+                run_directory = Path(first.artifacts_dir)
+                ledger_path = run_directory / "ledger.json"
+                ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                remaining_entries = [
+                    entry
+                    for entry in ledger["entries"]
+                    if entry["stage"] != stage
+                ]
+                self.assertLess(len(remaining_entries), len(ledger["entries"]))
+
+                counter_fields = (
+                    "input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "cached_tokens",
+                    "tool_calls",
+                )
+                counters = {
+                    field_name: sum(
+                        entry["usage"][field_name]
+                        for entry in remaining_entries
+                    )
+                    for field_name in counter_fields
+                }
+                known_cost_usd = sum(
+                    entry["usage"]["cost_usd"]
+                    for entry in remaining_entries
+                    if entry["usage"]["cost_usd"] is not None
+                )
+                provider_cost_usd: dict[str, float] = {}
+                for entry in remaining_entries:
+                    cost_usd = entry["usage"]["cost_usd"]
+                    if cost_usd is not None:
+                        provider = entry["provider"]
+                        provider_cost_usd[provider] = (
+                            provider_cost_usd.get(provider, 0.0) + cost_usd
+                        )
+                ledger.update(
+                    {
+                        **counters,
+                        "total_tokens": counters["input_tokens"]
+                        + counters["output_tokens"],
+                        "known_cost_usd": known_cost_usd,
+                        "provider_cost_usd": provider_cost_usd,
+                        "unknown_cost_calls": sum(
+                            entry["usage"]["cost_usd"] is None
+                            for entry in remaining_entries
+                        ),
+                        "accounting_failure": None,
+                        "stop_reason": None,
+                        "entries": remaining_entries,
+                        "warnings": [],
+                    }
+                )
+                ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+                (run_directory / cache_name).unlink()
+                call_count = len(registry.calls)
+
+                with self.assertRaisesRegex(ConfigError, expected_error):
+                    orchestrator.fuse(task, run_id=run_id)
+
+                self.assertEqual(len(registry.calls), call_count)
+
     def test_cached_gate_recomputes_policy_and_blocks_truthy_negative_verdict(self) -> None:
         config = orchestration_config()
         registry = VerdictOverrideRegistry(
@@ -1310,6 +1410,9 @@ class OrchestrationTests(unittest.TestCase):
         )
         failing_evidence = (
             "pytest exited with code 1",
+            "pytest failed",
+            "FAILED tests/test_x.py::test_y",
+            "make: *** [test] Error 2",
             "command returned exit code 2",
             "1 test failed",
             '{"passed": "false", "exit_code": "1"}',

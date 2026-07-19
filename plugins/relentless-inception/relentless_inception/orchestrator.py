@@ -145,7 +145,9 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
             flags=re.IGNORECASE,
         )
         explicit_failure = re.search(
-            r"\b(?:assertionerror|assertion\s+failure|tests?\s+(?:failed|failing)|build\s+failed|command\s+failed)\b"
+            r"\b(?:assertionerror|assertion\s+failure|tests?\s+(?:failed|failing)|pytest\s+(?:failed|failing)|build\s+failed|command\s+failed)\b"
+            r"|(?:^|\n)\s*FAILED\s+\S+(?:::|\s|$)"
+            r"|(?:^|\n)\s*make(?:\[\d+\])?:\s+\*{3}.*\bError\s+\d+\b"
             r"|traceback \(most recent call last\)",
             residual,
             flags=re.IGNORECASE,
@@ -577,6 +579,36 @@ def _has_persisted_invocation(store: RunStore, invocation: Mapping[str, Any]) ->
         isinstance(entry, Mapping)
         and entry.get("invocation_sha256") == invocation_sha256
         for entry in entries
+    )
+
+
+def _has_persisted_raw_invocation(
+    store: RunStore,
+    invocation: Mapping[str, Any],
+) -> bool:
+    responses_directory = store.path("responses")
+    if not responses_directory.exists():
+        return False
+    expected_invocation_sha256 = canonical_json_hash(invocation)
+    for artifact_path in responses_directory.glob("*.json"):
+        relative_name = artifact_path.relative_to(store.directory).as_posix()
+        saved = store.read_json(relative_name)
+        saved_invocation = saved.get("invocation")
+        if (
+            isinstance(saved_invocation, Mapping)
+            and canonical_json_hash(saved_invocation) == expected_invocation_sha256
+        ):
+            return True
+    return False
+
+
+def _has_response_evidence_for_invocation(
+    store: RunStore,
+    invocation: Mapping[str, Any],
+) -> bool:
+    return _has_persisted_invocation(store, invocation) or _has_persisted_raw_invocation(
+        store,
+        invocation,
     )
 
 
@@ -1158,6 +1190,10 @@ class FusionOrchestrator:
             if optional_seat.get("enabled", True) is True and isinstance(provider, Mapping) and provider.get("enabled", True) is True:
                 seat_names.append(str(optional_seat_name))
         max_panel_seats = int(fusion.get("max_panel_seats", len(seat_names)))
+        if max_panel_seats < len(panel_seat_names):
+            raise ConfigError(
+                "fusion.max_panel_seats cannot be smaller than the required panel length"
+            )
         seat_names = seat_names[:max_panel_seats]
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
 
@@ -1283,7 +1319,7 @@ class FusionOrchestrator:
                 isinstance(saved_result, Mapping)
                 and saved_result.get("response_evidence") is not None
             )
-            if not reusable_response and _has_persisted_invocation(
+            if not reusable_response and _has_response_evidence_for_invocation(
                 store,
                 invocations_by_seat[seat_name],
             ):
@@ -1472,7 +1508,7 @@ class FusionOrchestrator:
             if validated_judgment != canonical_judgment:
                 raise ConfigError("Stored judge judgment does not match its raw response")
             return canonical_judgment
-        if _has_persisted_invocation(store, judge_invocation):
+        if _has_response_evidence_for_invocation(store, judge_invocation):
             raise ConfigError(
                 "Persisted judge response evidence exists without a reusable judge artifact"
             )
@@ -1562,7 +1598,7 @@ class FusionOrchestrator:
                 except ProviderError as exc:
                     raise ConfigError(str(exc)) from exc
             return text, normalized_saved
-        if _has_persisted_invocation(store, synthesis_invocation):
+        if _has_response_evidence_for_invocation(store, synthesis_invocation):
             raise ConfigError(
                 f"Persisted {synthesis_stage} response evidence exists without a reusable synthesis artifact"
             )
@@ -1693,7 +1729,7 @@ class FusionOrchestrator:
         committed_reviewers = [
             reviewer_name
             for reviewer_name in reviewer_names
-            if _has_persisted_invocation(
+            if _has_response_evidence_for_invocation(
                 store,
                 invocations_by_reviewer[reviewer_name],
             )

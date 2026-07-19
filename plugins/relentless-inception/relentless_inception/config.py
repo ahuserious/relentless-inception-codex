@@ -495,6 +495,16 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
             errors.append(f"{path}.fusion.min_live_seats must be an integer >= 1")
         elif panel and min_live > len(panel):
             errors.append(f"{path}.fusion.min_live_seats cannot exceed panel length")
+        max_panel_seats = fusion.get("max_panel_seats")
+        if (
+            isinstance(max_panel_seats, int)
+            and not isinstance(max_panel_seats, bool)
+            and panel
+            and max_panel_seats < len(panel)
+        ):
+            errors.append(
+                f"{path}.fusion.max_panel_seats cannot be smaller than required panel length"
+            )
         max_concurrency = fusion.get("max_concurrency", 1)
         if not isinstance(max_concurrency, int) or not 1 <= max_concurrency <= 16:
                 errors.append(f"{path}.fusion.max_concurrency must be between 1 and 16")
