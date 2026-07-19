@@ -1,6 +1,6 @@
-# OPT-IN NATIVE-AGENT REGISTRATION — merge into user-level
-# ~/.codex/config.toml after reviewing existing values. This shape matches Codex
-# 0.145. Keep max_depth = 1 unless recursive delegation is deliberately required;
+# FUTURE COMPATIBILITY RETEST ONLY — merge into user-level ~/.codex/config.toml
+# temporarily after reviewing existing values. This shape matches Codex 0.145.
+# Keep max_depth = 1 unless recursive delegation is deliberately required;
 # deeper fan-out increases cost, latency, and the chance of uncontrolled task
 # expansion.
 
@@ -18,8 +18,9 @@ description = "Independent reasoning-only Grok 4.5 reviewer. It receives complet
 config_file = "/absolute/path/to/.codex/agents/grok45_reviewer.toml"
 nickname_candidates = ["Axiom", "Kepler", "Turing"]
 
-# IMPORTANT: this role is reasoning-only on Codex 0.145. The hardened agent
-# layer disables known tool-producing features; every MCP server inherited from
-# the user's main config must also be overridden with enabled = false in that
-# layer. A local text-only Grok 4.5 smoke test passed, but function-result
-# continuation failed. Use external plugin seats for tool use or implementation.
+# IMPORTANT: do not leave this role registered on the tested Codex 0.145 build.
+# A foreground tool-free Grok turn passed, but a real custom-agent spawn failed
+# with HTTP 422 due an unsupported xAI `ModelInput`, and function-result
+# continuation also failed. For future retesting, the hardened layer must disable
+# known tool-producing features. Every inherited MCP server must be repeated with
+# its `command` or `url` plus `enabled = false`; an enabled-only table is invalid.

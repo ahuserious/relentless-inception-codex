@@ -8,12 +8,12 @@
 #
 # VERIFIED CODEX 0.145 BOUNDARY: custom Responses providers advertise/send
 # namespace tools by default, while xAI rejects type="namespace" with HTTP 422.
-# A hardened role with all tool-producing features and inherited MCP servers
-# disabled passed a single-turn Grok 4.5 text smoke test. Tool-result continuation
-# still failed with a compaction-blob decode error, so use this provider only for
-# reasoning-only native review. Use the plugin's direct external xAI seats for
-# fusion, provider-hosted tools, and any workflow that needs tool use.
-# Tracking issue: https://github.com/openai/codex/issues/14242
+# A hardened foreground session with every tool surface disabled passed one Grok
+# 4.5 text smoke test, but a real spawned custom-agent turn still failed with
+# HTTP 422 due an unsupported xAI `ModelInput` shape. Tool-result continuation
+# also failed with a compaction-blob error. Do not register native Grok on the
+# tested Codex 0.145 build. Use the plugin's direct external xAI seats for Grok
+# subagents, fusion, provider-hosted tools, and review.
 
 [model_providers.xai]
 name = "xAI Responses"
@@ -31,5 +31,5 @@ supports_websockets = false
 # model = "grok-4.5"
 # model_reasoning_effort = "high"
 #
-# Select this provider only from the hardened reasoning-only custom-agent layer.
-# Do not select it globally or ask that role to call a tool on Codex 0.145.
+# Retest this provider only from the hardened reasoning-only custom-agent layer
+# after Codex or xAI changes. Do not leave that role registered on Codex 0.145.

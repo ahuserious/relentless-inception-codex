@@ -934,6 +934,7 @@ class ProviderRegistry:
         probe_seat = probe_config.get("seats", {}).get(seat_name)
         if not isinstance(probe_seat, dict):
             raise ConfigError(f"Unknown seat: {seat_name}")
+        probe_seat["tool_policy"] = "none"
         probe_seat["server_tools"] = []
         probe_seat["first_tool_required"] = False
         probe_seat["max_output_tokens"] = 32

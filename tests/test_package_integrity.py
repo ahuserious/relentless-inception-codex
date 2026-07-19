@@ -112,6 +112,18 @@ class PluginPackageIntegrityTests(unittest.TestCase):
                 merged_config = deep_merge(default_config, _load_json(example_path))
                 self.assertEqual(validate_config(merged_config), [])
 
+    def test_native_grok_role_keeps_instructions_at_root_and_documents_valid_mcp_overrides(self) -> None:
+        role_example_path = PLUGIN_ROOT / "examples" / "native-codex-grok-reviewer-agent.toml.example"
+        role_example = role_example_path.read_text(encoding="utf-8")
+        default_config = load_config(include_user=False)
+
+        self.assertLess(role_example.index("developer_instructions ="), role_example.index("[skills]"))
+        self.assertIn("command = \"/same/command/as/the/main/config\"", role_example)
+        self.assertIn("url = \"https://same-origin-as-the-main-config.example/mcp\"", role_example)
+        self.assertNotIn("# [mcp_servers.example_server]\n# enabled = false", role_example)
+        self.assertEqual(default_config["native_codex"]["reviewer_roles"], [])
+        self.assertEqual(default_config["native_codex"]["reasoning_only_roles"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

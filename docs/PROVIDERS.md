@@ -183,7 +183,7 @@ The examples directory contains:
 - `native-codex-trusted-router-provider.toml.example`;
 - `native-codex-grok-reviewer-agent.toml.example`.
 
-Provider snippets must be manually merged into `~/.codex/config.toml`; do not overwrite the file. Codex 0.145 uses this shape for limits and role registration:
+Provider snippets must be manually merged into `~/.codex/config.toml`; do not overwrite the file. The following is a future-compatibility retest shape, not a recommendation to register Grok on the tested build. Codex 0.145 uses this shape for limits and role registration:
 
 ```toml
 [agents]
@@ -198,25 +198,25 @@ config_file = "/absolute/path/to/.codex/agents/grok45_reviewer.toml"
 nickname_candidates = ["Axiom", "Kepler", "Turing"]
 ```
 
-Replace the placeholder with the absolute path to `~/.codex/agents/grok45_reviewer.toml`. The referenced file is a Codex config layer: keep model/provider selection, reasoning effort, the read-only/no-approval posture, tool-feature and inherited-MCP disables, and `developer_instructions` there, while keeping `description`, `config_file`, and `nickname_candidates` in the main role table. The bundled `native-codex-agent-limits.toml.example` and `native-codex-grok-reviewer-agent.toml.example` show the two halves.
+For a future retest, replace the placeholder with the absolute path to `~/.codex/agents/grok45_reviewer.toml`. The referenced file is a Codex config layer: keep model/provider selection, reasoning effort, the read-only/no-approval posture, tool-feature and inherited-MCP disables, and `developer_instructions` there, while keeping `description`, `config_file`, and `nickname_candidates` in the main role table. The bundled `native-codex-agent-limits.toml.example` and `native-codex-grok-reviewer-agent.toml.example` show the two halves. Do not leave the role registered after a failed smoke test.
 
 ### Verified Codex 0.145 xAI boundary
 
-Codex 0.145 custom Responses providers advertise/send tools with `type: "namespace"` by default. xAI rejects that tool type with HTTP 422; its accepted tool types include `function`, `web_search`, and `x_search`. Changing `wire_api` to Chat Completions is not a workaround because current Codex removed that wire option. See [openai/codex#14242](https://github.com/openai/codex/issues/14242) and the current Codex [provider capability source](https://github.com/openai/codex/blob/main/codex-rs/model-provider/src/provider.rs).
+Codex 0.145 custom Responses providers advertise/send tools with `type: "namespace"` by default. A local xAI probe rejected that tool type with HTTP 422; xAI's documented built-in tool types include `web_search` and `x_search`, while custom tools use `function`. Changing `wire_api` to Chat Completions is not a workaround because current Codex removed that wire option. The default namespace capability is visible in Codex's current [provider source](https://github.com/openai/codex/blob/main/codex-rs/model-provider/src/provider.rs), and xAI documents its accepted shapes under [tools](https://docs.x.ai/developers/tools/overview) and [function calling](https://docs.x.ai/developers/tools/function-calling).
 
-A local live probe found one useful but deliberately narrow exception. With web search disabled, skill instructions omitted, all known tool-producing features disabled, and every inherited MCP server disabled in the role's config layer, native Grok 4.5 returned a correct streamed text response. It can therefore act as a **single-turn, reasoning-only reviewer** when the parent includes the complete artifact and evidence in its prompt. The role requires `XAI_API_KEY` in the environment that launched Codex.
+A direct foreground probe found one narrow partial success. With web search disabled, skill instructions omitted, all known tool-producing features disabled, and every inherited MCP server disabled, Grok 4.5 returned a correct streamed text response. That did **not** establish custom-agent compatibility. An end-to-end Codex parent→`grok45_reviewer` spawn subsequently failed with HTTP 422 even in an isolated, tool-minimal configuration; xAI reported that the request body did not match any accepted `ModelInput` variant.
 
-That result does not establish tool compatibility. In a separate probe Grok selected a shell function and Codex executed it, but xAI rejected the continuation with `Could not decode the compaction blob`. Disabling remote compaction and raising the automatic-compaction threshold did not repair the continuation. Do not let this role call tools, retrieve evidence, inspect the workspace, or implement changes on Codex 0.145. Direct xAI seats inside the Relentless Inception MCP runtime remain the operational fusion/tool path because they use the plugin's own Responses adapter.
+The spawned-text failure is already blocking. In a separate probe Grok selected a shell function and Codex executed it, but xAI also rejected the continuation with `Could not decode the compaction blob`. Disabling remote compaction and raising the automatic-compaction threshold did not repair the continuation. Do not register or select this native role on the tested Codex 0.145 build. Direct xAI seats inside the Relentless Inception MCP runtime remain the operational Grok-subagent, fusion, and provider-tool path because they use the plugin's own Responses adapter.
 
-The custom-agent config layer merges with the parent. Disabling plugins/apps is not enough when the user's main config defines MCP servers: add `[mcp_servers.<id>] enabled = false` for every inherited server, and revisit the list whenever the main configuration changes. The bundled role example shows the required feature posture and an MCP override template.
+The custom-agent config layer merges with the parent, but Codex first deserializes the role file on its own. Disabling plugins/apps is not enough when the user's main config defines MCP servers. For every inherited server, repeat the matching transport discriminator (`command` for stdio or `url` for HTTP) alongside `enabled = false`; an enabled-only partial table fails with `invalid transport`. Do not copy literal credentials. Revisit the list whenever the main configuration changes, run `codex --strict-config doctor --json`, and refuse to register the role if the standalone layer is malformed or any inherited tool remains exposed. The bundled role example shows both transport shapes.
 
-After upgrading Codex or xAI, verify before granting the native role any tools:
+After upgrading Codex or xAI, verify before registering the native role:
 
-1. a plain streamed response;
+1. a parent-spawned custom-agent streamed response with no tools;
 2. a function call issued by the model;
 3. Codex executing the function under the expected sandbox;
 4. a second response after `function_call_output` continuation;
 5. timeout behavior on a high-reasoning request;
 6. requested and actual model identity.
 
-If the text step fails, remove or disable the native role registration and use Grok 4.5 through the external MCP panel. If text passes but any tool step fails, retain reasoning-only mode and keep every tool surface disabled.
+The first text step means a real parent-spawned custom-agent turn, not a foreground session with the same provider. If it fails, remove or disable the native role registration and use Grok 4.5 through the external MCP panel. If spawned text passes but any tool step fails, retain reasoning-only mode and keep every tool surface disabled.

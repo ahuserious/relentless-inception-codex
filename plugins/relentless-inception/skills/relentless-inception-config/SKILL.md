@@ -121,7 +121,7 @@ Only offer native setup when the user explicitly wants Grok or another provider 
 5. Ask before writing either path.
 6. After setup, restart or reload Codex and smoke-test a text response. Before exposing any tool, separately pass a streamed two-turn function-call/output continuation.
 
-Native xAI/OpenRouter/trusted-router compatibility is protocol-level and version-sensitive. On the locally tested Codex 0.145/xAI combination, Grok 4.5 works only as a hardened single-turn reasoning reviewer: disable web search, shell, plugins/apps, skill/tool features, and every inherited MCP server, and give the role a complete immutable evidence packet. The first function call can execute but its result continuation fails, so never ask that role to inspect, retrieve, execute, or mutate. If the text smoke test fails too, use the model only as an external MCP panelist.
+Native xAI/OpenRouter/trusted-router compatibility is protocol-level and version-sensitive. On the locally tested Codex 0.145/xAI combination, a foreground tool-free Grok 4.5 turn succeeded, but a real parent-spawned custom-agent turn failed with HTTP 422 because its input did not match xAI's accepted `ModelInput`; a function-result continuation failed separately. Do not register native Grok on that build. Use external MCP seats as the operational Grok subagents. For future retesting, disable every tool surface; an MCP override must repeat the matching `command` or `url` transport with `enabled = false` because Codex rejects enabled-only partial role tables. Require strict-config diagnostics and a successful parent-spawned text probe before registration, then test the complete tool loop before granting tools.
 
 ## Finish
 

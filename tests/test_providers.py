@@ -106,6 +106,7 @@ class ProviderParsingTests(unittest.TestCase):
                 original_seat = config["seats"]["responses_seat"]
                 original_seat.update(
                     {
+                        "tool_policy": "provider_server_tools",
                         "server_tools": ["web_search", {"type": "x_search"}],
                         "first_tool_required": True,
                         "max_output_tokens": 32_768,
@@ -157,6 +158,7 @@ class ProviderParsingTests(unittest.TestCase):
                 self.assertIsNot(probe_registry, registry)
                 self.assertIsNot(probe_registry.config, config)
                 probe_seat = probe_registry.config["seats"]["responses_seat"]
+                self.assertEqual(probe_seat["tool_policy"], "none")
                 self.assertEqual(probe_seat["server_tools"], [])
                 self.assertFalse(probe_seat["first_tool_required"])
                 self.assertFalse(probe_seat["allow_model_fallbacks"])
