@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import random
 import re
@@ -23,6 +24,7 @@ from .types import ModelResponse, Usage
 RETRYABLE_HTTP_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MAX_USAGE_INTEGER = (1 << 63) - 1
 
 
 class _ClassifiedProviderError(ProviderError):
@@ -198,32 +200,181 @@ def _extract_chat_text(payload: Mapping[str, Any]) -> str:
     raise _ClassifiedProviderError("empty_response", "Provider returned HTTP success but an empty completion")
 
 
+def _strict_usage_integer(value: Any, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative integer")
+    if value > MAX_USAGE_INTEGER:
+        raise ValueError(
+            f"{field_name} exceeds the signed 64-bit usage maximum of {MAX_USAGE_INTEGER}"
+        )
+    return value
+
+
+def _usage_integer_alias(
+    raw_usage: Mapping[str, Any],
+    field_names: Sequence[str],
+    label: str,
+    errors: List[str],
+) -> Tuple[int, bool]:
+    valid_values: List[int] = []
+    for field_name in field_names:
+        if field_name not in raw_usage:
+            continue
+        try:
+            valid_values.append(_strict_usage_integer(raw_usage[field_name], field_name))
+        except ValueError as exc:
+            errors.append(str(exc))
+    if not valid_values:
+        return 0, False
+    if any(value != valid_values[0] for value in valid_values[1:]):
+        errors.append(f"conflicting {label} fields")
+    return max(valid_values), True
+
+
+def _usage_detail_integer(
+    raw_usage: Mapping[str, Any],
+    container_names: Sequence[str],
+    field_name: str,
+    errors: List[str],
+) -> int:
+    valid_values: List[int] = []
+    for container_name in container_names:
+        if container_name not in raw_usage:
+            continue
+        details = raw_usage[container_name]
+        if details is None:
+            continue
+        if not isinstance(details, Mapping):
+            errors.append(f"{container_name} must be an object")
+            continue
+        if field_name not in details:
+            continue
+        try:
+            valid_values.append(
+                _strict_usage_integer(details[field_name], f"{container_name}.{field_name}")
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+    if valid_values and any(value != valid_values[0] for value in valid_values[1:]):
+        errors.append(f"conflicting {field_name} detail fields")
+    return max(valid_values) if valid_values else 0
+
+
+def _strict_usage_cost(value: Any, field_name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a nonnegative finite number")
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a nonnegative finite number") from exc
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError(f"{field_name} must be a nonnegative finite number")
+    return normalized
+
+
 def _usage_from_payload(payload: Mapping[str, Any]) -> Usage:
-    raw_usage = payload.get("usage")
-    if not isinstance(raw_usage, Mapping):
-        return Usage(tool_calls=_count_tool_calls(payload))
-    input_details = raw_usage.get("input_tokens_details") or raw_usage.get("prompt_tokens_details") or {}
-    output_details = raw_usage.get("output_tokens_details") or raw_usage.get("completion_tokens_details") or {}
-    reported_cost = raw_usage.get("cost")
-    cost_ticks = raw_usage.get("cost_in_usd_ticks")
-    if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool):
-        cost_usd: Optional[float] = float(reported_cost)
-    elif isinstance(cost_ticks, (int, float)) and not isinstance(cost_ticks, bool):
-        cost_usd = float(cost_ticks) / 10_000_000_000
+    validation_errors: List[str] = []
+    missing_usage = object()
+    raw_usage_value = payload.get("usage", missing_usage)
+    if raw_usage_value is missing_usage or raw_usage_value is None:
+        raw_usage: Mapping[str, Any] = {}
+    elif isinstance(raw_usage_value, Mapping):
+        raw_usage = raw_usage_value
     else:
-        cost_usd = None
+        raw_usage = {}
+        validation_errors.append("usage must be an object")
+
+    input_tokens, has_input_tokens = _usage_integer_alias(
+        raw_usage,
+        ("input_tokens", "prompt_tokens"),
+        "input token usage",
+        validation_errors,
+    )
+    output_tokens, has_output_tokens = _usage_integer_alias(
+        raw_usage,
+        ("output_tokens", "completion_tokens"),
+        "output token usage",
+        validation_errors,
+    )
+    input_output_usage_complete = has_input_tokens and has_output_tokens
+    incomplete_errors: List[str] = []
+    if not input_output_usage_complete:
+        missing_counts = []
+        if not has_input_tokens:
+            missing_counts.append("input token count")
+        if not has_output_tokens:
+            missing_counts.append("output token count")
+        incomplete_errors.append("missing " + " and ".join(missing_counts))
+
+    reported_cost: Optional[float] = None
+    if "cost" in raw_usage:
+        try:
+            reported_cost = _strict_usage_cost(raw_usage["cost"], "cost")
+        except ValueError as exc:
+            validation_errors.append(str(exc))
+    ticks_cost: Optional[float] = None
+    if "cost_in_usd_ticks" in raw_usage:
+        try:
+            ticks_cost = _strict_usage_integer(
+                raw_usage["cost_in_usd_ticks"], "cost_in_usd_ticks"
+            ) / 10_000_000_000
+        except ValueError as exc:
+            validation_errors.append(str(exc))
+    if (
+        reported_cost is not None
+        and ticks_cost is not None
+        and abs(reported_cost - ticks_cost)
+        > 4 * max(math.ulp(reported_cost), math.ulp(ticks_cost))
+    ):
+        validation_errors.append("conflicting cost and cost_in_usd_ticks fields")
+    valid_reported_costs = [
+        cost for cost in (reported_cost, ticks_cost) if cost is not None
+    ]
+    # Conflicting fields hard-latch accounting; retaining the larger valid
+    # report avoids understating the already-incurred charge.
+    cost_usd = max(valid_reported_costs) if valid_reported_costs else None
+
     tool_call_counts = [_count_tool_calls(payload)]
     for field_name in ("tool_calls", "num_server_side_tools_used"):
-        field_value = raw_usage.get(field_name)
-        if isinstance(field_value, (int, float)) and not isinstance(field_value, bool):
-            tool_call_counts.append(max(0, int(field_value)))
+        if field_name not in raw_usage:
+            continue
+        try:
+            tool_call_counts.append(_strict_usage_integer(raw_usage[field_name], field_name))
+        except ValueError as exc:
+            validation_errors.append(str(exc))
+
+    reasoning_tokens = _usage_detail_integer(
+        raw_usage,
+        ("output_tokens_details", "completion_tokens_details"),
+        "reasoning_tokens",
+        validation_errors,
+    )
+    cached_tokens = _usage_detail_integer(
+        raw_usage,
+        ("input_tokens_details", "prompt_tokens_details"),
+        "cached_tokens",
+        validation_errors,
+    )
+    if has_input_tokens and cached_tokens > input_tokens:
+        validation_errors.append("cached_tokens cannot exceed input token usage")
+    if has_output_tokens and reasoning_tokens > output_tokens:
+        validation_errors.append("reasoning_tokens cannot exceed output token usage")
+    unique_validation_errors = list(dict.fromkeys(validation_errors))
+    all_errors = unique_validation_errors + incomplete_errors
     return Usage(
-        input_tokens=int(raw_usage.get("input_tokens") or raw_usage.get("prompt_tokens") or 0),
-        output_tokens=int(raw_usage.get("output_tokens") or raw_usage.get("completion_tokens") or 0),
-        reasoning_tokens=int(output_details.get("reasoning_tokens") or 0) if isinstance(output_details, Mapping) else 0,
-        cached_tokens=int(input_details.get("cached_tokens") or 0) if isinstance(input_details, Mapping) else 0,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_tokens=cached_tokens,
         tool_calls=max(tool_call_counts),
         cost_usd=cost_usd,
+        input_output_usage_complete=input_output_usage_complete,
+        raw_usage_invalid=bool(unique_validation_errors),
+        accounting_error=(
+            "Provider returned invalid or incomplete usage: " + "; ".join(all_errors)
+            if all_errors
+            else None
+        ),
     )
 
 
@@ -279,6 +430,9 @@ def _openrouter_route(payload: Mapping[str, Any], headers: Mapping[str, str]) ->
 def _calculate_cost(usage: Usage, seat: Mapping[str, Any]) -> Optional[float]:
     if usage.cost_usd is not None:
         return usage.cost_usd
+    if not usage.input_output_usage_complete:
+        # Partial token counts cannot safely produce a zero-valued local cost.
+        return None
     pricing = seat.get("pricing")
     if not isinstance(pricing, Mapping):
         return None
@@ -407,7 +561,7 @@ class ProviderRegistry:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "relentless-inception-codex/0.1.0",
+            "User-Agent": "relentless-inception-codex/0.1.1",
         }
         if provider.get("type") == "anthropic_messages":
             headers["x-api-key"] = api_key
@@ -704,7 +858,11 @@ class ProviderRegistry:
                         }
                     )
                     errors.append(f"{model}: {sanitized_error}")
-                    if not allow_model_fallbacks or category not in fallback_categories:
+                    if (
+                        category == "usage_invalid"
+                        or not allow_model_fallbacks
+                        or category not in fallback_categories
+                    ):
                         break
         with self._circuit_lock:
             failure_count = self._provider_failures.get(provider_name, 0) + 1
@@ -753,33 +911,10 @@ class ProviderRegistry:
             semantic_failure: Optional[ProviderError] = None,
             recorded_transport_failures: Sequence[Mapping[str, Any]] = (),
         ) -> ModelResponse:
-            raw_usage = response_payload.get("usage")
-            has_billable_usage = isinstance(raw_usage, Mapping) and any(
-                field_name in raw_usage
-                for field_name in (
-                    "input_tokens",
-                    "prompt_tokens",
-                    "output_tokens",
-                    "completion_tokens",
-                    "cost",
-                    "cost_in_usd_ticks",
-                )
-            )
-            # A successful HTTP status does not make an unreported charge zero.
-            # Without any recognizable usage/cost field, both valid and invalid
-            # responses remain unknown-cost evidence.
-            if not has_billable_usage:
-                force_unknown_cost = True
-            try:
-                if normalized_usage is not None:
-                    usage = normalized_usage
-                else:
-                    usage = _usage_from_payload(response_payload)
-            except (OverflowError, TypeError, ValueError):
-                if semantic_failure is None:
-                    raise
-                usage = Usage(cost_usd=None)
-                force_unknown_cost = True
+            if normalized_usage is not None:
+                usage = normalized_usage
+            else:
+                usage = _usage_from_payload(response_payload)
             if force_unknown_cost:
                 usage.cost_usd = None
             else:
@@ -1048,18 +1183,19 @@ class ProviderRegistry:
                 raise _ClassifiedProviderError(
                     "empty_response", "Provider response failed the configured semantic minimum length"
                 )
-            try:
-                usage = _usage_from_payload(response_payload)
-            except (OverflowError, TypeError, ValueError) as exc:
+            usage = _usage_from_payload(response_payload)
+            if usage.raw_usage_invalid:
                 raise _ClassifiedProviderError(
-                    "schema_invalid", "Provider returned malformed usage fields"
-                ) from exc
+                    "usage_invalid",
+                    usage.accounting_error or "Provider returned invalid usage fields",
+                )
             if seat.get("first_tool_required", False) is True and usage.tool_calls < 1:
                 raise _ClassifiedProviderError(
                     "tool_failure",
                     "Provider returned without the required server-tool call",
                 )
         except _ClassifiedProviderError as exc:
+            failure_usage = usage or _usage_from_payload(response_payload)
             if on_semantic_failure_response is not None:
                 on_semantic_failure_response(
                     normalized_response(
@@ -1067,11 +1203,16 @@ class ProviderRegistry:
                         headers,
                         latency,
                         text,
-                        normalized_usage=usage,
+                        normalized_usage=failure_usage,
                         semantic_failure=exc,
                         recorded_transport_failures=transport_failures,
                     )
                 )
+            if failure_usage.raw_usage_invalid and _failure_category(exc) != "usage_invalid":
+                raise _ClassifiedProviderError(
+                    "usage_invalid",
+                    failure_usage.accounting_error or "Provider returned invalid usage fields",
+                ) from exc
             raise
 
         return normalized_response(
@@ -1141,7 +1282,12 @@ class ProviderRegistry:
             prompt='Reply with exactly the uppercase token "PONG" and nothing else.',
         )
         return {
-            "ok": response.text.strip() == "PONG",
+            "ok": (
+                response.text.strip() == "PONG"
+                and response.usage.input_output_usage_complete is True
+                and response.usage.accounting_error is None
+                and not response.usage.raw_usage_invalid
+            ),
             "text": response.text.strip()[:64],
             "provider": response.provider,
             "requested_model": response.requested_model,

@@ -15,6 +15,9 @@ class Usage:
     tool_calls: int = 0
     cost_usd: Optional[float] = None
     unknown_cost_fail_closed: bool = False
+    input_output_usage_complete: bool = True
+    raw_usage_invalid: bool = False
+    accounting_error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

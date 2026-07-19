@@ -197,6 +197,29 @@ def _duplicate_seat_names(seat_names: Sequence[Any]) -> List[str]:
     return sorted(duplicates)
 
 
+def _validated_synthesis_artifact(
+    saved: Mapping[str, Any],
+    *,
+    artifact_name: str,
+    expected_mode: str,
+    expected_author_seat: str,
+) -> Tuple[str, Dict[str, Any]]:
+    text = saved.get("text")
+    if not isinstance(text, str):
+        raise ConfigError(f"Stored {artifact_name} text must be a string")
+    if saved.get("sha256") != text_hash(text):
+        raise ConfigError(f"Stored {artifact_name} hash does not match its text")
+    if saved.get("mode") != expected_mode:
+        raise ConfigError(
+            f"Stored {artifact_name} provenance mode must be {expected_mode!r}"
+        )
+    if saved.get("author_seat") != expected_author_seat:
+        raise ConfigError(
+            f"Stored {artifact_name} provenance author must be {expected_author_seat!r}"
+        )
+    return text, dict(saved)
+
+
 def validate_judgment(value: Mapping[str, Any], required_fields: Sequence[str] = JUDGE_FIELDS) -> Dict[str, Any]:
     expected_fields = tuple(str(field) for field in required_fields)
     unexpected = set(value) - set(expected_fields)
@@ -254,6 +277,186 @@ def validate_verdict(value: Mapping[str, Any], artifact_hash: str) -> Dict[str, 
     if verdict == "PASS" and validated["required_actions"]:
         raise ProviderError("PASS verdict cannot include required_actions")
     return validated
+
+
+def _validated_cached_gate_reviews(
+    saved_reviews: Any,
+    reviewer_names: Sequence[str],
+    gates: Mapping[str, Any],
+    artifact_hash: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(saved_reviews, list):
+        raise ConfigError("Stored gate reviewers must be an array")
+
+    normalized_reviews: List[Dict[str, Any]] = []
+    saved_reviewer_names: List[str] = []
+    allowed_verdicts = gates.get("allowed_verdicts", ["PASS", "NEEDS_WORK", "FAIL"])
+    for saved_review in saved_reviews:
+        if not isinstance(saved_review, Mapping):
+            raise ConfigError("Stored gate reviewer entries must be objects")
+        reviewer_name = saved_review.get("seat_name")
+        if not isinstance(reviewer_name, str):
+            raise ConfigError("Stored gate reviewer entries must identify a string seat_name")
+        saved_reviewer_names.append(reviewer_name)
+
+        status = saved_review.get("status")
+        normalized_review = dict(saved_review)
+        if status == "completed":
+            saved_response = saved_review.get("response")
+            if not isinstance(saved_response, Mapping):
+                raise ConfigError("Stored completed gate review is missing its raw response")
+            response_text = saved_response.get("text")
+            if not isinstance(response_text, str):
+                raise ConfigError("Stored completed gate review raw response text must be a string")
+            try:
+                canonical_verdict = validate_verdict(
+                    parse_json_object(response_text),
+                    artifact_hash,
+                )
+            except ProviderError as exc:
+                raise ConfigError(f"Stored gate reviewer raw response is invalid: {exc}") from exc
+
+            saved_verdict = saved_review.get("verdict")
+            if not isinstance(saved_verdict, Mapping):
+                raise ConfigError("Stored completed gate review is missing its verdict")
+            try:
+                validated_verdict = validate_verdict(saved_verdict, artifact_hash)
+            except ProviderError as exc:
+                raise ConfigError(f"Stored gate reviewer verdict is invalid: {exc}") from exc
+            if validated_verdict != canonical_verdict:
+                raise ConfigError("Stored gate reviewer verdict does not match its raw response")
+            if isinstance(allowed_verdicts, list) and canonical_verdict["verdict"] not in allowed_verdicts:
+                raise ConfigError(
+                    f"Stored gate reviewer returned disallowed verdict {canonical_verdict['verdict']!r}"
+                )
+            normalized_review["verdict"] = canonical_verdict
+        elif status == "failed":
+            if saved_review.get("failure_kind") not in {"provider_failure", "schema_invalid"}:
+                raise ConfigError("Stored failed gate review has an invalid failure_kind")
+            if not isinstance(saved_review.get("error"), str):
+                raise ConfigError("Stored failed gate review must include a string error")
+        else:
+            raise ConfigError("Stored gate reviewer status must be 'completed' or 'failed'")
+        normalized_reviews.append(normalized_review)
+
+    duplicate_saved_reviewers = _duplicate_seat_names(saved_reviewer_names)
+    if duplicate_saved_reviewers or sorted(saved_reviewer_names) != sorted(reviewer_names):
+        raise ConfigError(
+            "Stored gate reviewer roster must match the configured reviewer seats exactly"
+        )
+    return normalized_reviews
+
+
+def _gate_result_from_reviews(
+    reviews: Sequence[Mapping[str, Any]],
+    reviewer_names: Sequence[str],
+    gates: Mapping[str, Any],
+    artifact_hash: str,
+    mechanical_evidence: str,
+) -> Dict[str, Any]:
+    review_rows = [dict(review) for review in reviews]
+    pass_count = sum(
+        1
+        for review in review_rows
+        if review.get("status") == "completed"
+        and review["verdict"]["verdict"] == "PASS"
+    )
+    negative_verdicts = [
+        {
+            "seat_name": str(review.get("seat_name", "unknown")),
+            "verdict": str(review["verdict"]["verdict"]),
+            "summary": str(review["verdict"]["summary"]),
+            "blocking_findings": list(review["verdict"]["blocking_findings"]),
+            "required_actions": list(review["verdict"]["required_actions"]),
+            "evidence": list(review["verdict"]["evidence"]),
+        }
+        for review in review_rows
+        if review.get("status") == "completed"
+        and review["verdict"]["verdict"] in {"FAIL", "NEEDS_WORK"}
+    ]
+    negative_verdict_blocked = bool(negative_verdicts)
+    required_passes = int(gates.get("required_passes", len(reviewer_names)))
+    fail_closed = gates.get("fail_closed", True) is True
+    failed_reviews = any(review.get("status") != "completed" for review in review_rows)
+    schema_failures = [
+        {
+            "seat_name": str(review.get("seat_name", "unknown")),
+            "error": str(review.get("error", "invalid structured verdict")),
+        }
+        for review in review_rows
+        if review.get("failure_kind") == "schema_invalid"
+    ]
+    schema_blocked = (
+        bool(schema_failures)
+        and gates.get("schema_failure_is_blocking", True) is True
+    )
+    mechanical_failures = _mechanical_failures(mechanical_evidence)
+    mechanical_blocked = (
+        bool(mechanical_failures)
+        and gates.get("mechanical_failure_is_blocking", True) is True
+    )
+    unresolved_blind_spots = [
+        str(blind_spot)
+        for review in review_rows
+        if review.get("status") == "completed"
+        for blind_spot in review.get("verdict", {}).get("blind_spots", [])
+    ]
+    blind_spot_blocked = (
+        bool(unresolved_blind_spots)
+        and gates.get("blind_spot_requires_targeted_review", True) is True
+    )
+    deterministic_blockers = []
+    if negative_verdict_blocked:
+        deterministic_blockers.append(
+            "At least one reviewer returned a blocking negative verdict: "
+            + "; ".join(
+                f"{review['seat_name']}: {review['verdict']}"
+                for review in negative_verdicts
+            )
+        )
+    if mechanical_blocked:
+        deterministic_blockers.append(
+            "Mechanical evidence reports failure: " + "; ".join(mechanical_failures)
+        )
+    if blind_spot_blocked:
+        deterministic_blockers.append(
+            "Targeted review is required for unresolved blind spots: "
+            + "; ".join(unresolved_blind_spots)
+        )
+    if schema_blocked:
+        deterministic_blockers.append(
+            "At least one reviewer returned an invalid structured verdict: "
+            + "; ".join(
+                f"{failure['seat_name']}: {failure['error']}"
+                for failure in schema_failures
+            )
+        )
+    passed = (
+        pass_count >= required_passes
+        and (not failed_reviews or not fail_closed)
+        and not mechanical_blocked
+        and not blind_spot_blocked
+        and not schema_blocked
+        and not negative_verdict_blocked
+    )
+    return {
+        "enabled": True,
+        "passed": passed,
+        "artifact_sha256": artifact_hash,
+        "pass_count": pass_count,
+        "required_passes": required_passes,
+        "fail_closed": fail_closed,
+        "mechanical_failures": mechanical_failures,
+        "mechanical_blocked": mechanical_blocked,
+        "schema_failures": schema_failures,
+        "schema_blocked": schema_blocked,
+        "negative_verdicts": negative_verdicts,
+        "negative_verdict_blocked": negative_verdict_blocked,
+        "unresolved_blind_spots": unresolved_blind_spots,
+        "blind_spot_blocked": blind_spot_blocked,
+        "deterministic_blockers": deterministic_blockers,
+        "reviewers": review_rows,
+    }
 
 
 class FusionOrchestrator:
@@ -551,13 +754,18 @@ class FusionOrchestrator:
         amendment_feedback: str = "",
     ) -> Tuple[str, Dict[str, Any]]:
         artifact_name = "synthesis.json" if round_index == 0 else f"synthesis-amendment-{round_index}.json"
+        fusion = profile["fusion"]
+        synthesizer_name = str(fusion["synthesizer"])
         if store.exists(artifact_name):
             saved = store.read_json(artifact_name)
-            return str(saved["text"]), saved
-        fusion = profile["fusion"]
+            return _validated_synthesis_artifact(
+                saved,
+                artifact_name=artifact_name,
+                expected_mode="client_orchestrated",
+                expected_author_seat=synthesizer_name,
+            )
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
         live_reports = [report for report in reports if report.get("status") == "completed"]
-        synthesizer_name = str(fusion["synthesizer"])
         synthesizer_seat = self._seat_config(synthesizer_name)
         if (
             fusion.get("separate_no_tools_synthesis_turn") is True
@@ -586,7 +794,13 @@ class FusionOrchestrator:
         quality_floor = fusion.get("quality_floor", {})
         if isinstance(quality_floor, Mapping):
             _validate_quality_floor(response.text, quality_floor, f"Synthesizer {synthesizer_name}")
-        saved = {"text": response.text, "sha256": text_hash(response.text), "response": response.to_dict()}
+        saved = {
+            "mode": "client_orchestrated",
+            "author_seat": synthesizer_name,
+            "text": response.text,
+            "sha256": text_hash(response.text),
+            "response": response.to_dict(),
+        }
         store.write_json(artifact_name, saved)
         store.mark_stage("synthesis" if round_index == 0 else f"amendment-{round_index}", "completed", artifact_name)
         return response.text, saved
@@ -616,11 +830,15 @@ class FusionOrchestrator:
         reviewer_names = list(gates.get("reviewers", []))
         if not reviewer_names:
             raise ConfigError("Adversarial gates are enabled but no reviewers are configured")
+        if any(not isinstance(reviewer_name, str) for reviewer_name in reviewer_names):
+            raise ConfigError("gates.reviewers must contain only string seat names")
         duplicate_reviewers = _duplicate_seat_names(reviewer_names)
         if duplicate_reviewers:
             raise ConfigError(
                 f"gates.reviewers must not contain duplicate seat names {duplicate_reviewers}"
             )
+        for reviewer_name in reviewer_names:
+            self._seat_config(reviewer_name)
         require_author_separation = gates.get("exclude_artifact_author", True)
         if (
             require_author_separation
@@ -635,24 +853,26 @@ class FusionOrchestrator:
             saved = store.read_json(artifact_name)
             if saved.get("artifact_sha256") != artifact_hash:
                 raise ConfigError("Stored gate artifact hash does not match the current synthesis")
-            saved_reviews = saved.get("reviewers", [])
-            if not isinstance(saved_reviews, list):
-                raise ConfigError("Stored gate reviewers must be an array")
-            for saved_review in saved_reviews:
-                if not isinstance(saved_review, Mapping) or saved_review.get("status") != "completed":
-                    continue
-                saved_verdict = saved_review.get("verdict")
-                if not isinstance(saved_verdict, Mapping):
-                    raise ConfigError("Stored completed gate review is missing its verdict")
-                try:
-                    validated_saved_verdict = validate_verdict(saved_verdict, artifact_hash)
-                except ProviderError as exc:
-                    raise ConfigError(f"Stored gate reviewer verdict is invalid: {exc}") from exc
-                if saved.get("passed") is True and validated_saved_verdict["verdict"] != "PASS":
-                    raise ConfigError(
-                        "Stored gate cannot pass while a completed reviewer returned a blocking negative verdict"
-                    )
-            return saved
+            saved_reviews = _validated_cached_gate_reviews(
+                saved.get("reviewers"),
+                reviewer_names,
+                gates,
+                artifact_hash,
+            )
+            result = _gate_result_from_reviews(
+                saved_reviews,
+                reviewer_names,
+                gates,
+                artifact_hash,
+                mechanical_evidence,
+            )
+            store.write_json(artifact_name, result)
+            store.mark_stage(
+                f"gate-{round_index}",
+                "passed" if result["passed"] else "rejected",
+                artifact_name,
+            )
+            return result
         objective = str(profile.get("objective", "Deliver the most correct, complete, and executable result."))
         max_concurrency = min(int(gates.get("max_concurrency", 2)), len(reviewer_names))
 
@@ -708,104 +928,19 @@ class FusionOrchestrator:
                         }
                     )
 
-        pass_count = sum(
-            1 for review in reviews if review.get("status") == "completed" and review["verdict"]["verdict"] == "PASS"
+        result = _gate_result_from_reviews(
+            reviews,
+            reviewer_names,
+            gates,
+            artifact_hash,
+            mechanical_evidence,
         )
-        negative_verdicts = [
-            {
-                "seat_name": str(review.get("seat_name", "unknown")),
-                "verdict": str(review["verdict"]["verdict"]),
-                "summary": str(review["verdict"]["summary"]),
-                "blocking_findings": list(review["verdict"]["blocking_findings"]),
-                "required_actions": list(review["verdict"]["required_actions"]),
-                "evidence": list(review["verdict"]["evidence"]),
-            }
-            for review in reviews
-            if review.get("status") == "completed"
-            and review["verdict"]["verdict"] in {"FAIL", "NEEDS_WORK"}
-        ]
-        negative_verdict_blocked = bool(negative_verdicts)
-        required_passes = int(gates.get("required_passes", len(reviewer_names)))
-        fail_closed = gates.get("fail_closed", True) is True
-        failed_reviews = any(review.get("status") != "completed" for review in reviews)
-        schema_failures = [
-            {
-                "seat_name": str(review.get("seat_name", "unknown")),
-                "error": str(review.get("error", "invalid structured verdict")),
-            }
-            for review in reviews
-            if review.get("failure_kind") == "schema_invalid"
-        ]
-        schema_blocked = (
-            bool(schema_failures)
-            and gates.get("schema_failure_is_blocking", True) is True
-        )
-        mechanical_failures = _mechanical_failures(mechanical_evidence)
-        mechanical_blocked = bool(mechanical_failures) and gates.get("mechanical_failure_is_blocking", True) is True
-        unresolved_blind_spots = [
-            str(blind_spot)
-            for review in reviews
-            if review.get("status") == "completed"
-            for blind_spot in review.get("verdict", {}).get("blind_spots", [])
-        ]
-        blind_spot_blocked = (
-            bool(unresolved_blind_spots)
-            and gates.get("blind_spot_requires_targeted_review", True) is True
-        )
-        deterministic_blockers = []
-        if negative_verdict_blocked:
-            deterministic_blockers.append(
-                "At least one reviewer returned a blocking negative verdict: "
-                + "; ".join(
-                    f"{review['seat_name']}: {review['verdict']}"
-                    for review in negative_verdicts
-                )
-            )
-        if mechanical_blocked:
-            deterministic_blockers.append(
-                "Mechanical evidence reports failure: " + "; ".join(mechanical_failures)
-            )
-        if blind_spot_blocked:
-            deterministic_blockers.append(
-                "Targeted review is required for unresolved blind spots: "
-                + "; ".join(unresolved_blind_spots)
-            )
-        if schema_blocked:
-            deterministic_blockers.append(
-                "At least one reviewer returned an invalid structured verdict: "
-                + "; ".join(
-                    f"{failure['seat_name']}: {failure['error']}"
-                    for failure in schema_failures
-                )
-            )
-        passed = (
-            pass_count >= required_passes
-            and (not failed_reviews or not fail_closed)
-            and not mechanical_blocked
-            and not blind_spot_blocked
-            and not schema_blocked
-            and not negative_verdict_blocked
-        )
-        result = {
-            "enabled": True,
-            "passed": passed,
-            "artifact_sha256": artifact_hash,
-            "pass_count": pass_count,
-            "required_passes": required_passes,
-            "fail_closed": fail_closed,
-            "mechanical_failures": mechanical_failures,
-            "mechanical_blocked": mechanical_blocked,
-            "schema_failures": schema_failures,
-            "schema_blocked": schema_blocked,
-            "negative_verdicts": negative_verdicts,
-            "negative_verdict_blocked": negative_verdict_blocked,
-            "unresolved_blind_spots": unresolved_blind_spots,
-            "blind_spot_blocked": blind_spot_blocked,
-            "deterministic_blockers": deterministic_blockers,
-            "reviewers": reviews,
-        }
         store.write_json(artifact_name, result)
-        store.mark_stage(f"gate-{round_index}", "passed" if passed else "rejected", artifact_name)
+        store.mark_stage(
+            f"gate-{round_index}",
+            "passed" if result["passed"] else "rejected",
+            artifact_name,
+        )
         return result
 
     @staticmethod
@@ -892,6 +1027,13 @@ class FusionOrchestrator:
                 if native_fallback_started:
                     if not allow_fallback:
                         raise ConfigError("Stored native Fusion fallback conflicts with the selected profile")
+                    if store.exists("synthesis.json"):
+                        _validated_synthesis_artifact(
+                            store.read_json("synthesis.json"),
+                            artifact_name="synthesis.json",
+                            expected_mode="client_orchestrated",
+                            expected_author_seat=str(fusion_config["synthesizer"]),
+                        )
                     reports = self._run_panel(task, context, mechanical_evidence, profile, budget, store)
                     judgment = self._run_judge(task, reports, profile, budget, store, mechanical_evidence)
                     synthesis, _ = self._run_synthesis(
@@ -899,7 +1041,12 @@ class FusionOrchestrator:
                     )
                 elif store.exists("synthesis.json"):
                     saved_synthesis = store.read_json("synthesis.json")
-                    synthesis = str(saved_synthesis["text"])
+                    synthesis, _ = _validated_synthesis_artifact(
+                        saved_synthesis,
+                        artifact_name="synthesis.json",
+                        expected_mode="native_openrouter",
+                        expected_author_seat=str(seat_name),
+                    )
                     artifact_author_seat = str(seat_name)
                     reports = []
                     judgment = _native_openrouter_judgment()
@@ -933,6 +1080,7 @@ class FusionOrchestrator:
                             "synthesis.json",
                             {
                                 "mode": "native_openrouter",
+                                "author_seat": str(seat_name),
                                 "text": synthesis,
                                 "sha256": text_hash(synthesis),
                                 "response": response.to_dict(),

@@ -288,7 +288,7 @@ def build_handoff(
     contract = _execution_contract(execution, native_codex)
     backend = _configured_backend(execution)
     enabled = bool(execution.get("enabled", True))
-    synthesis_gate_passed = bool(gate.get("passed", False))
+    synthesis_gate_passed = gate.get("passed") is True
     artifacts = _selected_artifacts(synthesis, execution, judge, gates, budgets, ledger)
     fused_plan_available = bool(str(artifacts.get("fused_plan", "")).strip())
     fused_plan_required = bool(execution.get("require_fused_plan", True))

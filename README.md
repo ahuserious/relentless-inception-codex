@@ -15,7 +15,9 @@ This is a new runtime-backed implementation inspired by [`ahuserious/relentless-
 
 ## Status
 
-Version `0.1.0` is an alpha suitable for deliberate, cost-aware use. Direct xAI Grok 4.5, OpenAI Responses, Anthropic Messages, OpenRouter, OpenRouter native Fusion, and generic OpenAI-compatible/TrustedRouter transports are supported. External API seats can use provider-hosted tools when explicitly configured, but they never receive Codex filesystem access.
+Version `0.1.1` is an alpha suitable for deliberate, cost-aware use. Direct xAI Grok 4.5, OpenAI Responses, Anthropic Messages, OpenRouter, OpenRouter native Fusion, and generic OpenAI-compatible/TrustedRouter transports are supported. External API seats can use provider-hosted tools when explicitly configured, but they never receive Codex filesystem access.
+
+Version 0.1.1 intentionally cannot resume run state written by earlier releases. Existing run directories remain preserved for audit, but rerunning their work requires a new run ID; see the [run-state compatibility boundary](docs/ARCHITECTURE.md#run-state-compatibility).
 
 Codex plugins currently do not auto-register plugin-owned native agents. The bundled skills coordinate compatible native Codex reviewers/executors through the active host; opt-in provider/agent TOML templates are retained for explicit compatibility retesting. On Codex 0.145, a direct foreground Grok 4.5 text turn succeeded only after every tool surface was removed, but an actual spawned custom-agent turn still failed at xAI with HTTP 422 because the Codex subagent input did not match xAI's accepted `ModelInput` variants. A separate tool-result continuation also failed with a compaction-blob error. The shipped default therefore registers no native Grok role. Multiple external Grok 4.5/4.3 seats provide the operational Grok path for fusion, gates, and xAI-hosted tools.
 

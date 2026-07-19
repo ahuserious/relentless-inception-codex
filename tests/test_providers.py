@@ -13,6 +13,7 @@ from tests.support import PLUGIN_ROOT  # noqa: F401 - ensures the plugin package
 
 from relentless_inception.errors import ConfigError, ProviderError
 from relentless_inception.providers import (
+    MAX_USAGE_INTEGER,
     ProviderRegistry,
     _ClassifiedProviderError,
     _RejectRedirectHandler,
@@ -168,6 +169,36 @@ class ProviderParsingTests(unittest.TestCase):
                 self.assertEqual(config, original_config_snapshot)
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["text"], "PONG")
+
+    def test_test_seat_reports_false_for_incomplete_or_invalid_accounting(self) -> None:
+        usage_cases = (
+            Usage(input_output_usage_complete=False),
+            Usage(
+                input_tokens=1,
+                output_tokens=1,
+                cost_usd=0.01,
+                accounting_error="synthetic accounting error",
+            ),
+        )
+        for usage in usage_cases:
+            with self.subTest(usage=usage):
+                registry = ProviderRegistry(provider_test_config())
+                probe_response = ModelResponse(
+                    text="PONG",
+                    provider="responses",
+                    requested_model="probe-model",
+                    actual_model="probe-model",
+                    usage=usage,
+                )
+                with mock.patch.object(
+                    ProviderRegistry,
+                    "complete",
+                    autospec=True,
+                    return_value=probe_response,
+                ):
+                    result = registry.test_seat("responses_seat")
+
+                self.assertFalse(result["ok"])
 
     def test_openrouter_fusion_probe_refuses_before_serializing_a_request(self) -> None:
         config = provider_test_config()
@@ -347,18 +378,377 @@ class ProviderParsingTests(unittest.TestCase):
         self.assertAlmostEqual(response.usage.cost_usd or 0.0, 0.0001234)
         self.assertEqual(response.usage.tool_calls, 3)
 
-    def test_reported_usage_cost_takes_precedence_over_cost_ticks(self) -> None:
+    def test_conflicting_reported_costs_are_rejected_and_keep_the_larger_cost(self) -> None:
         registry = ProviderRegistry(provider_test_config())
         response_payload = {
             "status": "completed",
             "output_text": "answer",
-            "usage": {"cost": 0.25, "cost_in_usd_ticks": 9_000_000_000},
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cost": 0.0,
+                "cost_in_usd_ticks": 2_500_000_000,
+            },
+        }
+        failed_responses = []
+
+        with mock.patch.object(registry, "_post_json", return_value=(response_payload, {}, 0.1)):
+            with self.assertRaisesRegex(ProviderError, "conflicting cost"):
+                registry.complete(
+                    "responses_seat",
+                    system="system",
+                    prompt="prompt",
+                    on_semantic_failure_response=failed_responses.append,
+                )
+
+        self.assertEqual(len(failed_responses), 1)
+        response = failed_responses[0]
+        self.assertEqual(response.usage.cost_usd, 0.25)
+        self.assertTrue(response.usage.input_output_usage_complete)
+        self.assertTrue(response.usage.raw_usage_invalid)
+        self.assertIn("conflicting cost", response.usage.accounting_error or "")
+
+    def test_equivalent_reported_cost_encodings_tolerate_float_noise(self) -> None:
+        registry = ProviderRegistry(provider_test_config())
+        response_payload = {
+            "status": "completed",
+            "output_text": "answer",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cost": 0.1 + 0.2,
+                "cost_in_usd_ticks": 3_000_000_000,
+            },
         }
 
         with mock.patch.object(registry, "_post_json", return_value=(response_payload, {}, 0.1)):
             response = registry.complete("responses_seat", system="system", prompt="prompt")
 
-        self.assertEqual(response.usage.cost_usd, 0.25)
+        self.assertAlmostEqual(response.usage.cost_usd or 0.0, 0.3)
+        self.assertFalse(response.usage.raw_usage_invalid)
+        self.assertIsNone(response.usage.accounting_error)
+
+    def test_raw_usage_values_are_not_coerced_or_mistaken_for_complete_accounting(self) -> None:
+        cases = (
+            ("null cost", {"cost": None}, 0, 0, False, None, True),
+            ("input only", {"input_tokens": 100}, 100, 0, False, None, False),
+            ("output only", {"output_tokens": 20}, 0, 20, False, None, False),
+            (
+                "booleans",
+                {"input_tokens": True, "output_tokens": True},
+                0,
+                0,
+                False,
+                None,
+                True,
+            ),
+            (
+                "fractional numbers",
+                {"input_tokens": 1.9, "output_tokens": 2.9},
+                0,
+                0,
+                False,
+                None,
+                True,
+            ),
+            (
+                "numeric strings",
+                {"input_tokens": "100", "output_tokens": "20"},
+                0,
+                0,
+                False,
+                None,
+                True,
+            ),
+            (
+                "negative counts",
+                {"input_tokens": -1, "output_tokens": -2},
+                0,
+                0,
+                False,
+                None,
+                True,
+            ),
+            (
+                "nonfinite cost",
+                {"input_tokens": 10, "output_tokens": 2, "cost": float("inf")},
+                10,
+                2,
+                True,
+                0.00004,
+                True,
+            ),
+            (
+                "boolean cost",
+                {"input_tokens": 10, "output_tokens": 2, "cost": True},
+                10,
+                2,
+                True,
+                0.00004,
+                True,
+            ),
+            (
+                "string cost",
+                {"input_tokens": 10, "output_tokens": 2, "cost": "0.25"},
+                10,
+                2,
+                True,
+                0.00004,
+                True,
+            ),
+            (
+                "negative cost",
+                {"input_tokens": 10, "output_tokens": 2, "cost": -0.25},
+                10,
+                2,
+                True,
+                0.00004,
+                True,
+            ),
+            (
+                "overflowing cost",
+                {"input_tokens": 10, "output_tokens": 2, "cost": 10**10_000},
+                10,
+                2,
+                True,
+                0.00004,
+                True,
+            ),
+        )
+        for (
+            label,
+            raw_usage,
+            expected_input,
+            expected_output,
+            complete,
+            expected_cost,
+            raw_usage_invalid,
+        ) in cases:
+            with self.subTest(label=label):
+                registry = ProviderRegistry(provider_test_config())
+                response_payload = {
+                    "status": "completed",
+                    "output_text": "answer",
+                    "usage": raw_usage,
+                }
+                failed_responses = []
+                with mock.patch.object(
+                    registry,
+                    "_post_json",
+                    return_value=(response_payload, {}, 0.1),
+                ):
+                    if raw_usage_invalid:
+                        with self.assertRaisesRegex(ProviderError, "invalid or incomplete usage"):
+                            registry.complete(
+                                "responses_seat",
+                                system="system",
+                                prompt="prompt",
+                                on_semantic_failure_response=failed_responses.append,
+                            )
+                        self.assertEqual(len(failed_responses), 1)
+                        response = failed_responses[0]
+                    else:
+                        response = registry.complete(
+                            "responses_seat", system="system", prompt="prompt"
+                        )
+
+                self.assertEqual(response.usage.input_tokens, expected_input)
+                self.assertEqual(response.usage.output_tokens, expected_output)
+                self.assertEqual(response.usage.input_output_usage_complete, complete)
+                self.assertEqual(response.usage.raw_usage_invalid, raw_usage_invalid)
+                self.assertIsNotNone(response.usage.accounting_error)
+                if expected_cost is None:
+                    self.assertIsNone(response.usage.cost_usd)
+                else:
+                    self.assertAlmostEqual(response.usage.cost_usd or 0.0, expected_cost)
+
+    def test_usage_counts_above_signed_64_bit_are_callbacked_and_cannot_fallback(self) -> None:
+        oversized = MAX_USAGE_INTEGER + 1
+        usage_cases = (
+            {"input_tokens": oversized, "output_tokens": 2, "cost": 0.25},
+            {"input_tokens": 10, "output_tokens": oversized, "cost": 0.25},
+            {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": oversized},
+                "cost": 0.25,
+            },
+            {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "output_tokens_details": {"reasoning_tokens": oversized},
+                "cost": 0.25,
+            },
+            {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "tool_calls": oversized,
+                "cost": 0.25,
+            },
+            {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "num_server_side_tools_used": oversized,
+                "cost": 0.25,
+            },
+            {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cost": 0.25,
+                "cost_in_usd_ticks": oversized,
+            },
+        )
+        fallback_payload = {
+            "status": "completed",
+            "output_text": "fallback must not run",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "cost": 0.01},
+        }
+
+        for raw_usage in usage_cases:
+            with self.subTest(raw_usage=raw_usage):
+                config = provider_test_config()
+                config["active_profile"] = "test_profile"
+                config["profiles"] = {
+                    "test_profile": {
+                        "rescue": {
+                            "enabled": True,
+                            "fallback_on": ["usage_invalid"],
+                        }
+                    }
+                }
+                config["seats"]["responses_seat"].update(
+                    {
+                        "allow_model_fallbacks": True,
+                        "fallback_models": ["fallback-model"],
+                    }
+                )
+                registry = ProviderRegistry(config)
+                primary_payload = {
+                    "id": "oversized-usage",
+                    "status": "completed",
+                    "output_text": "primary answer",
+                    "usage": raw_usage,
+                }
+                failed_responses = []
+                with mock.patch.object(
+                    registry,
+                    "_post_json",
+                    side_effect=[(primary_payload, {}, 0.1), (fallback_payload, {}, 0.1)],
+                ) as post_json:
+                    with self.assertRaisesRegex(ProviderError, "signed 64-bit usage maximum"):
+                        registry.complete(
+                            "responses_seat",
+                            system="system",
+                            prompt="prompt",
+                            on_semantic_failure_response=failed_responses.append,
+                        )
+
+                self.assertEqual(post_json.call_count, 1)
+                self.assertEqual(len(failed_responses), 1)
+                failed_response = failed_responses[0]
+                self.assertEqual(failed_response.usage.cost_usd, 0.25)
+                self.assertTrue(failed_response.usage.raw_usage_invalid)
+                self.assertEqual(
+                    failed_response.route["semantic_failure"]["category"],
+                    "usage_invalid",
+                )
+
+    def test_signed_64_bit_usage_boundary_is_accepted(self) -> None:
+        registry = ProviderRegistry(provider_test_config())
+        response_payload = {
+            "status": "completed",
+            "output_text": "answer",
+            "usage": {
+                "input_tokens": MAX_USAGE_INTEGER,
+                "output_tokens": MAX_USAGE_INTEGER,
+                "input_tokens_details": {"cached_tokens": MAX_USAGE_INTEGER},
+                "output_tokens_details": {"reasoning_tokens": MAX_USAGE_INTEGER},
+                "tool_calls": MAX_USAGE_INTEGER,
+                "cost": 0.25,
+            },
+        }
+
+        with mock.patch.object(registry, "_post_json", return_value=(response_payload, {}, 0.1)):
+            response = registry.complete("responses_seat", system="system", prompt="prompt")
+
+        self.assertEqual(response.usage.input_tokens, MAX_USAGE_INTEGER)
+        self.assertEqual(response.usage.output_tokens, MAX_USAGE_INTEGER)
+        self.assertEqual(response.usage.cached_tokens, MAX_USAGE_INTEGER)
+        self.assertEqual(response.usage.reasoning_tokens, MAX_USAGE_INTEGER)
+        self.assertEqual(response.usage.tool_calls, MAX_USAGE_INTEGER)
+        self.assertFalse(response.usage.raw_usage_invalid)
+
+        ticks_payload = {
+            "status": "completed",
+            "output_text": "answer",
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cost_in_usd_ticks": MAX_USAGE_INTEGER,
+            },
+        }
+        with mock.patch.object(
+            registry,
+            "_post_json",
+            return_value=(ticks_payload, {}, 0.1),
+        ):
+            ticks_response = registry.complete(
+                "responses_seat", system="system", prompt="prompt"
+            )
+
+        self.assertEqual(
+            ticks_response.usage.cost_usd,
+            MAX_USAGE_INTEGER / 10_000_000_000,
+        )
+        self.assertFalse(ticks_response.usage.raw_usage_invalid)
+
+    def test_null_usage_and_token_detail_containers_are_treated_as_omitted(self) -> None:
+        cases = (
+            (
+                {
+                    "status": "completed",
+                    "output_text": "answer",
+                    "usage": None,
+                },
+                False,
+                "missing input token count",
+            ),
+            (
+                {
+                    "status": "completed",
+                    "output_text": "answer",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "input_tokens_details": None,
+                        "output_tokens_details": None,
+                    },
+                },
+                True,
+                None,
+            ),
+        )
+        for payload, expected_complete, expected_error in cases:
+            with self.subTest(payload=payload):
+                registry = ProviderRegistry(provider_test_config())
+                with mock.patch.object(
+                    registry,
+                    "_post_json",
+                    return_value=(payload, {}, 0.1),
+                ):
+                    response = registry.complete(
+                        "responses_seat", system="system", prompt="prompt"
+                    )
+
+                self.assertEqual(
+                    response.usage.input_output_usage_complete,
+                    expected_complete,
+                )
+                self.assertFalse(response.usage.raw_usage_invalid)
+                if expected_error is None:
+                    self.assertIsNone(response.usage.accounting_error)
+                else:
+                    self.assertIn(expected_error, response.usage.accounting_error or "")
 
     def test_chat_adapter_extracts_segmented_text_route_and_reported_cost(self) -> None:
         config = provider_test_config()
@@ -925,6 +1315,59 @@ class ProviderParsingTests(unittest.TestCase):
             failed_response.route["semantic_failure"]["category"],
             "empty_response",
         )
+
+    def test_invalid_usage_on_semantic_failure_blocks_model_fallback(self) -> None:
+        config = provider_test_config()
+        config["active_profile"] = "test_profile"
+        config["profiles"] = {
+            "test_profile": {
+                "rescue": {
+                    "enabled": True,
+                    "fallback_on": ["empty_response", "usage_invalid"],
+                }
+            }
+        }
+        config["seats"]["responses_seat"].update(
+            {
+                "allow_model_fallbacks": True,
+                "fallback_models": ["fallback-model"],
+            }
+        )
+        registry = ProviderRegistry(config)
+        failed_responses = []
+        primary_payload = {
+            "id": "invalid-paid-primary",
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": True,
+                "output_tokens": True,
+                "cost": 0.25,
+            },
+        }
+        fallback_payload = {
+            "status": "completed",
+            "output_text": "fallback must not run",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "cost": 0.01},
+        }
+
+        with mock.patch.object(
+            registry,
+            "_post_json",
+            side_effect=[(primary_payload, {}, 0.1), (fallback_payload, {}, 0.1)],
+        ) as post_json:
+            with self.assertRaisesRegex(ProviderError, "invalid or incomplete usage"):
+                registry.complete(
+                    "responses_seat",
+                    system="system",
+                    prompt="prompt",
+                    on_semantic_failure_response=failed_responses.append,
+                )
+
+        self.assertEqual(post_json.call_count, 1)
+        self.assertEqual(len(failed_responses), 1)
+        self.assertEqual(failed_responses[0].usage.cost_usd, 0.25)
+        self.assertTrue(failed_responses[0].usage.raw_usage_invalid)
 
     def test_semantic_failure_without_usage_is_reported_with_unknown_cost(self) -> None:
         registry = ProviderRegistry(provider_test_config())

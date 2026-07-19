@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 - 2026-07-19
+
+- Hardened provider usage and cost accounting, budget-ledger restoration, concurrent snapshot persistence, and post-response gate stop checks so integrity failures remain fail-closed across resume.
+- Added explicit synthesis `mode` and `author_seat` provenance so cached client-orchestrated and native OpenRouter artifacts cannot be confused during author-separation checks.
+- Introduced internal budget-ledger snapshot schema v2. Pre-0.1.1 run directories remain preserved but are intentionally not resumable; restart with a new run ID because legacy ledgers and synthesis artifacts do not contain enough trustworthy information for a safe migration.
+
 ## 0.1.0 - 2026-07-19
 
 - Initial Codex plugin marketplace package and bundled stdio MCP server.

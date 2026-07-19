@@ -105,6 +105,12 @@ Opening a run acquires a nonblocking operating-system lease for that run ID and 
 
 Budget enforcement distinguishes what is knowable before network dispatch. Every actual HTTP attempt, including retries and fallbacks, is atomically reserved against `max_calls` before sending. Token, provider-tool, elapsed-time, and dollar usage are known only from a response or local estimate, so those values are stop-before-next-dispatch thresholds. A response and other concurrent requests already in flight can cross them. The resulting stop reason is persisted and blocks resume from launching more work. Unknown cost fails closed by default after recording the completed call. Within an orchestrated run, an HTTP-success response that fails semantic validation is also persisted and accounted before any fallback; if that accounting latches a blocking stop, fallback does not dispatch.
 
+#### Run-state compatibility
+
+Version 0.1.1 writes internal budget-ledger snapshot schema v2 and requires every cached synthesis artifact to identify its orchestration `mode` and actual `author_seat`. These formats are intentionally not backward-resumable. Run directories created before 0.1.1 remain preserved and are not rewritten or deleted, but their work must be restarted under a new run ID.
+
+There is no safe automatic migration: a legacy ledger does not carry the complete normalized accounting and integrity-latch evidence needed to re-prove its aggregates, while a legacy synthesis artifact does not unambiguously establish whether client orchestration or native Fusion produced it or which seat authored it. Guessing those fields could understate spend or defeat reviewer/author separation, so the runtime fails closed instead. Ledger snapshot schema v2 is an internal persistence format; it is distinct from configuration `schema_version: 1` and execution-handoff schema v2.
+
 ## Deliberation pipeline
 
 ### 1. Map

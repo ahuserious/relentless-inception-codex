@@ -179,6 +179,26 @@ class ExecutionHandoffTests(unittest.TestCase):
         self.assertTrue(handoff["ready"])
         self.assertTrue(handoff["mutation_authorized"])
 
+    def test_handoff_requires_literal_true_synthesis_gate_pass(self) -> None:
+        gates = _gates_config()
+        gates["stages"]["plan"]["enabled"] = False  # type: ignore[index]
+        gates["stages"]["pre_execution"]["enabled"] = False  # type: ignore[index]
+        execution = _execution_config(require_pre_execution_gate=False)
+
+        handoff = build_handoff(
+            "Do not execute a malformed cached gate result.",
+            "run-non-boolean-gate",
+            {"passed": "yes", "artifact_sha256": "c" * 64},
+            execution,
+            gates=gates,
+        )
+
+        self.assertFalse(handoff["synthesis_gate"]["passed"])
+        self.assertFalse(handoff["ready_for_host_workflow"])
+        self.assertFalse(handoff["ready"])
+        self.assertFalse(handoff["mutation_authorized"])
+        self.assertIn("synthesis_gate_not_passed", handoff["blocking_reasons"])
+
     def test_required_plan_omitted_from_selected_sections_blocks_packet(self) -> None:
         execution = _execution_config(handoff_include=["constraints", "required_checks"])
         handoff = build_handoff(

@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping
 
+from relentless_inception import __version__
 from relentless_inception.cli import doctor
 from relentless_inception.config import (
     deep_get,
@@ -24,7 +25,7 @@ from relentless_inception.orchestrator import FusionOrchestrator
 from relentless_inception.providers import ProviderRegistry
 
 
-SERVER_INFO = {"name": "relentless-inception", "version": "0.1.0"}
+SERVER_INFO = {"name": "relentless-inception", "version": __version__}
 
 
 def _tool(name: str, description: str, properties: Mapping[str, Any], required: list[str] | None = None) -> Dict[str, Any]:

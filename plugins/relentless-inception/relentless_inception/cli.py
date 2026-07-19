@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
+from . import __version__
 from .config import (
     PLUGIN_ROOT,
     deep_get,
@@ -50,7 +51,7 @@ def doctor(config: Mapping[str, Any]) -> Dict[str, Any]:
         }
     return {
         "ok": not validation_errors,
-        "version": "0.1.0",
+        "version": __version__,
         "python": platform.python_version(),
         "plugin_root": str(PLUGIN_ROOT),
         "data_dir": str(runtime_data_dir()),

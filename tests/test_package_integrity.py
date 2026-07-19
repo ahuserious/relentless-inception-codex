@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 from typing import Any, Dict
+from unittest.mock import patch
 
 from tests.support import MCP_SERVER_PATH, PLUGIN_ROOT, REPOSITORY_ROOT
 
+from relentless_inception import __version__
+from relentless_inception.cli import doctor
 from relentless_inception.config import deep_merge, load_config, validate_config
+from relentless_inception.providers import ProviderRegistry
 
 
 PLUGIN_MANIFEST_PATH = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
@@ -61,6 +66,20 @@ class PluginPackageIntegrityTests(unittest.TestCase):
         mcp_manifest = self._resolve_inside(PLUGIN_ROOT, plugin_manifest["mcpServers"])
         self.assertEqual(mcp_manifest, MCP_MANIFEST_PATH.resolve())
         self.assertTrue(mcp_manifest.is_file(), mcp_manifest)
+
+    def test_release_identity_is_consistent_across_install_and_runtime_surfaces(self) -> None:
+        plugin_manifest = _load_json(PLUGIN_MANIFEST_PATH)
+        default_config = load_config(include_user=False)
+
+        self.assertEqual(__version__, "0.1.1")
+        self.assertEqual(plugin_manifest.get("version"), __version__)
+        self.assertEqual(doctor(default_config)["version"], __version__)
+
+        with patch.dict(os.environ, {"XAI_API_KEY": "test-only-placeholder"}):
+            headers = ProviderRegistry(default_config)._headers(
+                default_config["providers"]["xai_direct"]
+            )
+        self.assertEqual(headers["User-Agent"], f"relentless-inception-codex/{__version__}")
 
     def test_mcp_manifest_uses_codex_camel_case_and_resolves_server(self) -> None:
         mcp_manifest = _load_json(MCP_MANIFEST_PATH)

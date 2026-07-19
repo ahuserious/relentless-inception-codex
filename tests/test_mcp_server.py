@@ -56,7 +56,10 @@ class McpServerSmokeTests(unittest.TestCase):
 
         initialize = responses[0]["result"]
         self.assertEqual(initialize["protocolVersion"], "2025-06-18")
-        self.assertEqual(initialize["serverInfo"]["name"], "relentless-inception")
+        self.assertEqual(
+            initialize["serverInfo"],
+            {"name": "relentless-inception", "version": "0.1.1"},
+        )
 
         tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertTrue({"config_validate", "fuse", "adversarial_gate"}.issubset(tool_names))
@@ -124,6 +127,7 @@ class McpServerSmokeTests(unittest.TestCase):
         self.assertTrue(payloads[0]["errors"])
         self.assertFalse(responses[1]["result"]["isError"])
         self.assertFalse(payloads[1]["ok"])
+        self.assertEqual(payloads[1]["version"], "0.1.1")
         self.assertFalse(responses[2]["result"]["isError"])
         self.assertTrue(kill_file_created)
 

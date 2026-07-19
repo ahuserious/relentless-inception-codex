@@ -295,6 +295,62 @@ class OrchestrationTests(unittest.TestCase):
         ]
         self.assertEqual(len(semantic_failures), 1)
 
+    def test_incomplete_usage_is_ledgered_with_known_cost_and_blocks_later_dispatch(self) -> None:
+        config = orchestration_config()
+        profile = config["profiles"]["maximum_intelligence"]
+        profile["budgets"].update(
+            {"enforcement": "warn_only", "unknown_cost_policy": "warn"}
+        )
+        registry = ProviderRegistry(config)
+        orchestrator = FusionOrchestrator(config, registry)
+        budget = BudgetTracker(profile["budgets"])
+        response_payload = {
+            "id": "incomplete-usage-request",
+            "status": "completed",
+            "model": "incomplete-usage-live",
+            "output_text": "answer",
+            "usage": {"cost": 0.25},
+        }
+
+        def fake_post_json(
+            _url,
+            _payload,
+            _provider,
+            *,
+            before_attempt=None,
+            on_invalid_response=None,
+        ):
+            del on_invalid_response
+            self.assertIsNotNone(before_attempt)
+            before_attempt()
+            return response_payload, {}, 0.1
+
+        with RunStore("Incomplete usage fixture", config, "incomplete-usage-latch") as store:
+            with mock.patch.object(
+                registry,
+                "_post_json",
+                side_effect=fake_post_json,
+            ) as post_json:
+                with self.assertRaisesRegex(BudgetExceeded, "missing input token count"):
+                    orchestrator._call(
+                        budget,
+                        store,
+                        "synthesis",
+                        "grok45_researcher",
+                        "system",
+                        "prompt",
+                    )
+                with self.assertRaisesRegex(BudgetExceeded, "missing input token count"):
+                    budget.reserve_attempt("gate", "later-seat")
+                ledger = store.read_json("ledger.json")
+
+        self.assertEqual(post_json.call_count, 1)
+        self.assertEqual(ledger["calls"], 1)
+        self.assertEqual(ledger["known_cost_usd"], 0.25)
+        self.assertEqual(ledger["unknown_cost_calls"], 0)
+        self.assertEqual(len(ledger["entries"]), 1)
+        self.assertIn("missing input token count", ledger["accounting_failure"])
+
     def test_malformed_resume_ledger_is_not_overwritten_and_releases_lease(self) -> None:
         config = orchestration_config()
         task = "Preserve malformed accounting evidence."
@@ -326,6 +382,53 @@ class OrchestrationTests(unittest.TestCase):
                 run_id=run_id,
             )
 
+        self.assertEqual(ledger_path.read_bytes(), original_ledger)
+        with RunStore(
+            composite_task,
+            config,
+            run_id,
+            input_identity=input_identity,
+        ) as reopened_store:
+            self.assertEqual(reopened_store.read_json("manifest.json")["status"], "failed")
+
+    def test_semantically_invalid_resume_ledger_is_not_overwritten_or_dispatched(self) -> None:
+        config = orchestration_config()
+        task = "Preserve semantically invalid accounting evidence."
+        artifact = "Caller supplied artifact."
+        run_id = "invalid-json-ledger-preserved"
+        selected_profile_name = str(config["active_profile"])
+        composite_task = task + "\n\nARTIFACT-SHA256:" + text_hash(artifact)
+        input_identity = {
+            "operation": "adversarial_gate",
+            "task": task,
+            "artifact_sha256": text_hash(artifact),
+            "mechanical_evidence": "",
+            "profile_name": selected_profile_name,
+        }
+        with RunStore(
+            composite_task,
+            config,
+            run_id,
+            input_identity=input_identity,
+        ) as store:
+            poisoned_ledger = BudgetTracker(
+                config["profiles"][selected_profile_name]["budgets"]
+            ).snapshot()
+            poisoned_ledger["known_cost_usd"] = -500.0
+            poisoned_ledger["provider_cost_usd"] = {"poisoned-provider": -500.0}
+            store.write_json("ledger.json", poisoned_ledger)
+            ledger_path = store.path("ledger.json")
+            original_ledger = ledger_path.read_bytes()
+
+        registry = FakeProviderRegistry()
+        with self.assertRaisesRegex(ConfigError, "known_cost_usd"):
+            FusionOrchestrator(config, registry).adversarial_gate(
+                task,
+                artifact,
+                run_id=run_id,
+            )
+
+        self.assertEqual(registry.calls, [])
         self.assertEqual(ledger_path.read_bytes(), original_ledger)
         with RunStore(
             composite_task,
@@ -442,6 +545,12 @@ class OrchestrationTests(unittest.TestCase):
             "result.json",
         }
         self.assertTrue(expected_artifacts.issubset({path.name for path in artifact_directory.iterdir()}))
+        synthesis_artifact = json.loads(
+            (artifact_directory / "synthesis.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(synthesis_artifact["mode"], "client_orchestrated")
+        self.assertEqual(synthesis_artifact["author_seat"], "grok45_synthesizer")
+        self.assertEqual(synthesis_artifact["sha256"], synthesis_hash)
         manifest = json.loads((artifact_directory / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "completed")
         self.assertRegex(manifest["input_hash"], r"^[0-9a-f]{64}$")
@@ -512,6 +621,135 @@ class OrchestrationTests(unittest.TestCase):
                 run_id="standalone-gate-resume",
             )
         self.assertEqual(len(registry.calls), call_count)
+
+    def test_cached_gate_requires_the_exact_configured_reviewer_roster(self) -> None:
+        config = orchestration_config()
+        registry = FakeProviderRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "Reject a cached gate with missing reviewer evidence."
+        artifact = "Candidate artifact"
+
+        first = orchestrator.adversarial_gate(
+            task,
+            artifact,
+            run_id="cached-gate-roster",
+        )
+        gate_path = Path(first["artifacts_dir"]) / "gate-0.json"
+        cached_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        cached_gate["passed"] = True
+        cached_gate["pass_count"] = 0
+        cached_gate["reviewers"] = []
+        gate_path.write_text(json.dumps(cached_gate), encoding="utf-8")
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(
+            ConfigError,
+            "reviewer roster must match the configured reviewer seats exactly",
+        ):
+            orchestrator.adversarial_gate(
+                task,
+                artifact,
+                run_id="cached-gate-roster",
+            )
+
+        self.assertEqual(len(registry.calls), call_count)
+
+    def test_cached_completed_gate_review_requires_persisted_raw_response(self) -> None:
+        config = orchestration_config()
+        registry = FakeProviderRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "Reject a cached completed review without raw evidence."
+        artifact = "Candidate artifact"
+
+        first = orchestrator.adversarial_gate(
+            task,
+            artifact,
+            run_id="cached-gate-missing-response",
+        )
+        gate_path = Path(first["artifacts_dir"]) / "gate-0.json"
+        cached_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        cached_gate["reviewers"][0].pop("response")
+        gate_path.write_text(json.dumps(cached_gate), encoding="utf-8")
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(ConfigError, "missing its raw response"):
+            orchestrator.adversarial_gate(
+                task,
+                artifact,
+                run_id="cached-gate-missing-response",
+            )
+
+        self.assertEqual(len(registry.calls), call_count)
+
+    def test_cached_completed_gate_review_rejects_raw_response_verdict_contradiction(self) -> None:
+        config = orchestration_config()
+        registry = FakeProviderRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "Reject contradictory cached reviewer evidence."
+        artifact = "Candidate artifact"
+
+        first = orchestrator.adversarial_gate(
+            task,
+            artifact,
+            run_id="cached-gate-contradictory-response",
+        )
+        gate_path = Path(first["artifacts_dir"]) / "gate-0.json"
+        cached_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        cached_gate["reviewers"][0]["verdict"]["verdict"] = "NEEDS_WORK"
+        gate_path.write_text(json.dumps(cached_gate), encoding="utf-8")
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(ConfigError, "does not match its raw response"):
+            orchestrator.adversarial_gate(
+                task,
+                artifact,
+                run_id="cached-gate-contradictory-response",
+            )
+
+        self.assertEqual(len(registry.calls), call_count)
+
+    def test_cached_gate_recomputes_policy_and_blocks_truthy_negative_verdict(self) -> None:
+        config = orchestration_config()
+        registry = FakeProviderRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "Recompute cached gate authorization from reviewer evidence."
+
+        first = orchestrator.fuse(task, run_id="cached-gate-recomputed")
+        gate_path = Path(first.artifacts_dir) / "gate-0.json"
+        cached_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        cached_gate["passed"] = "yes"
+        cached_gate["pass_count"] = 2
+        cached_gate["required_passes"] = 0
+        cached_gate["negative_verdict_blocked"] = False
+        cached_review = next(
+            review
+            for review in cached_gate["reviewers"]
+            if review["seat_name"] == "grok45_verifier"
+        )
+        cached_review["verdict"].update(
+            {
+                "verdict": "NEEDS_WORK",
+                "summary": "A cached blocking defect remains.",
+                "blocking_findings": ["The candidate omits required evidence."],
+                "required_actions": ["Add and verify the missing evidence."],
+                "evidence": ["Deterministic cached-gate fixture."],
+            }
+        )
+        cached_review["response"]["text"] = json.dumps(cached_review["verdict"])
+        gate_path.write_text(json.dumps(cached_gate), encoding="utf-8")
+        call_count = len(registry.calls)
+
+        resumed = orchestrator.fuse(task, run_id="cached-gate-recomputed")
+
+        self.assertEqual(len(registry.calls), call_count)
+        self.assertEqual(resumed.status, "rejected")
+        self.assertFalse(resumed.gate["passed"])
+        self.assertEqual(resumed.gate["pass_count"], 1)
+        self.assertEqual(resumed.gate["required_passes"], 2)
+        self.assertTrue(resumed.gate["negative_verdict_blocked"])
+        self.assertFalse(resumed.execution_handoff["ready_for_host_workflow"])
+        self.assertFalse(resumed.execution_handoff["ready"])
+        self.assertFalse(resumed.execution_handoff["mutation_authorized"])
 
     def test_panel_collapse_fails_closed_and_marks_manifest_failed(self) -> None:
         panel = ["grok45_researcher", "grok45_adversary"]
@@ -595,6 +833,11 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(failure_artifact["status"], "failed")
         self.assertEqual(failure_artifact["fallback"], "client_orchestrated")
         self.assertIn("synthetic provider failure", failure_artifact["error"])
+        synthesis_artifact = json.loads(
+            (Path(result.artifacts_dir) / "synthesis.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(synthesis_artifact["mode"], "client_orchestrated")
+        self.assertEqual(synthesis_artifact["author_seat"], "grok45_synthesizer")
         self.assertEqual(
             {row["seat_name"] for row in result.panel if row["status"] == "completed"},
             set(DEFAULT_PANEL),
@@ -647,6 +890,11 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(first.status, "completed")
         self.assertEqual(registry.calls[0]["seat_name"], "openrouter_native_fusion_seat")
         self.assertEqual(first.ledger["calls"], 3)
+        synthesis_artifact = json.loads(
+            (Path(first.artifacts_dir) / "synthesis.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(synthesis_artifact["mode"], "native_openrouter")
+        self.assertEqual(synthesis_artifact["author_seat"], "openrouter_native_fusion_seat")
         call_count = len(registry.calls)
 
         resumed = FusionOrchestrator(config, registry).fuse(
@@ -682,6 +930,53 @@ class OrchestrationTests(unittest.TestCase):
             [call["seat_name"] for call in registry.calls],
             ["openrouter_native_fusion_seat"],
         )
+
+    def test_native_fallback_resume_rejects_cached_native_synthesis_provenance(self) -> None:
+        config = orchestration_config()
+        profile = config["profiles"]["maximum_intelligence"]
+        fusion = profile["fusion"]
+        fusion["engine"] = "openrouter_native"
+        fusion["native_fusion_seat"] = "openrouter_native_fusion_seat"
+        fusion["native_openrouter_fusion"]["enabled"] = True
+        fusion["native_openrouter_fusion"]["fallback_to_client_orchestrated"] = True
+        profile["gates"]["reviewers"] = ["openrouter_native_fusion_seat"]
+        profile["gates"]["required_passes"] = 1
+        registry = FakeProviderRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "A fallback marker must not change cached native authorship."
+        run_id = "native-fallback-provenance"
+
+        with self.assertRaisesRegex(
+            ConfigError,
+            "actual artifact author 'openrouter_native_fusion_seat'",
+        ):
+            orchestrator.fuse(task, run_id=run_id)
+
+        run_directory = Path(self.temporary_directory.name) / "runs" / run_id
+        synthesis_artifact = json.loads(
+            (run_directory / "synthesis.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(synthesis_artifact["mode"], "native_openrouter")
+        self.assertEqual(synthesis_artifact["author_seat"], "openrouter_native_fusion_seat")
+        (run_directory / "native-openrouter-failure.json").write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "error": "malformed fallback marker",
+                    "fallback": "client_orchestrated",
+                }
+            ),
+            encoding="utf-8",
+        )
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(
+            ConfigError,
+            "provenance mode must be 'client_orchestrated'",
+        ):
+            orchestrator.fuse(task, run_id=run_id)
+
+        self.assertEqual(len(registry.calls), call_count)
 
     def test_standalone_gate_does_not_attribute_external_artifact_to_native_fusion_seat(self) -> None:
         config = orchestration_config()

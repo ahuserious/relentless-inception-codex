@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import concurrent.futures
 import json
 import multiprocessing
@@ -264,6 +265,74 @@ class BudgetTrackerTests(unittest.TestCase):
             resumed.reserve_attempt("judge", "later-seat")
         self.assertEqual(resumed.snapshot()["unknown_cost_calls"], 1)
 
+    def test_unknown_cost_hard_latches_even_when_thresholds_only_warn(self) -> None:
+        cases = (
+            (
+                budget_config(enforcement="warn_only", unknown_cost_policy="fail_closed"),
+                Usage(input_tokens=1, output_tokens=1, cost_usd=None),
+                "did not report cost",
+            ),
+            (
+                budget_config(enforcement="warn_only", unknown_cost_policy="warn"),
+                Usage(
+                    input_tokens=1,
+                    output_tokens=1,
+                    cost_usd=None,
+                    unknown_cost_fail_closed=True,
+                ),
+                "exceeded its base-rate context threshold",
+            ),
+        )
+        for config, usage, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                tracker = BudgetTracker(config)
+                tracker.reserve_attempt("panel", "unknown-cost-seat")
+                with self.assertRaisesRegex(BudgetExceeded, expected_error):
+                    tracker.record("panel", "unknown-cost-seat", response(usage=usage))
+                with self.assertRaisesRegex(BudgetExceeded, expected_error):
+                    tracker.reserve_attempt("gate", "same-process-seat")
+
+                snapshot = tracker.snapshot()
+                self.assertIn(expected_error, snapshot["accounting_failure"])
+                unlatched_snapshot = copy.deepcopy(snapshot)
+                unlatched_snapshot["accounting_failure"] = None
+                unlatched_snapshot["stop_reason"] = None
+                unlatched_snapshot["entries"][0]["usage"]["accounting_error"] = None
+                with self.assertRaisesRegex(ConfigError, "unlatched usage integrity failure"):
+                    BudgetTracker(config).restore(unlatched_snapshot)
+                resumed = BudgetTracker(config)
+                resumed.restore(snapshot)
+                with self.assertRaisesRegex(BudgetExceeded, expected_error):
+                    resumed.reserve_attempt("gate", "resumed-seat")
+
+    def test_inconsistent_known_and_unknown_cost_status_preserves_cost_and_latches(self) -> None:
+        config = budget_config(enforcement="warn_only", unknown_cost_policy="warn")
+        tracker = BudgetTracker(config)
+        tracker.reserve_attempt("panel", "inconsistent-cost-seat")
+
+        with self.assertRaisesRegex(BudgetExceeded, "known cost cannot also be marked"):
+            tracker.record(
+                "panel",
+                "inconsistent-cost-seat",
+                response(
+                    usage=Usage(
+                        input_tokens=1,
+                        output_tokens=1,
+                        cost_usd=0.25,
+                        unknown_cost_fail_closed=True,
+                    )
+                ),
+            )
+
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["known_cost_usd"], 0.25)
+        self.assertEqual(snapshot["unknown_cost_calls"], 0)
+        self.assertTrue(snapshot["entries"][0]["usage"]["raw_usage_invalid"])
+        resumed = BudgetTracker(config)
+        resumed.restore(snapshot)
+        with self.assertRaisesRegex(BudgetExceeded, "known cost cannot also be marked"):
+            resumed.reserve_attempt("gate", "later-seat")
+
     def test_invalid_provider_usage_latches_across_later_dispatch(self) -> None:
         tracker = BudgetTracker(budget_config())
         tracker.reserve_attempt("panel", "invalid-usage-seat")
@@ -277,8 +346,263 @@ class BudgetTrackerTests(unittest.TestCase):
 
         snapshot = tracker.snapshot()
         self.assertIn("invalid input token usage", snapshot["stop_reason"])
+        self.assertEqual(snapshot["known_cost_usd"], 0.01)
+        self.assertEqual(snapshot["provider_cost_usd"], {"test_provider": 0.01})
+        self.assertEqual(len(snapshot["entries"]), 1)
+        self.assertEqual(snapshot["entries"][0]["usage"]["input_tokens"], 0)
+        self.assertTrue(snapshot["entries"][0]["usage"]["raw_usage_invalid"])
         with self.assertRaisesRegex(BudgetExceeded, "invalid input token usage"):
             tracker.reserve_attempt("gate", "later-seat")
+
+        resumed = BudgetTracker(budget_config())
+        resumed.restore(snapshot)
+        with self.assertRaisesRegex(BudgetExceeded, "invalid input token usage"):
+            resumed.reserve_attempt("gate", "resumed-seat")
+
+    def test_incomplete_token_usage_preserves_known_cost_and_hard_latches(self) -> None:
+        config = budget_config(enforcement="warn_only", unknown_cost_policy="warn")
+        tracker = BudgetTracker(config)
+        tracker.reserve_attempt("panel", "incomplete-usage-seat")
+        accounting_error = (
+            "Provider returned invalid or incomplete usage: missing output token count"
+        )
+
+        with self.assertRaisesRegex(BudgetExceeded, "missing output token count"):
+            tracker.record(
+                "panel",
+                "incomplete-usage-seat",
+                response(
+                    usage=Usage(
+                        input_tokens=10,
+                        cost_usd=0.25,
+                        input_output_usage_complete=False,
+                        accounting_error=accounting_error,
+                    )
+                ),
+            )
+
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["known_cost_usd"], 0.25)
+        self.assertEqual(snapshot["provider_cost_usd"], {"test_provider": 0.25})
+        self.assertEqual(snapshot["unknown_cost_calls"], 0)
+        self.assertEqual(len(snapshot["entries"]), 1)
+        self.assertEqual(snapshot["accounting_failure"], accounting_error)
+
+        missing_latch = copy.deepcopy(snapshot)
+        del missing_latch["accounting_failure"]
+        with self.assertRaisesRegex(ConfigError, "missing required fields accounting_failure"):
+            BudgetTracker(config).restore(missing_latch)
+
+        unlatched_entry = copy.deepcopy(snapshot)
+        unlatched_entry["accounting_failure"] = None
+        unlatched_entry["stop_reason"] = None
+        unlatched_entry["entries"][0]["usage"]["accounting_error"] = None
+        with self.assertRaisesRegex(ConfigError, "unlatched usage integrity failure"):
+            BudgetTracker(config).restore(unlatched_entry)
+
+        resumed = BudgetTracker(config)
+        resumed.restore(snapshot)
+        with self.assertRaisesRegex(BudgetExceeded, "missing output token count"):
+            resumed.reserve_attempt("gate", "later-seat")
+        self.assertEqual(resumed.snapshot()["calls"], 1)
+
+    def test_first_accounting_failure_wins_across_in_flight_responses(self) -> None:
+        config = budget_config(enforcement="warn_only", unknown_cost_policy="warn")
+        tracker = BudgetTracker(config)
+        tracker.reserve_attempt("panel", "first-seat")
+        tracker.reserve_attempt("panel", "second-seat")
+        first_error = "Provider returned incomplete usage: first failure"
+        second_error = "Provider returned invalid usage: second failure"
+
+        with self.assertRaisesRegex(BudgetExceeded, "first failure"):
+            tracker.record(
+                "panel",
+                "first-seat",
+                response(
+                    usage=Usage(
+                        input_tokens=1,
+                        cost_usd=0.1,
+                        input_output_usage_complete=False,
+                        accounting_error=first_error,
+                    )
+                ),
+            )
+        with self.assertRaisesRegex(BudgetExceeded, "first failure"):
+            tracker.record(
+                "panel",
+                "second-seat",
+                response(
+                    usage=Usage(
+                        input_tokens=1,
+                        output_tokens=1,
+                        cost_usd=0.2,
+                        raw_usage_invalid=True,
+                        accounting_error=second_error,
+                    )
+                ),
+            )
+
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["accounting_failure"], first_error)
+        self.assertEqual(snapshot["stop_reason"], first_error)
+        self.assertEqual(
+            [entry["usage"]["accounting_error"] for entry in snapshot["entries"]],
+            [first_error, second_error],
+        )
+        resumed = BudgetTracker(config)
+        resumed.restore(snapshot)
+        with self.assertRaisesRegex(BudgetExceeded, "first failure"):
+            resumed.reserve_attempt("gate", "later-seat")
+
+    def test_accounting_failure_can_follow_a_prior_threshold_stop(self) -> None:
+        config = budget_config(max_total_tokens=1)
+        tracker = BudgetTracker(config)
+        tracker.reserve_attempt("panel", "threshold-seat")
+        tracker.reserve_attempt("panel", "in-flight-seat")
+        tracker.record(
+            "panel",
+            "threshold-seat",
+            response(usage=Usage(input_tokens=1, output_tokens=0, cost_usd=0.1)),
+        )
+        threshold_stop = tracker.snapshot()["stop_reason"]
+        accounting_error = "Provider returned incomplete usage after threshold"
+
+        with self.assertRaisesRegex(BudgetExceeded, "after threshold"):
+            tracker.record(
+                "panel",
+                "in-flight-seat",
+                response(
+                    usage=Usage(
+                        input_tokens=1,
+                        cost_usd=0.2,
+                        input_output_usage_complete=False,
+                        accounting_error=accounting_error,
+                    )
+                ),
+            )
+
+        snapshot = tracker.snapshot()
+        self.assertEqual(snapshot["stop_reason"], threshold_stop)
+        self.assertEqual(snapshot["accounting_failure"], accounting_error)
+        resumed = BudgetTracker(config)
+        resumed.restore(snapshot)
+        with self.assertRaisesRegex(BudgetExceeded, "after threshold"):
+            resumed.reserve_attempt("gate", "later-seat")
+
+    def test_restore_validates_every_accounting_field_before_mutating(self) -> None:
+        source = BudgetTracker(budget_config())
+        source.reserve_attempt("panel", "source-seat")
+        source.record(
+            "panel",
+            "source-seat",
+            response(usage=Usage(input_tokens=2, output_tokens=3, cost_usd=0.25)),
+        )
+        valid_snapshot = source.snapshot()
+        invalid_cases = (
+            ("missing fields", {}, "Unsupported budget snapshot schema"),
+            ("boolean schema", {"schema_version": True}, "Unsupported budget snapshot schema"),
+            ("fractional schema", {"schema_version": 2.0}, "Unsupported budget snapshot schema"),
+            ("negative counter", {"calls": -1}, "calls"),
+            ("boolean counter", {"input_tokens": True}, "input_tokens"),
+            ("fractional counter", {"output_tokens": 1.5}, "output_tokens"),
+            ("string cost", {"known_cost_usd": "0.25"}, "known_cost_usd"),
+            ("overflowing cost", {"known_cost_usd": 10**10_000}, "known_cost_usd"),
+            (
+                "nonfinite provider cost",
+                {"provider_cost_usd": {"test_provider": float("nan")}},
+                "provider_cost",
+            ),
+            ("nonfinite wall time", {"wall_seconds": float("inf")}, "wall_seconds"),
+            ("attempt mismatch", {"attempts": 2}, "attempts must equal calls"),
+            ("token total mismatch", {"total_tokens": 99}, "total_tokens"),
+            (
+                "provider cost mismatch",
+                {"provider_cost_usd": {"test_provider": 0.2}},
+                "provider_cost_usd must match entries",
+            ),
+            (
+                "redistributed provider cost",
+                {"provider_cost_usd": {"different-provider": 0.25}},
+                "provider_cost_usd must match entries",
+            ),
+            (
+                "forged aggregate cost",
+                {"known_cost_usd": 0.0, "provider_cost_usd": {}},
+                "known_cost_usd must match entries",
+            ),
+            (
+                "forged aggregate tokens",
+                {"input_tokens": 0, "total_tokens": 3},
+                "aggregate usage counters must match entries",
+            ),
+            (
+                "forged unknown cost count",
+                {"unknown_cost_calls": 1},
+                "unknown_cost_calls must match entries",
+            ),
+            ("invalid entries", {"entries": ["not-an-object"]}, "entries"),
+            ("invalid stop reason", {"stop_reason": False}, "stop_reason"),
+            ("invalid accounting failure", {"accounting_failure": []}, "accounting_failure"),
+            (
+                "late validation failure",
+                {"calls": 9, "attempts": 9, "warnings": [1]},
+                "warnings",
+            ),
+        )
+
+        for label, updates, expected_error in invalid_cases:
+            with self.subTest(label=label):
+                candidate = {} if label == "missing fields" else copy.deepcopy(valid_snapshot)
+                candidate.update(updates)
+                target = BudgetTracker(budget_config())
+                target.reserve_attempt("panel", "existing-seat")
+                target.record(
+                    "panel",
+                    "existing-seat",
+                    response(usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.5)),
+                )
+                before = target.snapshot()
+
+                with self.assertRaisesRegex(ConfigError, expected_error):
+                    target.restore(candidate)
+
+                after = target.snapshot()
+                before.pop("wall_seconds")
+                after.pop("wall_seconds")
+                self.assertEqual(after, before)
+
+    def test_restore_copies_untrusted_containers_before_mutating(self) -> None:
+        class ExplodingRoute(dict):
+            def __deepcopy__(self, memo):
+                del memo
+                raise RuntimeError("synthetic deepcopy failure")
+
+        source = BudgetTracker(budget_config())
+        source.reserve_attempt("panel", "source-seat")
+        source.record(
+            "panel",
+            "source-seat",
+            response(usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.25)),
+        )
+        candidate = copy.deepcopy(source.snapshot())
+        candidate["entries"][0]["route"] = ExplodingRoute()
+
+        target = BudgetTracker(budget_config())
+        target.reserve_attempt("panel", "existing-seat")
+        target.record(
+            "panel",
+            "existing-seat",
+            response(usage=Usage(input_tokens=2, output_tokens=2, cost_usd=0.5)),
+        )
+        before = target.snapshot()
+
+        with self.assertRaisesRegex(ConfigError, "could not be safely copied"):
+            target.restore(candidate)
+
+        after = target.snapshot()
+        before.pop("wall_seconds")
+        after.pop("wall_seconds")
+        self.assertEqual(after, before)
 
     def test_resume_does_not_round_a_small_cost_below_its_threshold(self) -> None:
         config = budget_config(

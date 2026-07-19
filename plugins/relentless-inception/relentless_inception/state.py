@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
 import json
@@ -16,7 +17,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from .config import canonical_hash, runtime_data_dir
 from .errors import BudgetExceeded, ConfigError, RunAborted
-from .types import ModelResponse
+from .types import ModelResponse, Usage
 
 try:
     import fcntl as _fcntl
@@ -238,6 +239,8 @@ class RunStore:
 
 
 class BudgetTracker:
+    SNAPSHOT_SCHEMA_VERSION = 2
+
     def __init__(self, budget_config: Mapping[str, Any]) -> None:
         self.config = dict(budget_config)
         self.started = time.monotonic()
@@ -252,30 +255,339 @@ class BudgetTracker:
         self.known_cost_usd = 0.0
         self.provider_cost_usd: Dict[str, float] = {}
         self.unknown_cost_calls = 0
+        self.accounting_failure: Optional[str] = None
         self.stop_reason: Optional[str] = None
         self.entries: list[Dict[str, Any]] = []
         self.warnings: list[str] = []
 
+    @staticmethod
+    def _snapshot_nonnegative_integer(snapshot: Mapping[str, Any], field_name: str) -> int:
+        value = snapshot.get(field_name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigError(
+                f"Invalid budget snapshot: {field_name} must be a nonnegative integer"
+            )
+        return value
+
+    @staticmethod
+    def _snapshot_nonnegative_number(snapshot: Mapping[str, Any], field_name: str) -> float:
+        value = snapshot.get(field_name, 0.0)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ConfigError(
+                f"Invalid budget snapshot: {field_name} must be a nonnegative finite number"
+            )
+        try:
+            normalized = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ConfigError(
+                f"Invalid budget snapshot: {field_name} must be a nonnegative finite number"
+            ) from exc
+        if not math.isfinite(normalized) or normalized < 0:
+            raise ConfigError(
+                f"Invalid budget snapshot: {field_name} must be a nonnegative finite number"
+            )
+        return normalized
+
+    @staticmethod
+    def _snapshot_optional_message(snapshot: Mapping[str, Any], field_name: str) -> Optional[str]:
+        value = snapshot.get(field_name)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise ConfigError(
+                f"Invalid budget snapshot: {field_name} must be a nonempty string or null"
+            )
+        return value
+
     def restore(self, snapshot: Mapping[str, Any]) -> None:
         """Restore cumulative accounting when a matching run is resumed."""
         with self.lock:
-            self.calls = int(snapshot.get("calls", 0))
-            self.input_tokens = int(snapshot.get("input_tokens", 0))
-            self.output_tokens = int(snapshot.get("output_tokens", 0))
-            self.reasoning_tokens = int(snapshot.get("reasoning_tokens", 0))
-            self.cached_tokens = int(snapshot.get("cached_tokens", 0))
-            self.tool_calls = int(snapshot.get("tool_calls", 0))
-            self.known_cost_usd = float(snapshot.get("known_cost_usd", 0.0))
+            if not isinstance(snapshot, Mapping):
+                raise ConfigError("Invalid budget snapshot: expected a JSON object")
+            schema_version = snapshot.get("schema_version")
+            if (
+                not isinstance(schema_version, int)
+                or isinstance(schema_version, bool)
+                or schema_version != self.SNAPSHOT_SCHEMA_VERSION
+            ):
+                raise ConfigError(
+                    "Unsupported budget snapshot schema; safe resume requires schema_version "
+                    f"{self.SNAPSHOT_SCHEMA_VERSION}"
+                )
+            required_fields = {
+                "schema_version",
+                "calls",
+                "attempts",
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "total_tokens",
+                "tool_calls",
+                "known_cost_usd",
+                "provider_cost_usd",
+                "unknown_cost_calls",
+                "accounting_failure",
+                "stop_reason",
+                "wall_seconds",
+                "entries",
+                "warnings",
+            }
+            missing_fields = sorted(required_fields.difference(snapshot))
+            if missing_fields:
+                raise ConfigError(
+                    "Invalid budget snapshot: missing required fields "
+                    + ", ".join(missing_fields)
+                )
+
+            calls = self._snapshot_nonnegative_integer(snapshot, "calls")
+            input_tokens = self._snapshot_nonnegative_integer(snapshot, "input_tokens")
+            output_tokens = self._snapshot_nonnegative_integer(snapshot, "output_tokens")
+            reasoning_tokens = self._snapshot_nonnegative_integer(snapshot, "reasoning_tokens")
+            cached_tokens = self._snapshot_nonnegative_integer(snapshot, "cached_tokens")
+            tool_calls = self._snapshot_nonnegative_integer(snapshot, "tool_calls")
+            unknown_cost_calls = self._snapshot_nonnegative_integer(snapshot, "unknown_cost_calls")
+            known_cost_usd = self._snapshot_nonnegative_number(snapshot, "known_cost_usd")
+            restored_wall_seconds = self._snapshot_nonnegative_number(snapshot, "wall_seconds")
+
+            attempts = self._snapshot_nonnegative_integer(snapshot, "attempts")
+            if attempts != calls:
+                raise ConfigError("Invalid budget snapshot: attempts must equal calls")
+            total_tokens = self._snapshot_nonnegative_integer(snapshot, "total_tokens")
+            if total_tokens != input_tokens + output_tokens:
+                raise ConfigError(
+                    "Invalid budget snapshot: total_tokens must equal input_tokens plus output_tokens"
+                )
+
             provider_cost = snapshot.get("provider_cost_usd", {})
-            self.provider_cost_usd = {str(key): float(value) for key, value in provider_cost.items()} if isinstance(provider_cost, Mapping) else {}
-            self.unknown_cost_calls = int(snapshot.get("unknown_cost_calls", 0))
-            restored_stop_reason = snapshot.get("stop_reason")
-            self.stop_reason = str(restored_stop_reason) if restored_stop_reason else None
+            if not isinstance(provider_cost, Mapping):
+                raise ConfigError("Invalid budget snapshot: provider_cost_usd must be an object")
+            normalized_provider_cost: Dict[str, float] = {}
+            for provider, value in provider_cost.items():
+                if not isinstance(provider, str) or not provider:
+                    raise ConfigError(
+                        "Invalid budget snapshot: provider_cost_usd keys must be nonempty strings"
+                    )
+                normalized_provider_cost[provider] = self._snapshot_nonnegative_number(
+                    {"provider_cost": value}, "provider_cost"
+                )
+
+            accounting_failure = self._snapshot_optional_message(snapshot, "accounting_failure")
+            stop_reason = self._snapshot_optional_message(snapshot, "stop_reason")
             entries = snapshot.get("entries", [])
-            self.entries = list(entries) if isinstance(entries, list) else []
+            if not isinstance(entries, list) or any(not isinstance(entry, Mapping) for entry in entries):
+                raise ConfigError("Invalid budget snapshot: entries must be an array of objects")
+            if len(entries) > calls:
+                raise ConfigError("Invalid budget snapshot: entries cannot exceed calls")
+            if unknown_cost_calls > len(entries):
+                raise ConfigError(
+                    "Invalid budget snapshot: unknown_cost_calls cannot exceed recorded entries"
+                )
+
+            recomputed_counters = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "tool_calls": 0,
+            }
+            recomputed_known_cost_usd = 0.0
+            recomputed_provider_cost_usd: Dict[str, float] = {}
+            recomputed_unknown_cost_calls = 0
+            entry_accounting_failures: list[str] = []
+            required_entry_fields = {
+                "stage",
+                "seat",
+                "provider",
+                "requested_model",
+                "actual_model",
+                "request_id",
+                "route",
+                "latency_seconds",
+                "usage",
+            }
+            required_usage_fields = {
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "tool_calls",
+                "cost_usd",
+                "unknown_cost_fail_closed",
+                "input_output_usage_complete",
+                "raw_usage_invalid",
+                "accounting_error",
+            }
+            for entry_index, entry in enumerate(entries):
+                missing_entry_fields = required_entry_fields.difference(entry)
+                if missing_entry_fields:
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} is missing required fields"
+                    )
+                for field_name in (
+                    "stage",
+                    "seat",
+                    "provider",
+                    "requested_model",
+                    "actual_model",
+                ):
+                    if not isinstance(entry[field_name], str) or not entry[field_name]:
+                        raise ConfigError(
+                            f"Invalid budget snapshot: entry {entry_index} {field_name} "
+                            "must be a nonempty string"
+                        )
+                request_id = entry["request_id"]
+                if request_id is not None and (
+                    not isinstance(request_id, str) or not request_id
+                ):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} request_id "
+                        "must be a nonempty string or null"
+                    )
+                if not isinstance(entry["route"], Mapping):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} route must be an object"
+                    )
+                self._snapshot_nonnegative_number(
+                    {"latency_seconds": entry["latency_seconds"]}, "latency_seconds"
+                )
+
+                entry_usage = entry["usage"]
+                if not isinstance(entry_usage, Mapping):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} usage must be an object"
+                    )
+                if required_usage_fields.difference(entry_usage):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} usage is missing required fields"
+                    )
+                entry_counters: Dict[str, int] = {}
+                for counter_name in recomputed_counters:
+                    entry_counters[counter_name] = self._snapshot_nonnegative_integer(
+                        entry_usage, counter_name
+                    )
+                    recomputed_counters[counter_name] += entry_counters[counter_name]
+                if entry_counters["cached_tokens"] > entry_counters["input_tokens"]:
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} cached_tokens "
+                        "cannot exceed input_tokens"
+                    )
+                if entry_counters["reasoning_tokens"] > entry_counters["output_tokens"]:
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} reasoning_tokens "
+                        "cannot exceed output_tokens"
+                    )
+                if not isinstance(entry_usage["unknown_cost_fail_closed"], bool):
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} "
+                        "unknown_cost_fail_closed must be a boolean"
+                    )
+                for usage_boolean in (
+                    "input_output_usage_complete",
+                    "raw_usage_invalid",
+                ):
+                    if not isinstance(entry_usage[usage_boolean], bool):
+                        raise ConfigError(
+                            f"Invalid budget snapshot: entry {entry_index} "
+                            f"{usage_boolean} must be a boolean"
+                        )
+                entry_accounting_error = self._snapshot_optional_message(
+                    entry_usage, "accounting_error"
+                )
+                entry_requires_accounting_latch = (
+                    not entry_usage["input_output_usage_complete"]
+                    or entry_usage["raw_usage_invalid"]
+                    or entry_usage["unknown_cost_fail_closed"]
+                )
+
+                entry_cost = entry_usage["cost_usd"]
+                if entry_cost is None:
+                    recomputed_unknown_cost_calls += 1
+                    if self.config.get("unknown_cost_policy", "fail_closed") == "fail_closed":
+                        entry_requires_accounting_latch = True
+                else:
+                    normalized_entry_cost = self._snapshot_nonnegative_number(
+                        {"cost_usd": entry_cost}, "cost_usd"
+                    )
+                    provider = str(entry["provider"])
+                    recomputed_known_cost_usd += normalized_entry_cost
+                    recomputed_provider_cost_usd[provider] = (
+                        recomputed_provider_cost_usd.get(provider, 0.0)
+                        + normalized_entry_cost
+                    )
+                if entry_requires_accounting_latch and entry_accounting_error is None:
+                    raise ConfigError(
+                        f"Invalid budget snapshot: entry {entry_index} has an unlatched "
+                        "usage integrity failure"
+                    )
+                if entry_accounting_error is not None:
+                    entry_accounting_failures.append(entry_accounting_error)
+
+            expected_counters = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "cached_tokens": cached_tokens,
+                "tool_calls": tool_calls,
+            }
+            if recomputed_counters != expected_counters:
+                raise ConfigError(
+                    "Invalid budget snapshot: aggregate usage counters must match entries"
+                )
+            if recomputed_known_cost_usd != known_cost_usd:
+                raise ConfigError(
+                    "Invalid budget snapshot: known_cost_usd must match entries"
+                )
+            if recomputed_provider_cost_usd != normalized_provider_cost:
+                raise ConfigError(
+                    "Invalid budget snapshot: provider_cost_usd must match entries"
+                )
+            if recomputed_unknown_cost_calls != unknown_cost_calls:
+                raise ConfigError(
+                    "Invalid budget snapshot: unknown_cost_calls must match entries"
+                )
+            if entry_accounting_failures and accounting_failure != entry_accounting_failures[0]:
+                raise ConfigError(
+                    "Invalid budget snapshot: accounting_failure must match entry usage"
+                )
+            if not entry_accounting_failures and accounting_failure is not None:
+                raise ConfigError(
+                    "Invalid budget snapshot: accounting_failure has no matching entry usage"
+                )
+
             warnings = snapshot.get("warnings", [])
-            self.warnings = list(warnings) if isinstance(warnings, list) else []
-            self.restored_wall_seconds = max(0.0, float(snapshot.get("wall_seconds", 0.0)))
+            if not isinstance(warnings, list) or any(
+                not isinstance(warning, str) or not warning for warning in warnings
+            ):
+                raise ConfigError(
+                    "Invalid budget snapshot: warnings must be an array of nonempty strings"
+                )
+
+            # Copy untrusted containers before assignment as custom Mapping or
+            # list subclasses may raise while being copied.
+            try:
+                restored_entries = copy.deepcopy(entries)
+                restored_warnings = list(warnings)
+            except Exception as exc:
+                raise ConfigError(
+                    "Invalid budget snapshot: accounting containers could not be safely copied"
+                ) from exc
+
+            # Assign only after every validation and fallible copy completes.
+            self.calls = calls
+            self.input_tokens = input_tokens
+            self.output_tokens = output_tokens
+            self.reasoning_tokens = reasoning_tokens
+            self.cached_tokens = cached_tokens
+            self.tool_calls = tool_calls
+            self.known_cost_usd = known_cost_usd
+            self.provider_cost_usd = normalized_provider_cost
+            self.unknown_cost_calls = unknown_cost_calls
+            self.accounting_failure = accounting_failure
+            self.stop_reason = stop_reason
+            self.entries = restored_entries
+            self.warnings = restored_warnings
+            self.restored_wall_seconds = restored_wall_seconds
 
     def _elapsed_wall_seconds(self) -> float:
         return self.restored_wall_seconds + (time.monotonic() - self.started)
@@ -324,6 +636,10 @@ class BudgetTracker:
         }
 
     def _check_observed_thresholds_before_dispatch(self) -> None:
+        if self.accounting_failure is not None:
+            # Provider accounting integrity failures are never downgraded by a
+            # warn-only budget policy.
+            raise BudgetExceeded(self.accounting_failure)
         if self.stop_reason is not None:
             self._block_dispatch(self.stop_reason)
 
@@ -396,7 +712,12 @@ class BudgetTracker:
             return None
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise BudgetExceeded("Provider returned invalid cost usage: expected a nonnegative finite number")
-        normalized = float(value)
+        try:
+            normalized = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise BudgetExceeded(
+                "Provider returned invalid cost usage: expected a nonnegative finite number"
+            ) from exc
         if not math.isfinite(normalized) or normalized < 0:
             raise BudgetExceeded("Provider returned invalid cost usage: expected a nonnegative finite number")
         return normalized
@@ -404,19 +725,99 @@ class BudgetTracker:
     def record(self, stage: str, seat_name: str, response: ModelResponse) -> None:
         with self.lock:
             usage = response.usage
+            response_accounting_failure: Optional[str] = None
+            if usage.accounting_error is not None:
+                if not isinstance(usage.accounting_error, str) or not usage.accounting_error:
+                    response_accounting_failure = (
+                        "Provider returned invalid usage accounting status"
+                    )
+                else:
+                    response_accounting_failure = usage.accounting_error
+            raw_usage_invalid = usage.raw_usage_invalid
+            if not isinstance(raw_usage_invalid, bool):
+                response_accounting_failure = "Provider returned invalid raw-usage status"
+                raw_usage_invalid = True
+            elif raw_usage_invalid and response_accounting_failure is None:
+                response_accounting_failure = "Provider returned invalid raw usage"
+            input_output_usage_complete = usage.input_output_usage_complete
+            if not isinstance(input_output_usage_complete, bool):
+                response_accounting_failure = (
+                    "Provider returned invalid input/output usage completeness status"
+                )
+                input_output_usage_complete = False
+                raw_usage_invalid = True
+            elif not input_output_usage_complete and response_accounting_failure is None:
+                response_accounting_failure = (
+                    "Provider returned incomplete usage: input and output token counts are required"
+                )
+            unknown_cost_fail_closed = usage.unknown_cost_fail_closed
+            if not isinstance(unknown_cost_fail_closed, bool):
+                response_accounting_failure = (
+                    response_accounting_failure
+                    or "Provider returned invalid unknown-cost status"
+                )
+                unknown_cost_fail_closed = False
+                raw_usage_invalid = True
+            elif unknown_cost_fail_closed and usage.cost_usd is not None:
+                response_accounting_failure = response_accounting_failure or (
+                    "Provider returned inconsistent cost usage: a known cost cannot also "
+                    "be marked unknown-cost fail-closed"
+                )
+                raw_usage_invalid = True
+
+            normalized_usage_integers: Dict[str, int] = {}
+            usage_integer_fields = (
+                ("input_tokens", usage.input_tokens, "input token"),
+                ("output_tokens", usage.output_tokens, "output token"),
+                ("reasoning_tokens", usage.reasoning_tokens, "reasoning token"),
+                ("cached_tokens", usage.cached_tokens, "cached token"),
+                ("tool_calls", usage.tool_calls, "tool call"),
+            )
+            for field_name, field_value, field_label in usage_integer_fields:
+                try:
+                    normalized_usage_integers[field_name] = self._nonnegative_usage_integer(
+                        field_value, field_label
+                    )
+                except BudgetExceeded as exc:
+                    normalized_usage_integers[field_name] = 0
+                    response_accounting_failure = response_accounting_failure or str(exc)
+                    raw_usage_invalid = True
             try:
-                input_tokens = self._nonnegative_usage_integer(usage.input_tokens, "input token")
-                output_tokens = self._nonnegative_usage_integer(usage.output_tokens, "output token")
-                reasoning_tokens = self._nonnegative_usage_integer(usage.reasoning_tokens, "reasoning token")
-                cached_tokens = self._nonnegative_usage_integer(usage.cached_tokens, "cached token")
-                tool_calls = self._nonnegative_usage_integer(usage.tool_calls, "tool call")
                 cost_usd = self._known_cost(usage.cost_usd)
             except BudgetExceeded as exc:
-                # Invalid provider accounting is a persistent fail-closed state,
-                # not a one-call exception that a resume may silently bypass.
-                if self.stop_reason is None:
-                    self.stop_reason = str(exc)
-                raise
+                cost_usd = None
+                response_accounting_failure = response_accounting_failure or str(exc)
+                raw_usage_invalid = True
+
+            input_tokens = normalized_usage_integers["input_tokens"]
+            output_tokens = normalized_usage_integers["output_tokens"]
+            reasoning_tokens = normalized_usage_integers["reasoning_tokens"]
+            cached_tokens = normalized_usage_integers["cached_tokens"]
+            tool_calls = normalized_usage_integers["tool_calls"]
+            if cached_tokens > input_tokens:
+                response_accounting_failure = response_accounting_failure or (
+                    "Provider returned invalid cached token usage: cannot exceed input tokens"
+                )
+                raw_usage_invalid = True
+                cached_tokens = input_tokens
+            if reasoning_tokens > output_tokens:
+                response_accounting_failure = response_accounting_failure or (
+                    "Provider returned invalid reasoning token usage: cannot exceed output tokens"
+                )
+                raw_usage_invalid = True
+                reasoning_tokens = output_tokens
+            recorded_usage = Usage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                reasoning_tokens=reasoning_tokens,
+                cached_tokens=cached_tokens,
+                tool_calls=tool_calls,
+                cost_usd=cost_usd,
+                unknown_cost_fail_closed=unknown_cost_fail_closed,
+                input_output_usage_complete=input_output_usage_complete,
+                raw_usage_invalid=raw_usage_invalid,
+                accounting_error=response_accounting_failure,
+            )
 
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
@@ -426,7 +827,7 @@ class BudgetTracker:
             unknown_cost_failure: Optional[str] = None
             if cost_usd is None:
                 self.unknown_cost_calls += 1
-                if usage.unknown_cost_fail_closed:
+                if recorded_usage.unknown_cost_fail_closed:
                     unknown_cost_failure = (
                         f"Seat {seat_name} exceeded its base-rate context threshold without configured long-context pricing"
                     )
@@ -439,6 +840,11 @@ class BudgetTracker:
             else:
                 self.known_cost_usd += cost_usd
                 self.provider_cost_usd[response.provider] = self.provider_cost_usd.get(response.provider, 0.0) + cost_usd
+            if unknown_cost_failure is not None and response_accounting_failure is None:
+                # A configured fail-closed unknown-cost outcome is an accounting
+                # integrity latch, even when threshold enforcement is warn-only.
+                response_accounting_failure = unknown_cost_failure
+                recorded_usage.accounting_error = unknown_cost_failure
             self.entries.append(
                 {
                     "stage": stage,
@@ -449,9 +855,15 @@ class BudgetTracker:
                     "request_id": response.request_id,
                     "route": response.route,
                     "latency_seconds": response.latency_seconds,
-                    "usage": usage.to_dict(),
+                    "usage": recorded_usage.to_dict(),
                 }
             )
+            if response_accounting_failure is not None:
+                if self.accounting_failure is None:
+                    self.accounting_failure = response_accounting_failure
+                if self.stop_reason is None:
+                    self.stop_reason = self.accounting_failure
+                raise BudgetExceeded(self.accounting_failure)
             if unknown_cost_failure:
                 if self.stop_reason is None:
                     self.stop_reason = unknown_cost_failure
@@ -534,6 +946,7 @@ class BudgetTracker:
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
             return {
+                "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
                 "calls": self.calls,
                 "attempts": self.calls,
                 "input_tokens": self.input_tokens,
@@ -547,6 +960,7 @@ class BudgetTracker:
                 "known_cost_usd": self.known_cost_usd,
                 "provider_cost_usd": dict(self.provider_cost_usd),
                 "unknown_cost_calls": self.unknown_cost_calls,
+                "accounting_failure": self.accounting_failure,
                 "stop_reason": self.stop_reason,
                 "wall_seconds": self._elapsed_wall_seconds(),
                 "entries": list(self.entries),
