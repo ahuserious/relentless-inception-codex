@@ -1,0 +1,24 @@
+{
+  "name": "ahuserious-codex",
+  "owner": {
+    "name": "ahuserious"
+  },
+  "metadata": {
+    "description": "Codex-native intelligence amplification plugins"
+  },
+  "plugins": [
+    {
+      "name": "relentless-inception",
+      "source": {
+        "source": "local",
+        "path": "./plugins/relentless-inception"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE",
+        "products": ["CODEX"]
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from tests.support import MCP_SERVER_PATH, PLUGIN_ROOT
+
+
+class McpServerSmokeTests(unittest.TestCase):
+    def test_initialize_tools_list_and_config_validate_over_stdio(self) -> None:
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "config_validate", "arguments": {}},
+            },
+        ]
+        stdin = "\n".join(json.dumps(message) for message in messages) + "\n"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "RELENTLESS_INCEPTION_DATA_DIR": temporary_directory,
+                    "RELENTLESS_INCEPTION_CONFIG": os.path.join(temporary_directory, "missing-user-config.json"),
+                }
+            )
+            existing_python_path = environment.get("PYTHONPATH")
+            environment["PYTHONPATH"] = (
+                str(PLUGIN_ROOT)
+                if not existing_python_path
+                else str(PLUGIN_ROOT) + os.pathsep + existing_python_path
+            )
+            completed = subprocess.run(
+                [sys.executable, str(MCP_SERVER_PATH)],
+                input=stdin,
+                text=True,
+                capture_output=True,
+                cwd=str(PLUGIN_ROOT),
+                env=environment,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+        self.assertEqual([response["id"] for response in responses], [1, 2, 3])
+
+        initialize = responses[0]["result"]
+        self.assertEqual(initialize["protocolVersion"], "2025-06-18")
+        self.assertEqual(initialize["serverInfo"]["name"], "relentless-inception")
+
+        tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
+        self.assertTrue({"config_validate", "fuse", "adversarial_gate"}.issubset(tool_names))
+
+        validation_result = responses[2]["result"]
+        self.assertFalse(validation_result["isError"])
+        validation_payload = json.loads(validation_result["content"][0]["text"])
+        self.assertEqual(validation_payload, {"errors": [], "ok": True})
+
+
+if __name__ == "__main__":
+    unittest.main()

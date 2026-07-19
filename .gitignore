@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.coverage
+htmlcov/
+.pytest_cache/
+.batch-runs/
+dist/
+build/
+*.egg-info/
+
+# Runtime state and credentials never belong in the repository.
+.relentless-inception/
+secrets.*
+*.secret
+.env
+.env.*

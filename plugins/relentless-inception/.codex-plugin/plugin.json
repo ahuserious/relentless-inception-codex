@@ -1,0 +1,37 @@
+{
+  "name": "relentless-inception",
+  "version": "0.1.0",
+  "description": "Bounded multi-model deliberation, generative fusion, adversarial gates, and execution handoff for Codex.",
+  "author": {
+    "name": "ahuserious",
+    "url": "https://github.com/ahuserious"
+  },
+  "homepage": "https://github.com/ahuserious/relentless-inception-codex",
+  "repository": "https://github.com/ahuserious/relentless-inception-codex",
+  "keywords": [
+    "multi-agent",
+    "multi-model",
+    "fusion",
+    "deliberation",
+    "adversarial-review",
+    "grok",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Relentless Inception",
+    "shortDescription": "Fuse frontier models, then execute with evidence gates",
+    "longDescription": "A provider-neutral, cost-bounded deliberation control plane for Codex. It runs independent model seats, structured comparison, minority-preserving synthesis, and adversarial verification while keeping filesystem execution under Codex control.",
+    "developerName": "ahuserious",
+    "category": "Developer Tools",
+    "websiteURL": "https://github.com/ahuserious/relentless-inception-codex",
+    "defaultPrompt": [
+      "Use Relentless Inception to solve this with maximum intelligence",
+      "Fuse independent frontier-model plans, then execute the strongest verified plan",
+      "Run an adversarial review gate on this implementation"
+    ],
+    "brandColor": "#5B21B6",
+    "screenshots": []
+  }
+}

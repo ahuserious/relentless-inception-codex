@@ -1,0 +1,22 @@
+# EXPERIMENTAL OPT-IN EXAMPLE — merge into user-level ~/.codex/config.toml.
+#
+# OpenRouter's Responses API is currently beta and stateless-only. A successful
+# text response does not prove that Codex's streamed tool continuation works.
+# Test the full tool loop on the installed Codex version before using this for a
+# native subagent. Otherwise keep OpenRouter models as external MCP panelists.
+
+[model_providers.openrouter_ri]
+name = "OpenRouter Responses (Relentless Inception)"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+env_key_instructions = "Set OPENROUTER_API_KEY in the environment that launches Codex."
+wire_api = "responses"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 3600000
+supports_websockets = false
+
+# Example selection for a custom agent configuration layer:
+# model_provider = "openrouter_ri"
+# model = "x-ai/grok-4.5"
+# model_reasoning_effort = "high"

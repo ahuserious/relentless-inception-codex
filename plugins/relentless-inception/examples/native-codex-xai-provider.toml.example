@@ -1,0 +1,27 @@
+# OPT-IN EXAMPLE — merge this table into user-level ~/.codex/config.toml.
+# Do not replace the whole file, and do not put this provider table in a
+# project-scoped .codex/config.toml; Codex ignores machine-local provider/auth
+# settings there.
+#
+# Set XAI_API_KEY in the environment that launches Codex. Never paste its value
+# into this file. After reloading Codex, smoke-test SSE streaming and a complete
+# two-turn function-call/output loop before relying on this provider.
+
+[model_providers.xai]
+name = "xAI Responses"
+base_url = "https://api.x.ai/v1"
+env_key = "XAI_API_KEY"
+env_key_instructions = "Set XAI_API_KEY in the environment that launches Codex."
+wire_api = "responses"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 3600000
+supports_websockets = false
+
+# Selecting this provider globally would change the active Codex session:
+# model_provider = "xai"
+# model = "grok-4.5"
+# model_reasoning_effort = "high"
+#
+# Prefer the separate read-only custom-agent example when Grok should be only
+# one reviewer in a larger Codex workflow.

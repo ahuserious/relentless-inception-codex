@@ -1,0 +1,10 @@
+# OPT-IN GLOBAL SUBAGENT LIMITS — merge into user-level ~/.codex/config.toml or
+# an appropriate trusted project configuration after reviewing existing values.
+# Keep max_depth = 1 unless recursive delegation is deliberately required; deeper
+# fan-out increases cost, latency, and the chance of uncontrolled task expansion.
+
+[agents]
+max_threads = 4
+max_depth = 1
+job_max_runtime_seconds = 1800
+interrupt_message = true

@@ -1,0 +1,658 @@
+{
+  "$schema": "../schemas/config.schema.json",
+  "schema_version": 1,
+  "secret_env_files": [],
+  "active_profile": "maximum_intelligence",
+  "providers": {
+    "xai_direct": {
+      "enabled": true,
+      "type": "xai_responses",
+      "base_url": "https://api.x.ai/v1",
+      "api_key_env": "XAI_API_KEY",
+      "store": false,
+      "prompt_cache_key_enabled": true,
+      "connect_timeout_seconds": 30,
+      "request_timeout_seconds": 900,
+      "max_retries": 2,
+      "max_concurrency": 2,
+      "retry_statuses": [408, 409, 429, 500, 502, 503, 504],
+      "capabilities": {
+        "tools": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "streaming": true
+      }
+    },
+    "openai_direct": {
+      "enabled": false,
+      "type": "openai_responses",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "store": false,
+      "connect_timeout_seconds": 30,
+      "request_timeout_seconds": 900,
+      "max_retries": 2,
+      "max_concurrency": 2,
+      "retry_statuses": [408, 409, 429, 500, 502, 503, 504],
+      "capabilities": {
+        "tools": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "streaming": true
+      }
+    },
+    "anthropic_direct": {
+      "enabled": false,
+      "type": "anthropic_messages",
+      "base_url": "https://api.anthropic.com/v1",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "connect_timeout_seconds": 30,
+      "request_timeout_seconds": 900,
+      "max_retries": 2,
+      "max_concurrency": 2,
+      "retry_statuses": [408, 409, 429, 500, 502, 503, 504],
+      "capabilities": {
+        "tools": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "streaming": true
+      }
+    },
+    "openrouter": {
+      "enabled": false,
+      "type": "openrouter_chat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "connect_timeout_seconds": 30,
+      "request_timeout_seconds": 900,
+      "max_retries": 2,
+      "max_concurrency": 2,
+      "retry_statuses": [408, 409, 429, 500, 502, 503, 504],
+      "router_metadata": true,
+      "provider_preferences": {
+        "allow_fallbacks": true,
+        "require_parameters": true,
+        "data_collection": "deny",
+        "zdr": true,
+        "enforce_distillable_text": false,
+        "order": [],
+        "only": [],
+        "ignore": [],
+        "quantizations": [],
+        "sort": {
+          "by": "throughput",
+          "partition": "none"
+        },
+        "preferred_min_throughput": null,
+        "preferred_max_latency": null,
+        "max_price": null
+      },
+      "capabilities": {
+        "tools": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "streaming": true
+      }
+    },
+    "openrouter_native_fusion": {
+      "enabled": false,
+      "type": "openrouter_fusion",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "connect_timeout_seconds": 30,
+      "request_timeout_seconds": 1800,
+      "max_retries": 1,
+      "max_concurrency": 1,
+      "retry_statuses": [408, 409, 429, 500, 502, 503, 504],
+      "router_metadata": true,
+      "provider_preferences": {
+        "allow_fallbacks": true,
+        "require_parameters": true,
+        "data_collection": "deny",
+        "zdr": true,
+        "enforce_distillable_text": false,
+        "order": [],
+        "only": [],
+        "ignore": [],
+        "quantizations": [],
+        "sort": {
+          "by": "throughput",
+          "partition": "none"
+        },
+        "preferred_min_throughput": null,
+        "preferred_max_latency": null,
+        "max_price": null
+      },
+      "capabilities": {
+        "tools": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "streaming": true
+      }
+    },
+    "trusted_router": {
+      "enabled": false,
+      "type": "openai_compatible_chat",
+      "base_url": "https://api-us-central1.quillrouter.com/v1",
+      "api_key_env": "TRUSTED_ROUTER_API_KEY",
+      "connect_timeout_seconds": 30,
+      "request_timeout_seconds": 900,
+      "max_retries": 2,
+      "max_concurrency": 2,
+      "retry_statuses": [408, 409, 429, 500, 502, 503, 504],
+      "capabilities": {
+        "tools": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "streaming": true
+      }
+    }
+  },
+  "seats": {
+    "grok45_researcher": {
+      "enabled": true,
+      "provider": "xai_direct",
+      "model": "grok-4.5",
+      "role": "panel",
+      "persona": "Evidence-first researcher. Produce a complete independent solution, use tools when useful, state uncertainty, and surface source-backed minority findings.",
+      "context_bundle": "full_task_and_evidence",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 32768,
+      "temperature": null,
+      "timeout_seconds": 900,
+      "tool_policy": "provider_server_tools",
+      "server_tools": ["web_search", "x_search", "code_interpreter"],
+      "first_tool_required": false,
+      "structured_output": "panel_report",
+      "allow_model_fallbacks": false,
+      "fallback_models": ["grok-4.3"],
+      "fallback_seats": ["grok43_constraint_auditor"],
+      "pricing": {
+        "input_per_million_usd": 2.0,
+        "cached_input_per_million_usd": 0.3,
+        "output_per_million_usd": 6.0,
+        "base_rate_input_limit_tokens": 200000,
+        "above_base_rate_behavior": "unknown_cost_fail_closed"
+      }
+    },
+    "grok45_adversary": {
+      "enabled": true,
+      "provider": "xai_direct",
+      "model": "grok-4.5",
+      "role": "panel",
+      "persona": "Adversarial falsifier. Seek counterexamples, hidden assumptions, prompt-injection attempts, unsafe execution, and plausible ways the leading answer could fail.",
+      "context_bundle": "requirements_risks_and_counterexamples",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 32768,
+      "temperature": null,
+      "timeout_seconds": 900,
+      "tool_policy": "provider_server_tools",
+      "server_tools": ["web_search", "x_search"],
+      "first_tool_required": false,
+      "structured_output": "panel_report",
+      "allow_model_fallbacks": false,
+      "fallback_models": ["grok-4.3"],
+      "fallback_seats": ["grok43_constraint_auditor"],
+      "pricing": {
+        "input_per_million_usd": 2.0,
+        "cached_input_per_million_usd": 0.3,
+        "output_per_million_usd": 6.0,
+        "base_rate_input_limit_tokens": 200000,
+        "above_base_rate_behavior": "unknown_cost_fail_closed"
+      }
+    },
+    "grok43_constraint_auditor": {
+      "enabled": true,
+      "provider": "xai_direct",
+      "model": "grok-4.3",
+      "role": "panel",
+      "persona": "Constraint auditor. Trace every stated requirement to evidence, identify omissions and contradictions, and independently verify mechanical claims.",
+      "context_bundle": "requirements_and_mechanical_evidence",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 24576,
+      "temperature": null,
+      "timeout_seconds": 900,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "panel_report",
+      "allow_model_fallbacks": false,
+      "fallback_models": [],
+      "fallback_seats": ["grok45_adversary"],
+      "pricing": {
+        "input_per_million_usd": 1.25,
+        "cached_input_per_million_usd": 0.2,
+        "output_per_million_usd": 2.5,
+        "base_rate_input_limit_tokens": null,
+        "above_base_rate_behavior": "use_base_rate"
+      }
+    },
+    "grok43_judge": {
+      "enabled": true,
+      "provider": "xai_direct",
+      "model": "grok-4.3",
+      "role": "judge",
+      "persona": "Anonymous comparative judge. Diagnose agreement, contradictions, coverage, and blind spots without writing the final answer or deciding by vote.",
+      "context_bundle": "anonymous_panel_and_checks",
+      "reasoning_effort": "low",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 8192,
+      "temperature": null,
+      "timeout_seconds": 300,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "judge_analysis",
+      "allow_model_fallbacks": false,
+      "fallback_models": [],
+      "fallback_seats": [],
+      "pricing": {
+        "input_per_million_usd": 1.25,
+        "cached_input_per_million_usd": 0.2,
+        "output_per_million_usd": 2.5,
+        "base_rate_input_limit_tokens": null,
+        "above_base_rate_behavior": "use_base_rate"
+      }
+    },
+    "grok45_synthesizer": {
+      "enabled": true,
+      "provider": "xai_direct",
+      "model": "grok-4.5",
+      "role": "synthesizer",
+      "persona": "Strongest synthesis seat. Produce a new answer from raw panel evidence and judge guidance, resolve contradictions, and retain supported lone-minority findings.",
+      "context_bundle": "original_task_raw_panel_checks_and_judge",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 49152,
+      "temperature": null,
+      "timeout_seconds": 1200,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "final_answer",
+      "allow_model_fallbacks": false,
+      "fallback_models": ["grok-4.3"],
+      "fallback_seats": [],
+      "pricing": {
+        "input_per_million_usd": 2.0,
+        "cached_input_per_million_usd": 0.3,
+        "output_per_million_usd": 6.0,
+        "base_rate_input_limit_tokens": 200000,
+        "above_base_rate_behavior": "unknown_cost_fail_closed"
+      }
+    },
+    "grok45_verifier": {
+      "enabled": true,
+      "provider": "xai_direct",
+      "model": "grok-4.5",
+      "role": "verifier",
+      "persona": "Independent release gate. Check the fused answer or execution evidence against the original requirements and reject unsupported claims or unverified changes.",
+      "context_bundle": "original_task_fused_output_diff_and_evidence",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 24576,
+      "temperature": null,
+      "timeout_seconds": 900,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "gate_verdict",
+      "allow_model_fallbacks": false,
+      "fallback_models": ["grok-4.3"],
+      "fallback_seats": ["grok43_constraint_auditor"],
+      "pricing": {
+        "input_per_million_usd": 2.0,
+        "cached_input_per_million_usd": 0.3,
+        "output_per_million_usd": 6.0,
+        "base_rate_input_limit_tokens": 200000,
+        "above_base_rate_behavior": "unknown_cost_fail_closed"
+      }
+    },
+    "openrouter_sol_pro_panel": {
+      "enabled": false,
+      "provider": "openrouter",
+      "model": "openai/gpt-5.6-sol-pro",
+      "role": "panel",
+      "persona": "Independent frontier coding and reasoning expert. Solve the whole task, inspect edge cases, and distinguish evidence, inference, and uncertainty.",
+      "context_bundle": "full_task_and_evidence",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 32768,
+      "temperature": null,
+      "timeout_seconds": 900,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "panel_report",
+      "allow_model_fallbacks": false,
+      "fallback_models": ["openai/gpt-5.6-sol"],
+      "fallback_seats": []
+    },
+    "openrouter_opus47_panel": {
+      "enabled": false,
+      "provider": "openrouter",
+      "model": "anthropic/claude-opus-4.7",
+      "role": "panel",
+      "persona": "Independent frontier synthesis critic. Develop an alternative solution path and aggressively inspect conceptual gaps and unsupported assumptions.",
+      "context_bundle": "full_task_and_evidence",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 32768,
+      "temperature": null,
+      "timeout_seconds": 900,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "panel_report",
+      "allow_model_fallbacks": false,
+      "fallback_models": ["openai/gpt-5.6-sol"],
+      "fallback_seats": []
+    },
+    "trusted_router_frontier_panel": {
+      "enabled": false,
+      "provider": "trusted_router",
+      "model": "z-ai/glm-5.2",
+      "role": "panel",
+      "persona": "Independent routed-model expert. Seek an alternative solution path and preserve evidence that disagrees with the leading answer.",
+      "context_bundle": "full_task_and_evidence",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 32768,
+      "temperature": null,
+      "timeout_seconds": 900,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "panel_report",
+      "allow_model_fallbacks": false,
+      "fallback_models": ["moonshotai/kimi-k2.6", "deepseek/deepseek-v4-pro"],
+      "fallback_seats": []
+    },
+    "openrouter_native_fusion_seat": {
+      "enabled": true,
+      "provider": "openrouter_native_fusion",
+      "model": "openrouter/fusion",
+      "role": "synthesizer",
+      "persona": "OpenRouter-managed Fusion fast path. Return the final visible answer while preserving supported minority evidence.",
+      "context_bundle": "full_task_and_evidence",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "max_output_tokens": 49152,
+      "temperature": null,
+      "timeout_seconds": 1800,
+      "tool_policy": "none",
+      "server_tools": [],
+      "first_tool_required": false,
+      "structured_output": "final_answer",
+      "allow_model_fallbacks": false,
+      "fallback_models": [],
+      "fallback_seats": [],
+      "fusion": {
+        "preset": "general-high",
+        "analysis_models": [
+          "x-ai/grok-4.5",
+          "openai/gpt-5.6-sol-pro",
+          "anthropic/claude-opus-4.7"
+        ],
+        "model": "anthropic/claude-opus-4.7",
+        "max_tool_calls": 16,
+        "max_completion_tokens": 49152,
+        "reasoning": {
+          "effort": "high",
+          "max_tokens": null,
+          "exclude": false
+        },
+        "temperature": 1.0
+      }
+    }
+  },
+  "native_codex": {
+    "enabled": true,
+    "mode": "host_handoff",
+    "executor_model": "gpt-5.6-sol",
+    "executor_reasoning_effort": "xhigh",
+    "reviewer_models": ["gpt-5.6-sol", "gpt-5.6-terra"],
+    "reviewer_reasoning_effort": "xhigh",
+    "max_parallel_agents": 3,
+    "inherit_workspace_context": true,
+    "require_fusion_before_execution": true,
+    "require_gate_after_execution": true
+  },
+  "profiles": {
+    "maximum_intelligence": {
+      "display_name": "Maximum intelligence",
+      "description": "High-effort direct Grok deliberation with generative synthesis, fail-closed verification, and a host-managed Codex execution handoff.",
+      "fusion": {
+        "engine": "client_orchestrated",
+        "panel": [
+          "grok45_researcher",
+          "grok45_adversary",
+          "grok43_constraint_auditor"
+        ],
+        "optional_panel": [
+          "openrouter_sol_pro_panel",
+          "openrouter_opus47_panel",
+          "trusted_router_frontier_panel"
+        ],
+        "judge": "grok43_judge",
+        "synthesizer": "grok45_synthesizer",
+        "native_fusion_seat": "openrouter_native_fusion_seat",
+        "min_live_seats": 2,
+        "max_panel_seats": 5,
+        "max_concurrency": 2,
+        "allow_degradation": false,
+        "independent_first_pass": true,
+        "anonymize_model_identity": true,
+        "randomize_panel_order": true,
+        "partition_context": true,
+        "preserve_initial_responses": true,
+        "prohibit_majority_vote": true,
+        "preserve_minority_findings": true,
+        "raw_panel_is_primary_evidence": true,
+        "separate_no_tools_synthesis_turn": true,
+        "judge_required_fields": [
+          "consensus",
+          "contradictions",
+          "partial_coverage",
+          "unique_insights",
+          "minority_findings",
+          "blind_spots",
+          "final_guidance"
+        ],
+        "quality_floor": {
+          "minimum_characters": 200,
+          "require_nonempty_claims": true,
+          "reject_tool_markup": true,
+          "reject_refusal_without_policy_reason": true
+        },
+        "adaptive_escalation": {
+          "enabled": true,
+          "max_rounds": 2,
+          "triggers": [
+            "panel_collapse",
+            "unresolved_contradictions",
+            "blind_spots",
+            "schema_invalid",
+            "empty_response",
+            "mechanical_check_failed"
+          ],
+          "strategy": "targeted_specialist_then_stronger_synthesizer",
+          "never_repeat_open_ended_debate": true
+        },
+        "native_openrouter_fusion": {
+          "enabled": false,
+          "provider": "openrouter_native_fusion",
+          "router_model": "openrouter/fusion",
+          "preset": "general-high",
+          "analysis_models": [
+            "x-ai/grok-4.5",
+            "openai/gpt-5.6-sol-pro",
+            "anthropic/claude-opus-4.7"
+          ],
+          "judge_model": "anthropic/claude-opus-4.7",
+          "max_tool_calls": 16,
+          "max_completion_tokens": 49152,
+          "reasoning": {
+            "effort": "high",
+            "max_tokens": null,
+            "exclude": false
+          },
+          "panel_temperature": 1.0,
+          "tool_choice": "required",
+          "fallback_to_client_orchestrated": true
+        }
+      },
+      "gates": {
+        "enabled": true,
+        "fail_closed": true,
+        "reviewers": ["grok45_verifier", "grok43_constraint_auditor"],
+        "required_passes": 2,
+        "allowed_verdicts": ["PASS", "NEEDS_WORK", "FAIL"],
+        "mechanical_failure_is_blocking": true,
+        "blind_spot_requires_targeted_review": true,
+        "schema_failure_is_blocking": true,
+        "exclude_artifact_author": true,
+        "require_independent_amendment": true,
+        "max_revision_cycles": 2,
+        "stages": {
+          "plan": {
+            "enabled": true,
+            "timeout_seconds": 900,
+            "tool_policy": "none",
+            "required_evidence": ["requirements_trace", "risk_analysis"]
+          },
+          "pre_execution": {
+            "enabled": true,
+            "timeout_seconds": 900,
+            "tool_policy": "none",
+            "required_evidence": ["approved_fused_plan", "scope_boundaries"]
+          },
+          "post_execution": {
+            "enabled": true,
+            "timeout_seconds": 1200,
+            "tool_policy": "none",
+            "required_evidence": ["diff", "tests", "requirement_coverage"]
+          },
+          "final": {
+            "enabled": true,
+            "timeout_seconds": 900,
+            "tool_policy": "none",
+            "required_evidence": ["gate_verdict", "cost_ledger", "provenance"]
+          },
+          "summarize": {
+            "enabled": true,
+            "timeout_seconds": 600,
+            "tool_policy": "none",
+            "required_evidence": ["decisions", "open_risks", "verification_state"]
+          }
+        }
+      },
+      "budgets": {
+        "enforcement": "hard_stop",
+        "max_calls": 40,
+        "max_total_tokens": 2000000,
+        "max_input_tokens": 1200000,
+        "max_output_tokens": 400000,
+        "max_reasoning_tokens": 400000,
+        "max_tool_calls": 64,
+        "max_wall_seconds": 7200,
+        "max_cost_usd": 100.0,
+        "approval_threshold_usd": 25.0,
+        "warning_fraction": 0.8,
+        "reserve_fraction_for_synthesis_and_gates": 0.3,
+        "per_provider_max_cost_usd": {
+          "xai_direct": 75.0,
+          "openrouter": 50.0,
+          "openrouter_native_fusion": 50.0,
+          "trusted_router": 50.0
+        }
+      },
+      "privacy": {
+        "external_provider_access": "allow_with_redaction",
+        "sensitive_path_policy": "require_user_approval",
+        "sensitive_value_redaction": true,
+        "redact_environment_values": true,
+        "redact_git_credentials": true,
+        "prompt_injection_fencing": true,
+        "treat_artifacts_as_untrusted_data": true,
+        "persist_raw_prompts": false,
+        "persist_raw_responses": true,
+        "persist_reasoning": false,
+        "persist_metadata_and_hashes": true,
+        "allow_provider_training": false,
+        "require_zero_data_retention_when_available": true,
+        "path_allowlist": [],
+        "path_denylist": [".env", ".env.*", "**/*credentials*", "**/*private_key*", "**/.ssh/**"]
+      },
+      "evidence": {
+        "require_claim_evidence": true,
+        "require_primary_sources_when_available": true,
+        "verify_citations": true,
+        "require_mechanical_checks_for_code": true,
+        "record_commands_and_exit_codes": true,
+        "record_test_output": true,
+        "hash_inputs_and_outputs": true,
+        "preserve_raw_panel_for_synthesizer": true,
+        "preserve_supported_minority": true,
+        "accept_self_reported_confidence": false,
+        "minimum_live_sources": 2,
+        "on_unverifiable_claim": "mark_uncertain"
+      },
+      "rescue": {
+        "enabled": true,
+        "retry_attempts": 2,
+        "backoff_initial_seconds": 2.0,
+        "backoff_max_seconds": 30.0,
+        "jitter": true,
+        "semantic_failure_detection": true,
+        "retry_on": ["timeout", "rate_limit", "server_error", "connection_error"],
+        "fallback_on": ["empty_response", "schema_invalid", "unsupported_parameters", "policy_refusal", "tool_failure"],
+        "circuit_breaker_failures": 3,
+        "circuit_breaker_reset_seconds": 300,
+        "panel_collapse_action": "fail_closed_and_escalate",
+        "fusion_failure_action": "stronger_synthesizer_then_human",
+        "budget_exhausted_action": "stop_and_report",
+        "preserve_failed_attempts": true,
+        "allow_degraded_single_provider": false,
+        "allow_single_live_seat": false,
+        "human_handoff_after_failures": 3
+      },
+      "execution": {
+        "enabled": true,
+        "mode": "codex_handoff",
+        "remote_models_may_write_workspace": false,
+        "require_fused_plan": true,
+        "require_pre_execution_gate": true,
+        "require_post_execution_gate": true,
+        "require_user_approval_for_destructive_actions": true,
+        "require_user_approval_for_external_writes": true,
+        "preserve_unrelated_changes": true,
+        "workspace_scope": "user_requested_only",
+        "sandbox_mode": "workspace_write",
+        "run_tests": true,
+        "require_diff_review": true,
+        "max_fix_cycles": 2,
+        "stop_on_test_failure": false,
+        "handoff_include": ["fused_plan", "constraints", "minority_findings", "required_checks", "budget_remaining"],
+        "completion_requires": ["requested_change", "verification_evidence", "post_execution_pass"]
+      },
+      "observability": {
+        "enabled": true,
+        "artifact_directory": ".relentless-inception/runs",
+        "write_jsonl_ledger": true,
+        "record_provider_and_model": true,
+        "record_requested_and_actual_model": true,
+        "record_route_metadata": true,
+        "record_usage_and_cost": true,
+        "record_latency": true,
+        "record_fallbacks": true,
+        "record_schema_validation": true,
+        "reconcile_usage_by_generation_id": true,
+        "content_logging": "metadata_only"
+      }
+    }
+  }
+}

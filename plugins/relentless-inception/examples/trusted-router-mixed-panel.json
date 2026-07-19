@@ -1,0 +1,52 @@
+{
+  "active_profile": "maximum_intelligence",
+  "providers": {
+    "xai_direct": {
+      "enabled": true,
+      "api_key_env": "XAI_API_KEY"
+    },
+    "trusted_router": {
+      "enabled": true,
+      "base_url": "https://api-us-central1.quillrouter.com/v1",
+      "api_key_env": "TRUSTED_ROUTER_API_KEY",
+      "max_concurrency": 2
+    }
+  },
+  "seats": {
+    "trusted_router_frontier_panel": {
+      "enabled": true,
+      "provider": "trusted_router",
+      "model": "z-ai/glm-5.2",
+      "reasoning_effort": "high",
+      "fallback_models": [
+        "moonshotai/kimi-k2.6",
+        "deepseek/deepseek-v4-pro"
+      ]
+    }
+  },
+  "profiles": {
+    "maximum_intelligence": {
+      "fusion": {
+        "engine": "client_orchestrated",
+        "panel": [
+          "grok45_researcher",
+          "grok45_adversary",
+          "trusted_router_frontier_panel"
+        ],
+        "optional_panel": [],
+        "judge": "grok43_judge",
+        "synthesizer": "grok45_synthesizer",
+        "min_live_seats": 3,
+        "max_concurrency": 2
+      },
+      "budgets": {
+        "max_cost_usd": 100.0,
+        "approval_threshold_usd": 25.0,
+        "per_provider_max_cost_usd": {
+          "xai_direct": 60.0,
+          "trusted_router": 60.0
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "active_profile": "maximum_intelligence",
+  "providers": {
+    "xai_direct": {
+      "enabled": true,
+      "api_key_env": "XAI_API_KEY",
+      "store": false,
+      "max_concurrency": 2
+    },
+    "openai_direct": {
+      "enabled": false
+    },
+    "anthropic_direct": {
+      "enabled": false
+    },
+    "openrouter": {
+      "enabled": false
+    },
+    "openrouter_native_fusion": {
+      "enabled": false
+    },
+    "trusted_router": {
+      "enabled": false
+    }
+  },
+  "profiles": {
+    "maximum_intelligence": {
+      "fusion": {
+        "engine": "client_orchestrated",
+        "panel": [
+          "grok45_researcher",
+          "grok45_adversary",
+          "grok43_constraint_auditor"
+        ],
+        "optional_panel": [],
+        "judge": "grok43_judge",
+        "synthesizer": "grok45_synthesizer",
+        "min_live_seats": 2,
+        "max_concurrency": 2,
+        "native_openrouter_fusion": {
+          "enabled": false
+        }
+      },
+      "budgets": {
+        "max_cost_usd": 50.0,
+        "approval_threshold_usd": 15.0,
+        "per_provider_max_cost_usd": {
+          "xai_direct": 50.0
+        }
+      }
+    }
+  }
+}

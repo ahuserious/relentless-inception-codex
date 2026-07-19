@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "artifact_sha256", "summary", "blocking_findings", "non_blocking_findings", "evidence", "required_actions"],
+  "properties": {
+    "verdict": {"enum": ["PASS", "FAIL", "NEEDS_WORK"]},
+    "artifact_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "summary": {"type": "string"},
+    "blocking_findings": {"type": "array", "items": {"type": "string"}},
+    "non_blocking_findings": {"type": "array", "items": {"type": "string"}},
+    "evidence": {"type": "array", "items": {"type": "string"}},
+    "required_actions": {"type": "array", "items": {"type": "string"}}
+  }
+}

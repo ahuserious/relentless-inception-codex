@@ -1,0 +1,23 @@
+# TEMPLATE — replace the example hostname and environment-variable names, then
+# merge this table into user-level ~/.codex/config.toml.
+#
+# Native Codex use requires an OpenAI-compatible Responses API, SSE events, and
+# multi-turn function-call/output continuation. Chat-Completions compatibility
+# alone is enough for an external plugin panelist but not for a native Codex
+# provider. Verify TLS, retention, upstream fallback, and actual-model metadata.
+
+[model_providers.trusted_router_ri]
+name = "Trusted Router Responses (Relentless Inception)"
+base_url = "https://trusted-router.example/v1"
+env_key = "TRUSTED_ROUTER_API_KEY"
+env_key_instructions = "Set TRUSTED_ROUTER_API_KEY in the environment that launches Codex."
+wire_api = "responses"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 3600000
+supports_websockets = false
+
+# Optional environment-backed request header. The value of
+# TRUSTED_ROUTER_TENANT_ID is read at runtime and is not stored here.
+[model_providers.trusted_router_ri.env_http_headers]
+"X-Tenant-ID" = "TRUSTED_ROUTER_TENANT_ID"
