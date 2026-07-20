@@ -62,17 +62,19 @@ The required client-orchestrated path is:
 |---|---|---|---|---|
 | Panel | `grok45_researcher` | xAI direct `grok-4.5` | high | xAI-hosted `web_search`, `x_search`, `code_interpreter` |
 | Panel | `grok45_adversary` | xAI direct `grok-4.5` | high | xAI-hosted `web_search`, `x_search` |
-| Panel | `grok43_constraint_auditor` | xAI direct `grok-4.3` | high | none |
-| Judge | `grok43_judge` | xAI direct `grok-4.3` | low | none |
+| Panel | `grok45_constraint_auditor` | xAI direct `grok-4.5` | high | none |
+| Judge | `grok45_judge` | xAI direct `grok-4.5` | high | none |
 | Synthesizer | `grok45_synthesizer` | xAI direct `grok-4.5` | high | none |
 | Gate | `grok45_verifier` plus constraint auditor | xAI direct | high | none |
 
 Provider-hosted server tools are not Codex tools. They cannot read the local workspace, run repository tests, use MCP/connectors, or mutate files. The active Codex session must gather local evidence such as diffs and test output and supply that bounded evidence to external seats. Judge, synthesizer, and gate calls remain tool-less by default so their outputs are based on the exact supplied artifact.
 
-Two optional OpenRouter panel seats use current catalog IDs:
+Optional routed seats remain disabled until the user supplies and enables their provider. The shipped OpenRouter Sol seat uses:
 
-- `openai/gpt-5.6-sol-pro`, with `openai/gpt-5.6-sol` available only as an explicitly enabled fallback;
-- `anthropic/claude-opus-4.7`, with a recorded Sol fallback that is also disabled by default.
+- `openai/gpt-5.6-sol`, with no weaker automatic model fallback.
+
+Other model/provider combinations, including the displayed Claude and TrustedRouter examples, remain configurable but are not active defaults.
+The compatibility seat key remains `openrouter_sol_pro_panel` so existing private overrides do not become orphaned; its shipped model is exact `openai/gpt-5.6-sol`.
 
 They are included only after both the seat and `openrouter` provider are enabled. `max_panel_seats: 5` bounds fan-out, so the first two enabled optional seats join the three required xAI seats. The TrustedRouter seat is demonstrated in a separate mixed-panel example because all three optional seats cannot fit simultaneously under that cap.
 
@@ -82,7 +84,7 @@ Every provider has an independent enable flag, base URL, credential environment 
 
 | Type | Protocol | Intended use |
 |---|---|---|
-| `xai_responses` | xAI Responses | Direct Grok 4.5/4.3 seats and xAI server tools |
+| `xai_responses` | xAI Responses | Direct Grok 4.5 seats and xAI server tools |
 | `openai_responses` | OpenAI Responses | Direct OpenAI models |
 | `anthropic_messages` | Anthropic Messages | Direct Claude models |
 | `openai_compatible_chat` | Chat Completions-compatible | TrustedRouter, a private gateway, or another compatible provider |
@@ -192,7 +194,7 @@ The default keeps native Fusion disabled. Enabling it requires:
 - `fusion.engine: "openrouter_native"`;
 - `fusion.native_fusion_seat: "openrouter_native_fusion_seat"`.
 
-The current example uses `x-ai/grok-4.5`, `openai/gpt-5.6-sol-pro`, and `anthropic/claude-opus-4.7`, with Opus 4.7 as the comparative model. Verify every ID with `provider_models`; catalog IDs are temporal.
+The shipped native-Fusion default uses `x-ai/grok-4.5` and `openai/gpt-5.6-sol`, with GPT-5.6 Sol as the comparative model. The separate example demonstrates how to configure other frontier models. Verify every routed ID with `provider_models`; catalog IDs are temporal.
 
 OpenRouter's current Fusion parameters live inside the seat's `fusion` object: `analysis_models`, comparative `model`, `preset`, `max_tool_calls`, `max_completion_tokens`, `reasoning`, and panel `temperature`. Legacy top-level `reasoning_effort`/temperature examples for the Fusion plugin are stale.
 
@@ -264,7 +266,7 @@ External API seats are data egress. The default:
 
 Raw visible provider responses **are persisted locally** because the synthesizer needs the original evidence, gates bind to the exact artifact, and crash resume must not silently re-run costly calls. They live only under the private plugin run directory: directories are mode `0700`, files are mode `0600`. Ordinary observability logging remains `metadata_only`; the private response artifact is a separate required run-state object. Provider retention is independent and governed by provider policy.
 
-The 0.1.1 runtime accepts only internal budget-ledger snapshot schema v3. Each cached model result must carry a receipt that binds its hashed prompt invocation, reserved attempt, complete visible response, private raw-response artifact, and exact ledger entry. Synthesis artifacts also identify their orchestration mode and author seat. Pre-0.1.1 run directories remain preserved, but cannot be resumed or safely migrated; start the work again with a new run ID. This internal ledger version does not change the user configuration's required `schema_version: 1`. The [architecture compatibility note](ARCHITECTURE.md#run-state-compatibility) explains the fail-closed boundary.
+The 0.1.4 runtime accepts only internal budget-ledger snapshot schema v3. Each cached model result must carry a receipt that binds its hashed prompt invocation, reserved attempt, complete visible response, private raw-response artifact, and exact ledger entry. Synthesis artifacts also identify their orchestration mode and author seat. Pre-0.1.1 run directories remain preserved, but cannot be resumed or safely migrated; incomplete 0.1.1 crash and native-fallback artifacts may also be rejected by the stricter current validation. Start that work again with a new run ID. This internal ledger version does not change the user configuration's required `schema_version: 1`. The [architecture compatibility note](ARCHITECTURE.md#run-state-compatibility) explains the fail-closed boundary.
 
 Do not select a metadata-only/non-resumable response mode until the runtime explicitly implements one. Deleting local run state does not delete provider logs.
 

@@ -307,6 +307,28 @@ class ExecutionHandoffTests(unittest.TestCase):
                 expected_payload_sha256=handoff["handoff_payload_sha256"],
             )
 
+    def test_handoff_schema_version_rejects_bool_and_float(self) -> None:
+        execution = _execution_config()
+        handoff = build_handoff(
+            "Plan",
+            "run-strict-schema",
+            {"passed": True, "artifact_sha256": "e" * 64},
+            execution,
+            gates=_gates_config(),
+        )
+        for invalid_schema_version in (True, 2.0):
+            with self.subTest(schema_version=invalid_schema_version):
+                candidate = copy.deepcopy(handoff)
+                candidate["schema_version"] = invalid_schema_version
+                candidate["handoff_payload_sha256"] = execution_module._handoff_payload_hash(
+                    candidate
+                )
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    "Unsupported execution handoff schema_version",
+                ):
+                    persisted_execution_contract(candidate)
+
     def test_execute_handoff_dispatch_does_not_load_current_profile(self) -> None:
         execution = _execution_config(
             mode="codex_cli",

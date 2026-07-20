@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import concurrent.futures
+import errno
 import json
 import multiprocessing
 import os
@@ -14,6 +15,7 @@ from unittest import mock
 from tests.support import PLUGIN_ROOT  # noqa: F401  (adds the plugin package to sys.path)
 
 from relentless_inception.errors import BudgetExceeded, ConfigError
+from relentless_inception import state as state_module
 from relentless_inception.state import (
     BudgetTracker,
     RunStore,
@@ -311,6 +313,107 @@ class BudgetTrackerTests(unittest.TestCase):
                 response_sha256=response_sha256,
                 response_artifact=f"responses/{entry_id}.json",
             )
+
+    def test_record_rejects_invalid_response_envelope_without_mutating_accounting(self) -> None:
+        invalid_responses = (
+            ModelResponse(
+                text="invalid latency",
+                provider="test_provider",
+                requested_model="requested",
+                actual_model="actual",
+                usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.1),
+                latency_seconds=float("nan"),
+            ),
+            ModelResponse(
+                text="invalid route",
+                provider="test_provider",
+                requested_model="requested",
+                actual_model="actual",
+                usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.1),
+                route={"not_json": object()},
+            ),
+        )
+        for invalid_response in invalid_responses:
+            with self.subTest(response_text=invalid_response.text):
+                tracker = BudgetTracker(budget_config())
+                tracker.reserve_attempt("panel", "envelope-seat")
+                before = tracker.snapshot()
+
+                with self.assertRaises(ConfigError):
+                    tracker.record("panel", "envelope-seat", invalid_response)
+
+                after = tracker.snapshot()
+                before.pop("wall_seconds")
+                after.pop("wall_seconds")
+                self.assertEqual(after, before)
+
+    def test_record_and_snapshot_detach_mutable_response_containers(self) -> None:
+        tracker = BudgetTracker(budget_config())
+        tracker.reserve_attempt("panel", "detached-seat")
+        model_response = response(
+            usage=Usage(input_tokens=1, output_tokens=1, cost_usd=0.1)
+        )
+        model_response.route = {"nested": {"models": ["original"]}}
+        tracker.record("panel", "detached-seat", model_response)
+
+        model_response.route["nested"]["models"].append("caller-mutation")
+        first_snapshot = tracker.snapshot()
+        self.assertEqual(
+            first_snapshot["entries"][0]["route"]["nested"]["models"],
+            ["original"],
+        )
+        first_snapshot["entries"][0]["route"]["nested"]["models"].append(
+            "snapshot-mutation"
+        )
+        self.assertEqual(
+            tracker.snapshot()["entries"][0]["route"]["nested"]["models"],
+            ["original"],
+        )
+
+    def test_receipt_schema_versions_reject_bool_and_float(self) -> None:
+        source = BudgetTracker(budget_config())
+        valid_snapshot = source.snapshot()
+        for invalid_schema_version in (True, 3.0):
+            with self.subTest(schema_version=invalid_schema_version):
+                candidate = copy.deepcopy(valid_snapshot)
+                candidate["schema_version"] = invalid_schema_version
+                with self.assertRaisesRegex(ConfigError, "Unsupported budget snapshot schema"):
+                    BudgetTracker(budget_config()).restore(candidate)
+
+    def test_atomic_json_fsyncs_parent_directory_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch.object(
+            state_module.os,
+            "fsync",
+            wraps=os.fsync,
+        ) as fsync:
+            state_module._atomic_json(
+                Path(temporary_directory) / "atomic.json",
+                {"persisted": True},
+            )
+
+        self.assertGreaterEqual(fsync.call_count, 2)
+
+    def test_atomic_json_propagates_parent_directory_fsync_eio(self) -> None:
+        real_fsync = os.fsync
+        fsync_calls = 0
+
+        def fail_parent_fsync(descriptor: int) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError(errno.EIO, "synthetic directory fsync failure")
+            real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch.object(
+            state_module.os,
+            "fsync",
+            side_effect=fail_parent_fsync,
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic directory fsync failure"):
+                state_module._atomic_json(
+                    Path(temporary_directory) / "atomic.json",
+                    {"persisted": True},
+                )
 
     def test_restore_rejects_tampered_attempt_and_response_receipts(self) -> None:
         source = BudgetTracker(budget_config())

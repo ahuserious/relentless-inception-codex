@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
 import stat
@@ -20,6 +21,9 @@ from relentless_inception.config import (
     validate_config,
 )
 from relentless_inception.errors import ConfigError
+from relentless_inception import config as config_module
+from relentless_inception import execution as execution_module
+from relentless_inception.state import canonical_json_hash
 
 
 class ConfigTests(unittest.TestCase):
@@ -70,6 +74,24 @@ class ConfigTests(unittest.TestCase):
         same_shape_different_secrets["nested"]["password"] = "different-password"
         self.assertEqual(canonical_hash(unsafe), canonical_hash(same_shape_different_secrets))
 
+    def test_all_integrity_hashes_reject_nonfinite_json_numbers(self) -> None:
+        nonfinite_payload = {"value": float("nan")}
+        hash_functions = (
+            canonical_hash,
+            canonical_json_hash,
+            execution_module._contract_hash,
+            execution_module._handoff_payload_hash,
+        )
+        for hash_function in hash_functions:
+            with self.subTest(hash_function=hash_function.__name__):
+                with self.assertRaises(ConfigError):
+                    hash_function(nonfinite_payload)
+
+        self.assertEqual(
+            canonical_hash({"api_key": float("nan")}),
+            canonical_hash({"api_key": "redacted-before-hashing"}),
+        )
+
     def test_validation_and_user_override_reject_plaintext_secrets(self) -> None:
         config = load_config(include_user=False)
         config["providers"]["xai_direct"]["api_key"] = "must-not-be-stored"
@@ -85,12 +107,112 @@ class ConfigTests(unittest.TestCase):
             set_user_config("providers.xai_direct.api_key", "must-not-be-stored")
         self.assertFalse(self.user_config_path.exists())
 
+    def test_config_schema_version_rejects_bool_and_float(self) -> None:
+        for invalid_schema_version in (True, 1.0):
+            with self.subTest(schema_version=invalid_schema_version):
+                config = load_config(include_user=False)
+                config["schema_version"] = invalid_schema_version
+                errors = validate_config(config)
+                self.assertIn("schema_version must be 1", errors)
+
+    def test_schema_validation_rejects_nonfinite_numbers_and_noninteger_counts(self) -> None:
+        for invalid_number in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(number=invalid_number):
+                config = load_config(include_user=False)
+                config["profiles"]["maximum_intelligence"]["budgets"]["max_cost_usd"] = invalid_number
+                errors = validate_config(config)
+                self.assertTrue(
+                    any("max_cost_usd must have JSON type number" in error for error in errors),
+                    errors,
+                )
+
+        for invalid_integer in (True, 40.0):
+            with self.subTest(integer=invalid_integer):
+                config = load_config(include_user=False)
+                config["profiles"]["maximum_intelligence"]["budgets"]["max_calls"] = invalid_integer
+                errors = validate_config(config)
+                self.assertTrue(
+                    any("max_calls must have JSON type integer" in error for error in errors),
+                    errors,
+                )
+
+    def test_load_config_rejects_nonfinite_json_constants_and_overflow(self) -> None:
+        for invalid_json_number in ("NaN", "Infinity", "-Infinity", "1e999"):
+            with self.subTest(value=invalid_json_number):
+                self.user_config_path.write_text(
+                    '{"profiles":{"maximum_intelligence":{"budgets":{"max_cost_usd":'
+                    + invalid_json_number
+                    + "}}}}",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ConfigError, "non-finite numeric"):
+                    load_config()
+
+    def test_nonfinite_user_override_is_not_persisted_or_partially_written(self) -> None:
+        for invalid_number in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(number=invalid_number):
+                with self.assertRaisesRegex(ConfigError, "max_cost_usd must have JSON type number"):
+                    set_user_config(
+                        "profiles.maximum_intelligence.budgets.max_cost_usd",
+                        invalid_number,
+                    )
+                self.assertFalse(self.user_config_path.exists())
+
+        stable_contents = '{"stable":true}\n'
+        self.user_config_path.write_text(stable_contents, encoding="utf-8")
+        with self.assertRaisesRegex(ConfigError, "valid canonical JSON"):
+            config_module._atomic_write_json(
+                self.user_config_path,
+                {"value": float("nan")},
+            )
+        self.assertEqual(self.user_config_path.read_text(encoding="utf-8"), stable_contents)
+        self.assertEqual(list(self.user_config_path.parent.glob(".user-config.json.*.tmp")), [])
+
+    def test_provider_base_urls_reject_credentials_query_and_fragment(self) -> None:
+        invalid_base_urls = {
+            "embedded credentials": "https://user:password@provider.example/v1",
+            "query string": "https://provider.example/v1?tenant=unexpected",
+            "fragment": "https://provider.example/v1#unexpected",
+        }
+        for expected_error, invalid_base_url in invalid_base_urls.items():
+            with self.subTest(base_url=invalid_base_url):
+                config = load_config(include_user=False)
+                config["providers"]["xai_direct"]["base_url"] = invalid_base_url
+                errors = validate_config(config)
+                self.assertTrue(any(expected_error in error for error in errors), errors)
+
+    def test_atomic_config_write_propagates_parent_directory_fsync_eio(self) -> None:
+        real_fsync = os.fsync
+        fsync_calls = 0
+
+        def fail_parent_fsync(descriptor: int) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError(errno.EIO, "synthetic directory fsync failure")
+            real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch.object(
+            config_module.os,
+            "fsync",
+            side_effect=fail_parent_fsync,
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic directory fsync failure"):
+                config_module._atomic_write_json(
+                    Path(temporary_directory) / "config.json",
+                    {"persisted": True},
+                )
+
     def test_safe_user_override_is_validated_and_written_privately(self) -> None:
         merged = set_user_config("providers.xai_direct.api_key_env", "TEST_XAI_API_KEY")
 
         self.assertEqual(merged["providers"]["xai_direct"]["api_key_env"], "TEST_XAI_API_KEY")
         persisted = json.loads(self.user_config_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted, {"providers": {"xai_direct": {"api_key_env": "TEST_XAI_API_KEY"}}})
+        self.assertEqual(
+            self.user_config_path.read_text(encoding="utf-8"),
+            '{"providers":{"xai_direct":{"api_key_env":"TEST_XAI_API_KEY"}}}\n',
+        )
         file_mode = stat.S_IMODE(self.user_config_path.stat().st_mode)
         self.assertEqual(file_mode, 0o600)
         self.assertEqual(load_config()["providers"]["xai_direct"]["api_key_env"], "TEST_XAI_API_KEY")

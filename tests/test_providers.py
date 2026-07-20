@@ -1732,6 +1732,17 @@ class ProviderParsingTests(unittest.TestCase):
             "http://127.0.0.1:8080/v1/responses",
         )
 
+    def test_endpoint_policy_rejects_credentials_query_and_fragment(self) -> None:
+        invalid_base_urls = {
+            "embedded credentials": "https://user:password@provider.example/v1",
+            "query string": "https://provider.example/v1?tenant=unexpected",
+            "fragment": "https://provider.example/v1#unexpected",
+        }
+        for expected_error, base_url in invalid_base_urls.items():
+            with self.subTest(base_url=base_url):
+                with self.assertRaisesRegex(ConfigError, expected_error):
+                    ProviderRegistry._endpoint(base_url, "/responses")
+
 
 if __name__ == "__main__":
     unittest.main()

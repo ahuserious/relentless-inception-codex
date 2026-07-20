@@ -1,0 +1,14 @@
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+
+[model_providers.xai]
+name = "xAI"
+base_url = "https://api.x.ai/v1"
+env_key = "XAI_API_KEY"
+wire_api = "responses"
+
+[mcp_servers.relentless-inception]
+command = "/opt/relentless-inception-bench/mcp_server_launcher.py"
+args = []
+startup_timeout_sec = 60
+tool_timeout_sec = 1800

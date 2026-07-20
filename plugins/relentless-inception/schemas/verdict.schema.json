@@ -3,6 +3,21 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["verdict", "artifact_sha256", "summary", "criteria_reviewed", "blind_spots", "blocking_findings", "non_blocking_findings", "evidence", "required_actions"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {"verdict": {"const": "PASS"}},
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": {
+          "blind_spots": {"maxItems": 0},
+          "blocking_findings": {"maxItems": 0},
+          "required_actions": {"maxItems": 0}
+        }
+      }
+    }
+  ],
   "properties": {
     "verdict": {"enum": ["PASS", "FAIL", "NEEDS_WORK"]},
     "artifact_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},

@@ -549,6 +549,12 @@ class ProviderRegistry:
         parsed = urllib.parse.urlparse(base_url)
         if parsed.scheme not in {"https", "http"}:
             raise ConfigError("Provider base_url must use https or http")
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError("Provider base_url must not contain embedded credentials")
+        if parsed.query:
+            raise ConfigError("Provider base_url must not contain a query string")
+        if parsed.fragment:
+            raise ConfigError("Provider base_url must not contain a fragment")
         if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise ConfigError("Plain HTTP providers are allowed only on localhost")
         return base_url.rstrip("/") + "/" + suffix.lstrip("/")
@@ -561,7 +567,7 @@ class ProviderRegistry:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "relentless-inception-codex/0.1.1",
+            "User-Agent": "relentless-inception-codex/0.1.4",
         }
         if provider.get("type") == "anthropic_messages":
             headers["x-api-key"] = api_key

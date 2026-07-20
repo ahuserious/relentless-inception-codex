@@ -71,7 +71,7 @@ class PluginPackageIntegrityTests(unittest.TestCase):
         plugin_manifest = _load_json(PLUGIN_MANIFEST_PATH)
         default_config = load_config(include_user=False)
 
-        self.assertEqual(__version__, "0.1.1")
+        self.assertEqual(__version__, "0.1.4")
         self.assertEqual(plugin_manifest.get("version"), __version__)
         self.assertEqual(doctor(default_config)["version"], __version__)
 
@@ -103,6 +103,11 @@ class PluginPackageIntegrityTests(unittest.TestCase):
         server_path = self._resolve_inside(working_directory, server["args"][0])
         self.assertEqual(server_path, MCP_SERVER_PATH.resolve())
         self.assertTrue(server_path.is_file(), server_path)
+        self.assertTrue(
+            os.access(server_path, os.X_OK),
+            "The MCP entrypoint must remain directly executable for harnesses "
+            "that cannot preserve a separate argv array.",
+        )
 
     def test_marketplace_source_resolves_to_manifest_plugin(self) -> None:
         marketplace = _load_json(MARKETPLACE_PATH)
@@ -156,16 +161,6 @@ class PluginPackageIntegrityTests(unittest.TestCase):
                 "base_rate_input_limit_tokens": 200_000,
                 "above_base_rate_behavior": "unknown_cost_fail_closed",
             },
-            "grok-4.3": {
-                "input_per_million_usd": 1.25,
-                "cached_input_per_million_usd": 0.2,
-                "output_per_million_usd": 2.5,
-                "long_context_input_per_million_usd": 2.5,
-                "long_context_cached_input_per_million_usd": 0.4,
-                "long_context_output_per_million_usd": 5.0,
-                "base_rate_input_limit_tokens": 200_000,
-                "above_base_rate_behavior": "unknown_cost_fail_closed",
-            },
         }
         direct_xai_seats = {
             seat_name: seat
@@ -191,6 +186,38 @@ class PluginPackageIntegrityTests(unittest.TestCase):
             configuration_doc,
         )
         self.assertIn("https://docs.x.ai/developers/pricing", configuration_doc)
+
+    def test_shipped_maximum_intelligence_defaults_are_frontier_only(self) -> None:
+        default_config = load_config(include_user=False)
+        profile = default_config["profiles"]["maximum_intelligence"]
+        fusion = profile["fusion"]
+        gates = profile["gates"]
+
+        active_seat_names = [
+            *fusion["panel"],
+            fusion["judge"],
+            fusion["synthesizer"],
+            *gates["reviewers"],
+        ]
+        for seat_name in active_seat_names:
+            with self.subTest(seat=seat_name):
+                seat = default_config["seats"][seat_name]
+                self.assertTrue(seat["enabled"])
+                self.assertEqual(seat["provider"], "xai_direct")
+                self.assertEqual(seat["model"], "grok-4.5")
+                self.assertEqual(seat["reasoning_effort"], "high")
+                self.assertNotIn("grok-4.3", seat["fallback_models"])
+
+        for seat_name, seat in default_config["seats"].items():
+            if seat.get("provider") == "xai_direct":
+                with self.subTest(default_xai_seat=seat_name):
+                    self.assertEqual(seat["model"], "grok-4.5")
+                    self.assertNotIn("grok-4.3", seat["fallback_models"])
+
+        native_codex = default_config["native_codex"]
+        self.assertEqual(native_codex["executor_model"], "gpt-5.6-sol")
+        self.assertEqual(native_codex["reviewer_models"], ["gpt-5.6-sol"])
+        self.assertEqual(profile["execution"]["model"], "gpt-5.6-sol")
 
 
 if __name__ == "__main__":

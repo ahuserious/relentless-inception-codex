@@ -34,7 +34,7 @@
           "trusted_router_frontier_panel"
         ],
         "optional_panel": [],
-        "judge": "grok43_judge",
+        "judge": "grok45_judge",
         "synthesizer": "grok45_synthesizer",
         "min_live_seats": 3,
         "max_concurrency": 2

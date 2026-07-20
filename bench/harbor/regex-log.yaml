@@ -1,0 +1,28 @@
+jobs_dir: jobs
+n_attempts: 1
+n_concurrent_trials: 1
+retry:
+  max_retries: 0
+environment:
+  type: docker
+  delete: true
+agents:
+  - import_path: bench.harbor.codex_agent:BenchmarkCodex
+    model_name: openai/gpt-5.6-sol
+    override_timeout_sec: 3600
+    kwargs:
+      version: 0.145.0-alpha.18
+      reasoning_effort: xhigh
+    mcp_servers:
+      - name: relentless-inception
+        transport: stdio
+        command: /opt/relentless-inception-bench/mcp_server_launcher.py
+        args: []
+datasets:
+  - name: terminal-bench/terminal-bench-2
+    version: "1"
+    registry_url: https://raw.githubusercontent.com/harbor-framework/harbor/459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc/registry.json
+    task_names:
+      - terminal-bench/regex-log
+extra_instruction_paths:
+  - bench/harbor/extra-instruction.md

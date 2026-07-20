@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from .config import canonical_hash, runtime_data_dir
+from .config import canonical_hash, canonical_json, runtime_data_dir
 from .errors import BudgetExceeded, ConfigError, RunAborted
 from .types import ModelResponse, Usage
 
@@ -38,16 +38,10 @@ def canonical_json_hash(value: Any) -> str:
     """Return the SHA-256 digest of a value's canonical JSON representation."""
 
     try:
-        canonical_json = json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
+        encoded = canonical_json(value)
+    except ConfigError as exc:
         raise ConfigError("Receipt evidence must be valid canonical JSON") from exc
-    return text_hash(canonical_json)
+    return text_hash(encoded)
 
 
 def _validated_sha256(value: Any, field_name: str) -> str:
@@ -108,6 +102,28 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
+        directory_descriptor: Optional[int] = None
+        try:
+            directory_descriptor = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            # Directory descriptors and directory fsync are not available on
+            # every supported platform. The file itself was fsynced above.
+            unsupported_errors = {
+                errno.EINVAL,
+                getattr(errno, "ENOTSUP", errno.EINVAL),
+                getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+            }
+            if os.name == "nt":
+                unsupported_errors.add(errno.EACCES)
+            if exc.errno not in unsupported_errors:
+                raise
+        finally:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
@@ -1032,7 +1048,78 @@ class BudgetTracker:
             resolved_attempt_id = str(reserved_attempt["attempt_id"])
             resolved_invocation_sha256 = str(reserved_attempt["invocation_sha256"])
 
-            expected_response_sha256 = canonical_json_hash(response.to_dict())
+            try:
+                response_dict = response.to_dict()
+                detached_response = copy.deepcopy(response_dict)
+            except Exception as exc:
+                raise ConfigError(
+                    "Invalid budget receipt: response envelope could not be safely copied"
+                ) from exc
+            expected_response_fields = {
+                "text",
+                "provider",
+                "requested_model",
+                "actual_model",
+                "usage",
+                "latency_seconds",
+                "request_id",
+                "route",
+                "raw_status",
+            }
+            if not isinstance(detached_response, dict) or set(detached_response) != expected_response_fields:
+                raise ConfigError("Invalid budget receipt: response envelope schema mismatch")
+            for field_name in (
+                "provider",
+                "requested_model",
+                "actual_model",
+                "raw_status",
+            ):
+                if (
+                    not isinstance(detached_response[field_name], str)
+                    or not detached_response[field_name]
+                ):
+                    raise ConfigError(
+                        f"Invalid budget receipt: {field_name} must be a nonempty string"
+                    )
+            if not isinstance(detached_response["text"], str):
+                raise ConfigError("Invalid budget receipt: text must be a string")
+            request_id = detached_response["request_id"]
+            if request_id is not None and (
+                not isinstance(request_id, str) or not request_id
+            ):
+                raise ConfigError(
+                    "Invalid budget receipt: request_id must be a nonempty string or null"
+                )
+            latency_seconds = detached_response["latency_seconds"]
+            if (
+                not isinstance(latency_seconds, (int, float))
+                or isinstance(latency_seconds, bool)
+                or not math.isfinite(float(latency_seconds))
+                or float(latency_seconds) < 0
+            ):
+                raise ConfigError(
+                    "Invalid budget receipt: latency_seconds must be a nonnegative finite number"
+                )
+            if not isinstance(detached_response["route"], Mapping):
+                raise ConfigError("Invalid budget receipt: route must be an object")
+            expected_usage_fields = {
+                "input_tokens",
+                "output_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "tool_calls",
+                "cost_usd",
+                "unknown_cost_fail_closed",
+                "input_output_usage_complete",
+                "raw_usage_invalid",
+                "accounting_error",
+            }
+            detached_usage = detached_response["usage"]
+            if not isinstance(detached_usage, dict) or set(detached_usage) != expected_usage_fields:
+                raise ConfigError("Invalid budget receipt: usage envelope schema mismatch")
+            # Canonical encoding rejects non-JSON and non-finite values before
+            # any accounting counter or entry can be committed.
+            expected_response_sha256 = canonical_json_hash(detached_response)
             if response_sha256 is None:
                 response_sha256 = expected_response_sha256
             else:
@@ -1056,12 +1143,7 @@ class BudgetTracker:
                 raise ConfigError(
                     "Invalid budget receipt: response_artifact does not match the entry_id"
                 )
-            if not isinstance(response.raw_status, str) or not response.raw_status:
-                raise ConfigError(
-                    "Invalid budget receipt: raw_status must be a nonempty string"
-                )
-
-            usage = response.usage
+            usage = Usage(**detached_usage)
             response_accounting_failure: Optional[str] = None
             if usage.accounting_error is not None:
                 if not isinstance(usage.accounting_error, str) or not usage.accounting_error:
@@ -1176,7 +1258,8 @@ class BudgetTracker:
                     )
             else:
                 self.known_cost_usd += cost_usd
-                self.provider_cost_usd[response.provider] = self.provider_cost_usd.get(response.provider, 0.0) + cost_usd
+                provider_name = detached_response["provider"]
+                self.provider_cost_usd[provider_name] = self.provider_cost_usd.get(provider_name, 0.0) + cost_usd
             if unknown_cost_failure is not None and response_accounting_failure is None:
                 # A configured fail-closed unknown-cost outcome is an accounting
                 # integrity latch, even when threshold enforcement is warn-only.
@@ -1193,13 +1276,13 @@ class BudgetTracker:
                     "response_artifact": response_artifact,
                     "stage": stage,
                     "seat": seat_name,
-                    "provider": response.provider,
-                    "requested_model": response.requested_model,
-                    "actual_model": response.actual_model,
-                    "request_id": response.request_id,
-                    "route": response.route,
-                    "raw_status": response.raw_status,
-                    "latency_seconds": response.latency_seconds,
+                    "provider": detached_response["provider"],
+                    "requested_model": detached_response["requested_model"],
+                    "actual_model": detached_response["actual_model"],
+                    "request_id": detached_response["request_id"],
+                    "route": detached_response["route"],
+                    "raw_status": detached_response["raw_status"],
+                    "latency_seconds": detached_response["latency_seconds"],
                     "usage": recorded_usage.to_dict(),
                 }
             )
@@ -1246,16 +1329,17 @@ class BudgetTracker:
                 elif self.known_cost_usd == float(max_cost):
                     exhausted_limits.append(f"Known cost threshold of ${float(max_cost):.2f} exhausted")
             per_provider_limits = self.config.get("per_provider_max_cost_usd", {})
-            provider_limit = per_provider_limits.get(response.provider) if isinstance(per_provider_limits, Mapping) else None
+            provider_name = detached_response["provider"]
+            provider_limit = per_provider_limits.get(provider_name) if isinstance(per_provider_limits, Mapping) else None
             if isinstance(provider_limit, (int, float)):
-                provider_cost = self.provider_cost_usd.get(response.provider, 0.0)
+                provider_cost = self.provider_cost_usd.get(provider_name, 0.0)
                 if provider_cost > float(provider_limit):
                     exceeded_limits.append(
-                        f"Provider {response.provider} cost threshold of ${float(provider_limit):.2f} exceeded"
+                        f"Provider {provider_name} cost threshold of ${float(provider_limit):.2f} exceeded"
                     )
                 elif provider_cost == float(provider_limit):
                     exhausted_limits.append(
-                        f"Provider {response.provider} cost threshold of ${float(provider_limit):.2f} exhausted"
+                        f"Provider {provider_name} cost threshold of ${float(provider_limit):.2f} exhausted"
                     )
             warning_fraction = self.config.get("warning_fraction")
             if isinstance(warning_fraction, (int, float)) and isinstance(max_cost, (int, float)):
@@ -1309,7 +1393,7 @@ class BudgetTracker:
                 "accounting_failure": self.accounting_failure,
                 "stop_reason": self.stop_reason,
                 "wall_seconds": self._elapsed_wall_seconds(),
-                "attempt_entries": list(self.attempt_entries),
-                "entries": list(self.entries),
+                "attempt_entries": copy.deepcopy(self.attempt_entries),
+                "entries": copy.deepcopy(self.entries),
                 "warnings": list(self.warnings),
             }

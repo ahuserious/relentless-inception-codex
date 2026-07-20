@@ -9,6 +9,8 @@ Use this skill to improve a difficult Codex task with independent external model
 
 This is a Codex orchestration contract, not an autonomous daemon. The MCP server runs provider calls and records deliberation artifacts. The active Codex session remains responsible for reading the repository, requesting approvals, editing files, running commands, and reporting results.
 
+The shipped `maximum_intelligence` defaults admit no weaker automatic model substitution: the Codex host and native host handoff use `gpt-5.6-sol`, while every direct xAI fusion and gate seat uses exact `grok-4.5` at high effort. Other models and routers participate only after an explicit validated configuration change.
+
 ## Non-negotiable boundary
 
 Keep these two mechanisms distinct:

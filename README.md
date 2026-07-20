@@ -11,15 +11,17 @@ The default pipeline is:
 5. independent reviewers bound to the exact artifact SHA-256;
 6. a persisted host-workflow packet whose enabled plan/pre-execution gates must pass before the active Codex session authorizes mutation.
 
+The shipped maximum-intelligence profile is deliberately frontier-only: the active Codex host, native reviewers, and execution handoff use `gpt-5.6-sol`; every direct xAI panel, judge, synthesizer, and adversarial reviewer uses exact `grok-4.5` at high effort. Router and provider-direct alternatives remain displayable and configurable, but are disabled and never selected as implicit fallbacks.
+
 This is a new runtime-backed implementation inspired by [`ahuserious/relentless-inception-grok`](https://github.com/ahuserious/relentless-inception-grok), not a mechanical host rename. The source Grok plugin is principally an orchestration contract; this port implements the call graph, configuration enforcement, persistence, budgets, kill switch, resume semantics, structured gates, and Codex packaging in code.
 
 ## Status
 
-Version `0.1.1` is an alpha suitable for deliberate, cost-aware use. Direct xAI Grok 4.5, OpenAI Responses, Anthropic Messages, OpenRouter, OpenRouter native Fusion, and generic OpenAI-compatible/TrustedRouter transports are supported. External API seats can use provider-hosted tools when explicitly configured, but they never receive Codex filesystem access.
+Version `0.1.4` is an alpha suitable for deliberate, cost-aware use. Direct xAI Grok 4.5, OpenAI Responses, Anthropic Messages, OpenRouter, OpenRouter native Fusion, and generic OpenAI-compatible/TrustedRouter transports are supported. External API seats can use provider-hosted tools when explicitly configured, but they never receive Codex filesystem access.
 
-Version 0.1.1 intentionally cannot resume run state written by earlier releases. Existing run directories remain preserved for audit, but rerunning their work requires a new run ID; see the [run-state compatibility boundary](docs/ARCHITECTURE.md#run-state-compatibility).
+Version 0.1.4 retains the v3 run ledger introduced in 0.1.1 and intentionally cannot resume pre-0.1.1 run state. Its stricter receipt checks can also reject incomplete 0.1.1 crash or native-fallback artifacts; those directories remain preserved for audit, but the work requires a new run ID. See the [run-state compatibility boundary](docs/ARCHITECTURE.md#run-state-compatibility).
 
-Codex plugins currently do not auto-register plugin-owned native agents. The bundled skills coordinate compatible native Codex reviewers/executors through the active host; opt-in provider/agent TOML templates are retained for explicit compatibility retesting. On Codex 0.145, a direct foreground Grok 4.5 text turn succeeded only after every tool surface was removed, but an actual spawned custom-agent turn still failed at xAI with HTTP 422 because the Codex subagent input did not match xAI's accepted `ModelInput` variants. A separate tool-result continuation also failed with a compaction-blob error. The shipped default therefore registers no native Grok role. Multiple external Grok 4.5/4.3 seats provide the operational Grok path for fusion, gates, and xAI-hosted tools.
+Codex plugins currently do not auto-register plugin-owned native agents. The bundled skills coordinate compatible native Codex reviewers/executors through the active host; opt-in provider/agent TOML templates are retained for explicit compatibility retesting. On Codex 0.145, a direct foreground Grok 4.5 text turn succeeded only after every tool surface was removed, but an actual spawned custom-agent turn still failed at xAI with HTTP 422 because the Codex subagent input did not match xAI's accepted `ModelInput` variants. A separate tool-result continuation also failed with a compaction-blob error. The shipped default therefore registers no native Grok role. The active Codex host and execution handoff use `gpt-5.6-sol`; every operational xAI fusion and gate seat uses exact `grok-4.5`, with no weaker automatic fallback.
 
 ## Install from this checkout
 

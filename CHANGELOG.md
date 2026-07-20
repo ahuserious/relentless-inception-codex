@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.4 - 2026-07-19
+
+- Made the shipped maximum-intelligence topology frontier-only: Codex host and native handoff settings use GPT-5.6 Sol, while every direct xAI panel, judge, synthesizer, fallback, and adversarial-review seat uses Grok 4.5 at high effort.
+- Removed all automatic Grok 4.3 and GPT-5.6 Terra defaults while preserving provider-neutral schemas and opt-in router configuration.
+- Fixed deterministic evidence parsing so shell source echoed after a canonical `$ ` marker cannot be mistaken for the command's actual `[exit N]` result; real nonzero markers and output diagnostics still block.
+
+## 0.1.3 - 2026-07-19
+
+- Bound every host-workspace, command, test, and mutation claim to supplied mechanical evidence and made provider-tool isolation explicit.
+- Added a trusted pre-execution plan-review contract that evaluates pending host plans without weakening completed-work evidence gates.
+- Hardened the pinned Harbor/Pier benchmark bridge with deterministic resumable run IDs, 30-minute MCP tool timeouts, exact evidence contracts, and fail-fast campaigns.
+
+## 0.1.2 - 2026-07-19
+
+- Made budget recording exception-atomic and detached persisted accounting from mutable response containers.
+- Blocked automatic redispatch after an invocation-bound reservation when billability is unknowable, and preflighted native-fallback provenance before additional provider spend.
+- Tightened schema-version, canonical JSON, non-finite-number, and durable atomic-write validation.
+- Clarified adversarial gate output so planned verification work is not confused with an unresolved blocking blind spot while every genuine blocker remains fail-closed.
+- Added pinned, no-oracle Harbor Terminal-Bench 2.0 and Pier DeepSWE acceptance assets and evidence checks.
+- Made the MCP entrypoint directly executable for current benchmark harnesses that flatten stdio command arguments.
+
 ## 0.1.1 - 2026-07-19
 
 - Hardened provider usage and cost accounting, budget-ledger restoration, concurrent snapshot persistence, and post-response gate stop checks so integrity failures remain fail-closed across resume.

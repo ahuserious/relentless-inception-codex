@@ -80,6 +80,7 @@ PANEL_RESULT_FIELDS = (
     "response_evidence",
     "error",
 )
+FAILED_PANEL_RESULT_FIELDS = (*PANEL_RESULT_FIELDS, "attempt_ids")
 RESPONSE_EVIDENCE_FIELDS = (
     "schema_version",
     "entry_id",
@@ -155,10 +156,18 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
         return True
 
     def inspect_text(value: str, *, inspect_terminal_failures: bool = True) -> None:
+        # Canonical benchmark transcripts prefix command echoes with ``$ `` and
+        # record the command's actual status separately as ``[exit N]``. Shell
+        # source such as a guarded ``then exit 1`` is not execution evidence;
+        # scanning it would contradict the authoritative status marker.
+        diagnostic_value = "\n".join(
+            "" if line.lstrip().startswith("$ ") else line
+            for line in value.splitlines()
+        )
         for match in re.finditer(
             r"\b(?:exit(?:ed)?|return(?:ed)?)\s*(?:with\s+)?(?:status|code)?\s*[:=]?\s*(-?\d+)\b"
             r"|\b(?:exit_code|exit_status|returncode|return_code)\s*[:=]\s*[\"']?(-?\d+)\b",
-            value,
+            diagnostic_value,
             flags=re.IGNORECASE,
         ):
             rendered_code = match.group(1) or match.group(2)
@@ -170,12 +179,12 @@ def _mechanical_failures(mechanical_evidence: str) -> List[str]:
             r"|\b(?:tests?_?)?fail(?:ed|ures?)\s*[:=]\s*(\d+)\b",
             flags=re.IGNORECASE,
         )
-        for match in counted_failure_pattern.finditer(value):
+        for match in counted_failure_pattern.finditer(diagnostic_value):
             rendered_count = match.group(1) or match.group(2)
             if rendered_count is not None and int(rendered_count) > 0:
                 failures.append(match.group(0))
 
-        residual = counted_failure_pattern.sub("", value)
+        residual = counted_failure_pattern.sub("", diagnostic_value)
         counted_error_pattern = re.compile(
             r"\b(\d+)\s+(?:tests?\s+)?errors?\b"
             r"|\b(?:tests?_?)?errors?\s*[:=]\s*(\d+)\b",
@@ -608,7 +617,12 @@ def _validated_response_evidence(
             f"Stored {label} response evidence schema mismatch; "
             f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
         )
-    if value.get("schema_version") != 1:
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
         raise ConfigError(f"Stored {label} response evidence has an unsupported schema")
     for field_name in RESPONSE_EVIDENCE_FIELDS[1:]:
         field_value = value.get(field_name)
@@ -631,46 +645,64 @@ def _validated_response_evidence(
     return dict(value)
 
 
-def _validated_persisted_call_response(
+def _validated_ledger_response_entry(
     store: RunStore,
-    value: Any,
-    evidence_value: Any,
+    entry: Mapping[str, Any],
+    attempt_entries: Sequence[Any],
     *,
     invocation: Mapping[str, Any],
     label: str,
-) -> Dict[str, Any]:
-    response = _validated_cached_response(value, label=label)
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     invocation_sha256 = canonical_json_hash(invocation)
+    entry_id = entry.get("entry_id")
+    response_artifact_name = entry.get("response_artifact")
+    if (
+        not isinstance(entry_id, str)
+        or not isinstance(response_artifact_name, str)
+        or response_artifact_name != f"responses/{entry_id}.json"
+        or not store.exists(response_artifact_name)
+    ):
+        raise ConfigError(
+            f"Stored {label} response has no matching persisted raw-response evidence"
+        )
+    persisted_response_artifact = store.read_json(response_artifact_name)
+    persisted_artifact_schema = persisted_response_artifact.get("schema_version")
+    if (
+        not isinstance(persisted_artifact_schema, int)
+        or isinstance(persisted_artifact_schema, bool)
+        or persisted_artifact_schema != 1
+    ):
+        raise ConfigError(f"Stored {label} raw-response evidence has an unsupported schema")
+    for nested_name in ("invocation", "receipt"):
+        nested_value = persisted_response_artifact.get(nested_name)
+        nested_schema_version = (
+            nested_value.get("schema_version")
+            if isinstance(nested_value, Mapping)
+            else None
+        )
+        if (
+            not isinstance(nested_schema_version, int)
+            or isinstance(nested_schema_version, bool)
+            or nested_schema_version != 1
+        ):
+            raise ConfigError(
+                f"Stored {label} raw-response {nested_name} has an unsupported schema"
+            )
+    response = _validated_cached_response(
+        persisted_response_artifact.get("response"),
+        label=label,
+    )
     evidence = _validated_response_evidence(
-        evidence_value,
+        persisted_response_artifact.get("receipt"),
         expected_invocation_sha256=invocation_sha256,
         response=response,
         label=label,
     )
-    response_artifact_name = _response_artifact_name(evidence)
     response_artifact = _response_artifact_payload(invocation, evidence, response)
-    if not store.exists(response_artifact_name):
-        raise ConfigError(
-            f"Stored {label} response has no matching persisted raw-response evidence"
-        )
-    if store.read_json(response_artifact_name) != response_artifact:
+    if canonical_json_hash(persisted_response_artifact) != canonical_json_hash(
+        response_artifact
+    ):
         raise ConfigError(f"Stored {label} response evidence does not match the cached response")
-    if not store.exists("ledger.json"):
-        raise ConfigError(f"Stored {label} response has no persisted ledger evidence")
-    ledger = store.read_json("ledger.json")
-    entries = ledger.get("entries")
-    if not isinstance(entries, list):
-        raise ConfigError(f"Stored {label} response has no persisted ledger entries")
-    matching_entries = [
-        entry
-        for entry in entries
-        if isinstance(entry, Mapping) and entry.get("entry_id") == evidence["entry_id"]
-    ]
-    if len(matching_entries) != 1:
-        raise ConfigError(
-            f"Stored {label} response has no matching persisted ledger entry"
-        )
-    entry = matching_entries[0]
     expected_entry_fields = {
         "stage": invocation["stage"],
         "seat": invocation["seat_name"],
@@ -688,14 +720,18 @@ def _validated_persisted_call_response(
         "response_sha256": evidence["response_sha256"],
         "response_artifact": response_artifact_name,
     }
-    if any(entry.get(field_name) != expected for field_name, expected in expected_entry_fields.items()):
+    persisted_entry_fields = {
+        field_name: entry.get(field_name) for field_name in expected_entry_fields
+    }
+    if canonical_json_hash(persisted_entry_fields) != canonical_json_hash(
+        expected_entry_fields
+    ):
         raise ConfigError(f"Stored {label} response does not match its ledger receipt")
-    attempt_entries = ledger.get("attempt_entries")
     matching_attempts = [
         attempt
         for attempt in attempt_entries
         if isinstance(attempt, Mapping) and attempt.get("attempt_id") == evidence["attempt_id"]
-    ] if isinstance(attempt_entries, list) else []
+    ]
     if len(matching_attempts) != 1:
         raise ConfigError(f"Stored {label} response has no matching persisted attempt")
     attempt = matching_attempts[0]
@@ -705,6 +741,68 @@ def _validated_persisted_call_response(
         or attempt.get("seat") != invocation["seat_name"]
     ):
         raise ConfigError(f"Stored {label} response attempt is bound to a different invocation")
+    return response, evidence
+
+
+def _validated_persisted_call_response(
+    store: RunStore,
+    value: Any,
+    evidence_value: Any,
+    *,
+    invocation: Mapping[str, Any],
+    label: str,
+) -> Dict[str, Any]:
+    response = _validated_cached_response(value, label=label)
+    invocation_sha256 = canonical_json_hash(invocation)
+    evidence = _validated_response_evidence(
+        evidence_value,
+        expected_invocation_sha256=invocation_sha256,
+        response=response,
+        label=label,
+    )
+    if not store.exists("ledger.json"):
+        raise ConfigError(f"Stored {label} response has no persisted ledger evidence")
+    ledger = store.read_json("ledger.json")
+    entries = ledger.get("entries")
+    if not isinstance(entries, list):
+        raise ConfigError(f"Stored {label} response has no persisted ledger entries")
+    attempt_entries = ledger.get("attempt_entries")
+    if not isinstance(attempt_entries, list):
+        raise ConfigError(f"Stored {label} response has no persisted attempt entries")
+    invocation_entries = [
+        entry
+        for entry in entries
+        if isinstance(entry, Mapping)
+        and entry.get("invocation_sha256") == invocation_sha256
+    ]
+    validated_entries = [
+        (
+            entry,
+            *_validated_ledger_response_entry(
+                store,
+                entry,
+                attempt_entries,
+                invocation=invocation,
+                label=label,
+            ),
+        )
+        for entry in invocation_entries
+    ]
+    matching_entries = [
+        validated_entry
+        for validated_entry in validated_entries
+        if validated_entry[0].get("entry_id") == evidence["entry_id"]
+    ]
+    if len(matching_entries) != 1:
+        raise ConfigError(
+            f"Stored {label} response has no matching persisted ledger entry"
+        )
+    _entry, persisted_response, persisted_evidence = matching_entries[0]
+    if (
+        canonical_json_hash(persisted_response) != canonical_json_hash(response)
+        or canonical_json_hash(persisted_evidence) != canonical_json_hash(evidence)
+    ):
+        raise ConfigError(f"Stored {label} response evidence does not match the cached response")
     return response
 
 
@@ -769,6 +867,13 @@ def _persisted_attempt_ids(
     ]
 
 
+def _has_persisted_attempt_for_invocation(
+    store: RunStore,
+    invocation: Mapping[str, Any],
+) -> bool:
+    return bool(_persisted_attempt_ids(store, invocation))
+
+
 def _validated_synthesis_artifact(
     saved: Mapping[str, Any],
     *,
@@ -827,7 +932,7 @@ def _validated_native_fallback_marker(
     store: RunStore,
     expected_invocation: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    expected_fields = {
+    required_fields = {
         "schema_version",
         "status",
         "error",
@@ -836,8 +941,9 @@ def _validated_native_fallback_marker(
         "invocation_sha256",
         "attempt_ids",
     }
-    unexpected = set(saved) - expected_fields
-    missing = expected_fields - set(saved)
+    allowed_fields = required_fields | {"response_entry_ids"}
+    unexpected = set(saved) - allowed_fields
+    missing = required_fields - set(saved)
     if unexpected or missing:
         raise ConfigError(
             "Stored native Fusion fallback marker schema mismatch; "
@@ -845,7 +951,12 @@ def _validated_native_fallback_marker(
         )
     if saved.get("status") != "failed":
         raise ConfigError("Stored native Fusion fallback marker status must be 'failed'")
-    if saved.get("schema_version") != 1:
+    schema_version = saved.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
         raise ConfigError("Stored native Fusion fallback marker has an unsupported schema")
     if saved.get("fallback") != "client_orchestrated":
         raise ConfigError(
@@ -895,11 +1006,14 @@ def _validated_native_fallback_marker(
     ):
         raise ConfigError("Stored native Fusion fallback attempts have invalid provenance")
     entries = ledger.get("entries")
-    response_attempt_ids = {
-        entry.get("attempt_id")
+    response_entries = [
+        entry
         for entry in entries
         if isinstance(entry, Mapping)
-    } if isinstance(entries, list) else set()
+        and entry.get("invocation_sha256") == invocation_sha256
+        and entry.get("attempt_id") in attempt_ids
+    ] if isinstance(entries, list) else []
+    response_attempt_ids = {entry.get("attempt_id") for entry in response_entries}
     expected_failure_phase = (
         "semantic"
         if any(attempt_id in response_attempt_ids for attempt_id in attempt_ids)
@@ -907,6 +1021,46 @@ def _validated_native_fallback_marker(
     )
     if saved.get("failure_phase") != expected_failure_phase:
         raise ConfigError("Stored native Fusion fallback marker has an invalid failure phase")
+    response_entry_ids = saved.get("response_entry_ids")
+    if expected_failure_phase == "semantic":
+        expected_response_entry_ids = [entry.get("entry_id") for entry in response_entries]
+        if (
+            not isinstance(response_entry_ids, list)
+            or not response_entry_ids
+            or any(
+                not isinstance(entry_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", entry_id) is None
+                for entry_id in response_entry_ids
+            )
+            or len(set(response_entry_ids)) != len(response_entry_ids)
+        ):
+            raise ConfigError(
+                "Stored native semantic fallback marker must bind response_entry_ids"
+            )
+        if response_entry_ids != expected_response_entry_ids:
+            raise ConfigError(
+                "Stored native semantic fallback marker does not match its response receipts"
+            )
+        for entry in response_entries:
+            response_artifact_name = entry.get("response_artifact")
+            if not isinstance(response_artifact_name, str) or not store.exists(
+                response_artifact_name
+            ):
+                raise ConfigError(
+                    "Stored native semantic fallback marker has no matching raw-response evidence"
+                )
+            response_artifact = store.read_json(response_artifact_name)
+            _validated_persisted_call_response(
+                store,
+                response_artifact.get("response"),
+                response_artifact.get("receipt"),
+                invocation=expected_invocation,
+                label="native semantic fallback",
+            )
+    elif response_entry_ids not in (None, []):
+        raise ConfigError(
+            "Stored native transport fallback marker cannot bind response receipts"
+        )
     return dict(saved)
 
 
@@ -964,6 +1118,8 @@ def validate_verdict(value: Mapping[str, Any], artifact_hash: str) -> Dict[str, 
         raise ProviderError("Verdict criteria_reviewed must identify at least one checked criterion")
     if verdict == "PASS" and validated["blocking_findings"]:
         raise ProviderError("PASS verdict cannot include blocking_findings")
+    if verdict == "PASS" and validated["blind_spots"]:
+        raise ProviderError("PASS verdict cannot include blind_spots")
     if verdict == "PASS" and validated["required_actions"]:
         raise ProviderError("PASS verdict cannot include required_actions")
     return validated
@@ -1376,7 +1532,11 @@ class FusionOrchestrator:
         for saved_result in stored_results:
             if not isinstance(saved_result, Mapping):
                 raise ConfigError("Stored panel result entries must be objects")
-            unexpected = set(saved_result) - set(PANEL_RESULT_FIELDS)
+            status = saved_result.get("status")
+            allowed_result_fields = (
+                FAILED_PANEL_RESULT_FIELDS if status == "failed" else PANEL_RESULT_FIELDS
+            )
+            unexpected = set(saved_result) - set(allowed_result_fields)
             missing = set(PANEL_RESULT_FIELDS) - set(saved_result)
             if unexpected or missing:
                 raise ConfigError(
@@ -1398,7 +1558,6 @@ class FusionOrchestrator:
                 raise ConfigError("Stored panel result anonymous_label must be a string")
 
             normalized_result = dict(saved_result)
-            status = saved_result.get("status")
             if status == "completed":
                 if saved_result.get("error") is not None:
                     raise ConfigError("Stored completed panel result cannot contain an error")
@@ -1441,6 +1600,28 @@ class FusionOrchestrator:
                         label=f"failed panel result for {seat_name}",
                     )
                     normalized_result["response_evidence"] = dict(saved_evidence)
+                saved_attempt_ids = saved_result.get("attempt_ids")
+                if (
+                    not isinstance(saved_attempt_ids, list)
+                    or any(
+                        not isinstance(attempt_id, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", attempt_id) is None
+                        for attempt_id in saved_attempt_ids
+                    )
+                    or len(set(saved_attempt_ids)) != len(saved_attempt_ids)
+                ):
+                    raise ConfigError(
+                        "Stored failed panel result must bind unique attempt_ids"
+                    )
+                represented_attempt_ids = _persisted_attempt_ids(
+                    store,
+                    invocations_by_seat[seat_name],
+                )
+                if saved_attempt_ids != represented_attempt_ids:
+                    raise ConfigError(
+                        f"Stored failed panel result for {seat_name!r} does not represent the exact persisted attempts"
+                    )
+                normalized_result["attempt_ids"] = list(saved_attempt_ids)
             else:
                 raise ConfigError("Stored panel result status must be 'completed' or 'failed'")
             latest_by_seat[seat_name] = normalized_result
@@ -1463,6 +1644,13 @@ class FusionOrchestrator:
             ):
                 raise ConfigError(
                     f"Stored panel artifact omits paid response evidence for seat {seat_name!r}"
+                )
+            if saved_result is None and _has_persisted_attempt_for_invocation(
+                store,
+                invocations_by_seat[seat_name],
+            ):
+                raise ConfigError(
+                    f"Persisted panel attempt evidence exists without a reusable semantic cache for seat {seat_name!r}"
                 )
         pending_seat_names = [
             seat_name
@@ -1543,6 +1731,11 @@ class FusionOrchestrator:
                             error=str(exc),
                         )
                     result_row = result.to_dict()
+                    if result_row["status"] == "failed":
+                        result_row["attempt_ids"] = _persisted_attempt_ids(
+                            store,
+                            invocations_by_seat[seat_name],
+                        )
                     latest_by_seat[seat_name] = result_row
                     attempts.append(result_row)
                     persist_panel_snapshot(
@@ -1650,6 +1843,10 @@ class FusionOrchestrator:
             raise ConfigError(
                 "Persisted judge response evidence exists without a reusable judge artifact"
             )
+        if _has_persisted_attempt_for_invocation(store, judge_invocation):
+            raise ConfigError(
+                "Persisted judge attempt evidence exists without a reusable judge artifact"
+            )
         response, response_evidence = self._call(
             budget,
             store,
@@ -1739,6 +1936,10 @@ class FusionOrchestrator:
         if _has_response_evidence_for_invocation(store, synthesis_invocation):
             raise ConfigError(
                 f"Persisted {synthesis_stage} response evidence exists without a reusable synthesis artifact"
+            )
+        if _has_persisted_attempt_for_invocation(store, synthesis_invocation):
+            raise ConfigError(
+                f"Persisted {synthesis_stage} attempt evidence exists without a reusable synthesis artifact"
             )
         if (
             fusion.get("separate_no_tools_synthesis_turn") is True
@@ -1876,6 +2077,19 @@ class FusionOrchestrator:
             raise ConfigError(
                 "Persisted gate response evidence exists without a reusable gate artifact for "
                 + ", ".join(committed_reviewers)
+            )
+        reserved_reviewers = [
+            reviewer_name
+            for reviewer_name in reviewer_names
+            if _has_persisted_attempt_for_invocation(
+                store,
+                invocations_by_reviewer[reviewer_name],
+            )
+        ]
+        if reserved_reviewers:
+            raise ConfigError(
+                "Persisted gate attempt evidence exists without a reusable gate artifact for "
+                + ", ".join(reserved_reviewers)
             )
         max_concurrency = min(int(gates.get("max_concurrency", 2)), len(reviewer_names))
 
@@ -2058,6 +2272,17 @@ class FusionOrchestrator:
                     )
                     if not allow_fallback:
                         raise ConfigError("Stored native Fusion fallback conflicts with the selected profile")
+                    if store.exists("synthesis.json"):
+                        fallback_synthesis = store.read_json("synthesis.json")
+                        expected_fallback_author = str(fusion_config["synthesizer"])
+                        if fallback_synthesis.get("mode") != "client_orchestrated":
+                            raise ConfigError(
+                                "Stored synthesis.json provenance mode must be 'client_orchestrated' for native fallback"
+                            )
+                        if fallback_synthesis.get("author_seat") != expected_fallback_author:
+                            raise ConfigError(
+                                "Stored synthesis.json provenance author must match the client fallback synthesizer"
+                            )
                     reports = self._run_panel(task, context, mechanical_evidence, profile, budget, store)
                     judgment = self._run_judge(task, reports, profile, budget, store, mechanical_evidence)
                     synthesis, _ = self._run_synthesis(
@@ -2135,11 +2360,17 @@ class FusionOrchestrator:
                                 "Native Fusion failed before any provider attempt; client fallback is not authorized"
                             ) from exc
                         ledger_entries = store.read_json("ledger.json").get("entries", [])
-                        response_attempt_ids = {
-                            entry.get("attempt_id")
+                        native_response_entries = [
+                            entry
                             for entry in ledger_entries
                             if isinstance(entry, Mapping)
-                        } if isinstance(ledger_entries, list) else set()
+                            and entry.get("invocation_sha256")
+                            == canonical_json_hash(native_invocation)
+                            and entry.get("attempt_id") in native_attempt_ids
+                        ] if isinstance(ledger_entries, list) else []
+                        response_attempt_ids = {
+                            entry.get("attempt_id") for entry in native_response_entries
+                        }
                         failure_phase = (
                             "semantic"
                             if any(
@@ -2149,17 +2380,27 @@ class FusionOrchestrator:
                             else "transport"
                         )
                         artifact_author_seat = str(fusion_config["synthesizer"])
+                        fallback_marker = {
+                            "schema_version": 1,
+                            "status": "failed",
+                            "error": str(exc),
+                            "fallback": "client_orchestrated",
+                            "failure_phase": failure_phase,
+                            "invocation_sha256": canonical_json_hash(native_invocation),
+                            "attempt_ids": native_attempt_ids,
+                        }
+                        if failure_phase == "semantic":
+                            fallback_marker["response_entry_ids"] = [
+                                entry["entry_id"] for entry in native_response_entries
+                            ]
                         store.write_json(
                             "native-openrouter-failure.json",
-                            {
-                                "schema_version": 1,
-                                "status": "failed",
-                                "error": str(exc),
-                                "fallback": "client_orchestrated",
-                                "failure_phase": failure_phase,
-                                "invocation_sha256": canonical_json_hash(native_invocation),
-                                "attempt_ids": native_attempt_ids,
-                            },
+                            fallback_marker,
+                        )
+                        _validated_native_fallback_marker(
+                            fallback_marker,
+                            store=store,
+                            expected_invocation=native_invocation,
                         )
                         store.mark_stage("native-openrouter-fusion", "failed", "native-openrouter-failure.json")
                         reports = self._run_panel(task, context, mechanical_evidence, profile, budget, store)

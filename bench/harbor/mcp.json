@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "relentless-inception": {
+      "command": "/opt/relentless-inception-bench/mcp_server_launcher.py",
+      "args": []
+    }
+  }
+}

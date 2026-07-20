@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -47,9 +49,26 @@ def user_config_path() -> Path:
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
+    def reject_nonfinite_constant(value: str) -> None:
+        raise ConfigError(
+            f"Invalid JSON in {path}: non-finite numeric constant {value!r} is not permitted"
+        )
+
+    def parse_finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ConfigError(
+                f"Invalid JSON in {path}: non-finite numeric value {value!r} is not permitted"
+            )
+        return parsed
+
     try:
         with path.open("r", encoding="utf-8") as handle:
-            value = json.load(handle)
+            value = json.load(
+                handle,
+                parse_constant=reject_nonfinite_constant,
+                parse_float=parse_finite_float,
+            )
     except FileNotFoundError as exc:
         raise ConfigError(f"Required configuration file does not exist: {path}") from exc
     except json.JSONDecodeError as exc:
@@ -57,6 +76,21 @@ def _read_json(path: Path) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"Configuration root must be a JSON object: {path}")
     return value
+
+
+def canonical_json(value: Any) -> str:
+    """Encode JSON deterministically and reject values JSON cannot represent safely."""
+
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Value must be valid canonical JSON") from exc
 
 
 def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
@@ -133,7 +167,9 @@ def _schema_type_matches(value: Any, expected_type: str) -> bool:
     if expected_type == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if expected_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return True
+        return isinstance(value, float) and math.isfinite(value)
     if expected_type == "string":
         return isinstance(value, str)
     if expected_type == "array":
@@ -205,9 +241,13 @@ def _schema_errors(
         if isinstance(pattern, str) and re.search(pattern, value) is None:
             errors.append(f"{path} must match pattern {pattern!r}")
         if schema.get("format") == "uri":
-            parsed = urllib.parse.urlparse(value)
-            if not parsed.scheme or not parsed.netloc:
+            try:
+                parsed = urllib.parse.urlparse(value)
+            except ValueError:
                 errors.append(f"{path} must be an absolute URI")
+            else:
+                if not parsed.scheme or not parsed.netloc:
+                    errors.append(f"{path} must be an absolute URI")
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         minimum = schema.get("minimum")
@@ -273,7 +313,12 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
 
     schema = load_schema()
     errors = _schema_errors(config, schema, schema, "config")
-    if config.get("schema_version") != 1:
+    schema_version = config.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
         errors.append("schema_version must be 1")
 
     for path, key, value in _walk(config):
@@ -312,6 +357,19 @@ def validate_config(config: Mapping[str, Any]) -> List[str]:
         if not isinstance(provider_type, str) or provider_type not in supported_provider_types:
             errors.append(f"{path}.type must be one of {sorted(supported_provider_types)}")
         _required_string(provider, "base_url", path, errors)
+        base_url = provider.get("base_url")
+        if isinstance(base_url, str) and base_url:
+            try:
+                parsed_base_url = urllib.parse.urlparse(base_url)
+            except ValueError:
+                errors.append(f"{path}.base_url must be a valid provider URL")
+            else:
+                if parsed_base_url.username is not None or parsed_base_url.password is not None:
+                    errors.append(f"{path}.base_url must not contain embedded credentials")
+                if parsed_base_url.query:
+                    errors.append(f"{path}.base_url must not contain a query string")
+                if parsed_base_url.fragment:
+                    errors.append(f"{path}.base_url must not contain a fragment")
         api_key_env = provider.get("api_key_env")
         if provider.get("enabled", True) and (not isinstance(api_key_env, str) or not api_key_env):
             errors.append(f"{path}.api_key_env must name an environment variable")
@@ -633,7 +691,7 @@ def redact_config(value: Any, key: str = "", *, environment_reference: bool = Fa
 
 
 def canonical_hash(value: Any) -> str:
-    encoded = json.dumps(redact_config(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    encoded = canonical_json(redact_config(value))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -668,17 +726,39 @@ def _deep_set(value: MutableMapping[str, Any], dotted_path: str, new_value: Any)
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
+    encoded_value = canonical_json(value) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True, ensure_ascii=False)
-            handle.write("\n")
+            handle.write(encoded_value)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
         os.chmod(path, 0o600)
+        directory_descriptor: Optional[int] = None
+        try:
+            directory_descriptor = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            # Directory descriptors and directory fsync are not available on
+            # every supported platform. The file itself was fsynced above.
+            unsupported_errors = {
+                errno.EINVAL,
+                getattr(errno, "ENOTSUP", errno.EINVAL),
+                getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+            }
+            if os.name == "nt":
+                unsupported_errors.add(errno.EACCES)
+            if exc.errno not in unsupported_errors:
+                raise
+        finally:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)

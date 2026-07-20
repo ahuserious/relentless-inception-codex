@@ -21,6 +21,7 @@ from relentless_inception.config import (
     validate_config,
 )
 from relentless_inception.errors import RelentlessInceptionError
+from relentless_inception.execution import persisted_execution_contract
 from relentless_inception.orchestrator import FusionOrchestrator
 from relentless_inception.providers import ProviderRegistry
 
@@ -154,6 +155,11 @@ def call_tool(name: str, arguments: Mapping[str, Any]) -> Any:
         handoff = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(handoff, dict):
             raise RelentlessInceptionError("Execution handoff must be a JSON object")
+        persisted_execution_contract(handoff)
+        if handoff.get("run_id") != run_id:
+            raise RelentlessInceptionError(
+                "Execution handoff run_id does not match the requested run_id"
+            )
         return handoff
 
     config = load_config(validate=name not in {"config_show", "config_get", "config_validate", "doctor"})

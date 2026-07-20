@@ -1,0 +1,18 @@
+jobs_dir: jobs
+n_attempts: 1
+n_concurrent_trials: 1
+retry:
+  max_retries: 0
+environment:
+  type: docker
+  delete: true
+agents:
+  - import_path: bench.pier.codex_agent:BenchmarkCodex
+    model_name: openai/gpt-5.6-sol
+    override_timeout_sec: 3600
+    kwargs:
+      version: 0.145.0-alpha.18
+      command_model_name: gpt-5.6-sol
+      config_toml_file: bench/pier/codex.toml
+      prompt_template_path: bench/pier/prompt.j2
+      reasoning_effort: xhigh

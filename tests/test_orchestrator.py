@@ -17,6 +17,7 @@ from relentless_inception.errors import BudgetExceeded, ConfigError, ProviderErr
 from relentless_inception.orchestrator import (
     FusionOrchestrator,
     _contains_substantive_claim,
+    validate_verdict,
 )
 from relentless_inception.providers import ProviderRegistry
 from relentless_inception.state import (
@@ -26,6 +27,7 @@ from relentless_inception.state import (
     canonical_json_hash,
     text_hash,
 )
+from relentless_inception.types import ModelResponse, Usage
 
 
 class VerdictOverrideRegistry(FakeProviderRegistry):
@@ -58,6 +60,67 @@ class VerdictOverrideRegistry(FakeProviderRegistry):
         verdict.update(copy.deepcopy(dict(self.verdict_overrides[seat_name])))
         response.text = json.dumps(verdict)
         return response
+
+
+class IntegralLatencyRegistry(FakeProviderRegistry):
+    def complete(self, seat_name: str, **kwargs: Any):
+        response = super().complete(seat_name, **kwargs)
+        response.latency_seconds = 1.0
+        return response
+
+
+class PreDispatchFailureRegistry(FakeProviderRegistry):
+    def __init__(self, fail_once_seat: str) -> None:
+        super().__init__()
+        self.fail_once_seat = fail_once_seat
+        self.pre_dispatch_failures = 0
+
+    def complete(self, seat_name: str, **kwargs: Any):
+        if seat_name == self.fail_once_seat and self.pre_dispatch_failures == 0:
+            self.pre_dispatch_failures += 1
+            raise ProviderError(f"synthetic pre-dispatch failure for {seat_name}")
+        return super().complete(seat_name, **kwargs)
+
+
+class SemanticFallbackRegistry(FakeProviderRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.semantic_fallbacks = 0
+
+    def complete(self, seat_name: str, **kwargs: Any):
+        if seat_name != "grok45_synthesizer" or self.semantic_fallbacks:
+            return super().complete(seat_name, **kwargs)
+
+        self.semantic_fallbacks += 1
+        before_attempt = kwargs.get("before_attempt")
+        on_semantic_failure_response = kwargs.get("on_semantic_failure_response")
+        if before_attempt is None or on_semantic_failure_response is None:
+            raise AssertionError("Semantic fallback fixture requires receipt callbacks")
+        before_attempt()
+        on_semantic_failure_response(
+            ModelResponse(
+                text="",
+                provider="fake_provider",
+                requested_model="requested/grok45_synthesizer",
+                actual_model="semantic-failure-model",
+                usage=Usage(
+                    input_tokens=3,
+                    output_tokens=1,
+                    cost_usd=0.001,
+                ),
+                latency_seconds=0.01,
+                request_id="semantic-failure-request",
+                route={
+                    "fixture": "offline",
+                    "semantic_failure": {"category": "empty_response"},
+                },
+            )
+        )
+        before_attempt()
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["before_attempt"] = None
+        fallback_kwargs["on_semantic_failure_response"] = None
+        return super().complete(seat_name, **fallback_kwargs)
 
 
 class OrchestrationTests(unittest.TestCase):
@@ -326,6 +389,37 @@ class OrchestrationTests(unittest.TestCase):
         ]
         self.assertEqual(len(semantic_failures), 1)
 
+    def test_cached_fallback_validates_every_semantic_failure_raw_response(self) -> None:
+        config = orchestration_config()
+        registry = SemanticFallbackRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "Every paid fallback response must retain its own raw receipt."
+        run_id = "fallback-validates-every-response"
+
+        first = orchestrator.fuse(task, run_id=run_id)
+        run_directory = Path(first.artifacts_dir)
+        synthesis_entries = [
+            entry
+            for entry in first.ledger["entries"]
+            if entry["stage"] == "synthesis"
+        ]
+        self.assertEqual(len(synthesis_entries), 2)
+        semantic_failure_entry = next(
+            entry
+            for entry in synthesis_entries
+            if "semantic_failure" in entry["route"]
+        )
+        (run_directory / semantic_failure_entry["response_artifact"]).unlink()
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(
+            ConfigError,
+            "no matching persisted raw-response evidence",
+        ):
+            orchestrator.fuse(task, run_id=run_id)
+
+        self.assertEqual(len(registry.calls), call_count)
+
     def test_incomplete_usage_is_ledgered_with_known_cost_and_blocks_later_dispatch(self) -> None:
         config = orchestration_config()
         profile = config["profiles"]["maximum_intelligence"]
@@ -541,7 +635,7 @@ class OrchestrationTests(unittest.TestCase):
 
         gate_calls = [call for call in calls if call["schema_name"] == "adversarial_verdict"]
         self.assertEqual(len(gate_calls), 2)
-        self.assertEqual({call["seat_name"] for call in gate_calls}, {"grok45_verifier", "grok43_constraint_auditor"})
+        self.assertEqual({call["seat_name"] for call in gate_calls}, {"grok45_verifier", "grok45_constraint_auditor"})
         for gate_call in gate_calls:
             self.assertTrue(gate_call["has_schema"])
             self.assertIn(synthesis_hash, gate_call["prompt"])
@@ -743,7 +837,7 @@ class OrchestrationTests(unittest.TestCase):
         for case_name in ("incomplete-response", "changed-model"):
             with self.subTest(case_name=case_name):
                 config = orchestration_config()
-                registry = FakeProviderRegistry(fail_seats={"grok43_judge"})
+                registry = FakeProviderRegistry(fail_seats={"grok45_judge"})
                 orchestrator = FusionOrchestrator(config, registry)
                 run_id = f"cached-panel-{case_name}"
 
@@ -934,6 +1028,86 @@ class OrchestrationTests(unittest.TestCase):
 
         self.assertEqual(len(registry.calls), call_count)
 
+    def test_receipt_schema_versions_reject_bool_and_float(self) -> None:
+        cases = (
+            ("response_evidence", True),
+            ("raw_response", 1.0),
+            ("raw_invocation_schema", True),
+            ("raw_receipt_schema", 1.0),
+            ("raw_usage_input_tokens", 10.0),
+        )
+        for case_name, invalid_schema_version in cases:
+            with self.subTest(case_name=case_name):
+                config = orchestration_config()
+                registry = FakeProviderRegistry()
+                orchestrator = FusionOrchestrator(config, registry)
+                task = f"Reject non-integer {case_name} receipt schema versions."
+                run_id = f"strict-receipt-schema-{case_name.replace('_', '-')}"
+                first = orchestrator.fuse(task, run_id=run_id)
+                run_directory = Path(first.artifacts_dir)
+                synthesis_path = run_directory / "synthesis.json"
+                synthesis = json.loads(synthesis_path.read_text(encoding="utf-8"))
+                if case_name == "response_evidence":
+                    synthesis["response_evidence"]["schema_version"] = (
+                        invalid_schema_version
+                    )
+                    synthesis_path.write_text(json.dumps(synthesis), encoding="utf-8")
+                    expected_error = "response evidence has an unsupported schema"
+                else:
+                    raw_path = (
+                        run_directory
+                        / "responses"
+                        / f"{synthesis['response_evidence']['entry_id']}.json"
+                    )
+                    raw_response = json.loads(raw_path.read_text(encoding="utf-8"))
+                    if case_name == "raw_response":
+                        raw_response["schema_version"] = invalid_schema_version
+                        expected_error = "raw-response evidence has an unsupported schema"
+                    elif case_name == "raw_invocation_schema":
+                        raw_response["invocation"]["schema_version"] = (
+                            invalid_schema_version
+                        )
+                        expected_error = "raw-response invocation has an unsupported schema"
+                    elif case_name == "raw_receipt_schema":
+                        raw_response["receipt"]["schema_version"] = (
+                            invalid_schema_version
+                        )
+                        expected_error = "raw-response receipt has an unsupported schema"
+                    else:
+                        raw_response["response"]["usage"]["input_tokens"] = float(
+                            raw_response["response"]["usage"]["input_tokens"]
+                        )
+                        expected_error = "usage input_tokens must be a nonnegative integer"
+                    raw_path.write_text(json.dumps(raw_response), encoding="utf-8")
+                call_count = len(registry.calls)
+
+                with self.assertRaisesRegex(ConfigError, expected_error):
+                    orchestrator.fuse(task, run_id=run_id)
+
+                self.assertEqual(len(registry.calls), call_count)
+
+    def test_ledger_receipt_comparison_is_json_type_strict(self) -> None:
+        config = orchestration_config()
+        registry = IntegralLatencyRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "Reject numerically equal but JSON-type-distinct ledger evidence."
+        run_id = "strict-ledger-json-types"
+        first = orchestrator.fuse(task, run_id=run_id)
+        ledger_path = Path(first.artifacts_dir) / "ledger.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        synthesis_entry = next(
+            entry for entry in ledger["entries"] if entry["stage"] == "synthesis"
+        )
+        self.assertEqual(synthesis_entry["latency_seconds"], 1.0)
+        synthesis_entry["latency_seconds"] = 1
+        ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(ConfigError, "does not match its ledger receipt"):
+            orchestrator.fuse(task, run_id=run_id)
+
+        self.assertEqual(len(registry.calls), call_count)
+
     def test_committed_response_without_cache_fails_before_redispatch(self) -> None:
         cases = (
             ("panel", "panel.json", "omits paid response evidence"),
@@ -960,6 +1134,85 @@ class OrchestrationTests(unittest.TestCase):
                 call_count = len(registry.calls)
 
                 with self.assertRaisesRegex(ConfigError, expected_error):
+                    orchestrator.fuse(task, run_id=run_id)
+
+                self.assertEqual(len(registry.calls), call_count)
+
+    def test_reserved_attempt_without_semantic_cache_fails_before_redispatch(self) -> None:
+        cases = (
+            ("panel", "panel.json"),
+            ("judge", "judge.json"),
+            ("synthesis", "synthesis.json"),
+            ("gate", "gate-0.json"),
+        )
+        for stage, cache_name in cases:
+            with self.subTest(stage=stage):
+                config = orchestration_config()
+                registry = FakeProviderRegistry()
+                orchestrator = FusionOrchestrator(config, registry)
+                task = f"Do not redispatch a reserved-only {stage} attempt."
+                run_id = f"reserved-only-{stage}"
+                first = orchestrator.fuse(task, run_id=run_id)
+                run_directory = Path(first.artifacts_dir)
+                ledger_path = run_directory / "ledger.json"
+                ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                stage_entries = [
+                    entry for entry in ledger["entries"] if entry["stage"] == stage
+                ]
+                if stage == "panel":
+                    stage_entries = stage_entries[:1]
+                    panel_path = run_directory / cache_name
+                    panel = json.loads(panel_path.read_text(encoding="utf-8"))
+                    omitted_seat = stage_entries[0]["seat"]
+                    panel["results"] = [
+                        row for row in panel["results"] if row["seat_name"] != omitted_seat
+                    ]
+                    panel_path.write_text(json.dumps(panel), encoding="utf-8")
+                else:
+                    (run_directory / cache_name).unlink()
+
+                removed_entry_ids = {entry["entry_id"] for entry in stage_entries}
+                for entry in stage_entries:
+                    (run_directory / entry["response_artifact"]).unlink()
+                remaining_entries = [
+                    entry
+                    for entry in ledger["entries"]
+                    if entry["entry_id"] not in removed_entry_ids
+                ]
+                ledger["entries"] = remaining_entries
+                for field_name in (
+                    "input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "cached_tokens",
+                    "tool_calls",
+                ):
+                    ledger[field_name] = sum(
+                        entry["usage"][field_name] for entry in remaining_entries
+                    )
+                ledger["total_tokens"] = (
+                    ledger["input_tokens"] + ledger["output_tokens"]
+                )
+                ledger["known_cost_usd"] = sum(
+                    entry["usage"]["cost_usd"]
+                    for entry in remaining_entries
+                    if entry["usage"]["cost_usd"] is not None
+                )
+                provider_cost_usd: dict[str, float] = {}
+                for entry in remaining_entries:
+                    cost_usd = entry["usage"]["cost_usd"]
+                    if cost_usd is not None:
+                        provider_cost_usd[entry["provider"]] = (
+                            provider_cost_usd.get(entry["provider"], 0.0) + cost_usd
+                        )
+                ledger["provider_cost_usd"] = provider_cost_usd
+                ledger["unknown_cost_calls"] = sum(
+                    entry["usage"]["cost_usd"] is None for entry in remaining_entries
+                )
+                ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+                call_count = len(registry.calls)
+
+                with self.assertRaisesRegex(ConfigError, "attempt evidence exists"):
                     orchestrator.fuse(task, run_id=run_id)
 
                 self.assertEqual(len(registry.calls), call_count)
@@ -1096,7 +1349,7 @@ class OrchestrationTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "failed")
 
-    def test_strict_panel_resume_retries_only_failed_seat_and_preserves_paid_success(self) -> None:
+    def test_failed_panel_row_still_allows_explicit_retry_after_validated_failure(self) -> None:
         panel = ["grok45_researcher", "grok45_adversary"]
         config = orchestration_config(panel=panel, min_live_seats=2, allow_degradation=False)
         registry = FakeProviderRegistry(fail_seats={"grok45_adversary"})
@@ -1123,6 +1376,104 @@ class OrchestrationTests(unittest.TestCase):
         resumed_panel = json.loads(panel_path.read_text(encoding="utf-8"))
         self.assertEqual(resumed_panel["live_count"], 2)
         self.assertEqual(len(resumed_panel["attempts"]), 3)
+
+    def test_failed_panel_row_with_newer_reserved_retry_attempt_blocks_redispatch(self) -> None:
+        panel = ["grok45_researcher", "grok45_adversary"]
+        config = orchestration_config(
+            panel=panel,
+            min_live_seats=2,
+            allow_degradation=False,
+        )
+        registry = FakeProviderRegistry(fail_seats={"grok45_adversary"})
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "A crashed retry reservation must not be dispatched twice."
+        run_id = "failed-panel-orphaned-retry"
+
+        with self.assertRaisesRegex(ProviderError, r"Panel collapsed: 1/2 live"):
+            orchestrator.fuse(task, run_id=run_id)
+
+        run_directory = Path(self.temporary_directory.name) / "runs" / run_id
+        panel_artifact = json.loads(
+            (run_directory / "panel.json").read_text(encoding="utf-8")
+        )
+        failed_row = next(
+            row
+            for row in panel_artifact["results"]
+            if row["seat_name"] == "grok45_adversary"
+        )
+        self.assertEqual(len(failed_row["attempt_ids"]), 1)
+        ledger = json.loads(
+            (run_directory / "ledger.json").read_text(encoding="utf-8")
+        )
+        failed_attempt = next(
+            attempt
+            for attempt in ledger["attempt_entries"]
+            if attempt["seat"] == "grok45_adversary"
+        )
+        budget = BudgetTracker(
+            config["profiles"]["maximum_intelligence"]["budgets"]
+        )
+        budget.restore(ledger)
+        budget.reserve_attempt(
+            "panel",
+            "grok45_adversary",
+            failed_attempt["invocation_sha256"],
+        )
+        selected_profile_name = str(config["active_profile"])
+        with RunStore(
+            task,
+            config,
+            run_id,
+            input_identity={
+                "operation": "fuse",
+                "task": task,
+                "context": "",
+                "mechanical_evidence": "",
+                "profile_name": selected_profile_name,
+            },
+        ) as store:
+            store.write_budget_snapshot(budget)
+
+        registry.fail_seats.clear()
+        call_count = len(registry.calls)
+        with self.assertRaisesRegex(ConfigError, "exact persisted attempts"):
+            orchestrator.fuse(task, run_id=run_id)
+
+        self.assertEqual(len(registry.calls), call_count)
+
+    def test_failed_panel_row_without_reserved_attempt_allows_safe_retry(self) -> None:
+        panel = ["grok45_researcher", "grok45_adversary"]
+        config = orchestration_config(
+            panel=panel,
+            min_live_seats=2,
+            allow_degradation=False,
+        )
+        registry = PreDispatchFailureRegistry("grok45_adversary")
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "A validated pre-dispatch failure remains safely retryable."
+        run_id = "panel-pre-dispatch-retry"
+
+        with self.assertRaisesRegex(ProviderError, r"Panel collapsed: 1/2 live"):
+            orchestrator.fuse(task, run_id=run_id)
+
+        run_directory = Path(self.temporary_directory.name) / "runs" / run_id
+        panel_artifact = json.loads(
+            (run_directory / "panel.json").read_text(encoding="utf-8")
+        )
+        failed_row = next(
+            row
+            for row in panel_artifact["results"]
+            if row["seat_name"] == "grok45_adversary"
+        )
+        self.assertEqual(failed_row["attempt_ids"], [])
+
+        result = orchestrator.fuse(task, run_id=run_id)
+
+        self.assertEqual(registry.pre_dispatch_failures, 1)
+        self.assertEqual(result.status, "completed")
+        call_counts = Counter(call["seat_name"] for call in registry.calls)
+        self.assertEqual(call_counts["grok45_researcher"], 1)
+        self.assertEqual(call_counts["grok45_adversary"], 1)
 
     def test_allowed_panel_degradation_records_failure_and_completes(self) -> None:
         config = orchestration_config(min_live_seats=2, allow_degradation=True)
@@ -1182,6 +1533,96 @@ class OrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(len(registry.calls), call_count)
         self.assertEqual(resumed.synthesis, result.synthesis)
+
+    def test_native_fallback_marker_cannot_override_cached_native_synthesis_before_dispatch(self) -> None:
+        config = orchestration_config()
+        fusion = config["profiles"]["maximum_intelligence"]["fusion"]
+        fusion["engine"] = "openrouter_native"
+        fusion["native_fusion_seat"] = "openrouter_native_fusion_seat"
+        fusion["native_openrouter_fusion"]["enabled"] = True
+        fusion["native_openrouter_fusion"]["fallback_to_client_orchestrated"] = True
+        registry = FakeProviderRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "A fallback marker cannot rewrite cached native authorship."
+        run_id = "fallback-cannot-override-native"
+        first = orchestrator.fuse(task, run_id=run_id)
+        run_directory = Path(first.artifacts_dir)
+        ledger = json.loads((run_directory / "ledger.json").read_text(encoding="utf-8"))
+        native_entries = [
+            entry
+            for entry in ledger["entries"]
+            if entry["stage"] == "native_openrouter_fusion"
+        ]
+        native_attempt_ids = [
+            attempt["attempt_id"]
+            for attempt in ledger["attempt_entries"]
+            if attempt["stage"] == "native_openrouter_fusion"
+        ]
+        marker = {
+            "schema_version": 1,
+            "status": "failed",
+            "error": "fabricated semantic failure",
+            "fallback": "client_orchestrated",
+            "failure_phase": "semantic",
+            "invocation_sha256": native_entries[0]["invocation_sha256"],
+            "attempt_ids": native_attempt_ids,
+            "response_entry_ids": [entry["entry_id"] for entry in native_entries],
+        }
+        (run_directory / "native-openrouter-failure.json").write_text(
+            json.dumps(marker), encoding="utf-8"
+        )
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(ConfigError, "provenance mode"):
+            orchestrator.fuse(task, run_id=run_id)
+
+        self.assertEqual(len(registry.calls), call_count)
+
+    def test_native_semantic_fallback_requires_bound_raw_response_evidence(self) -> None:
+        config = orchestration_config()
+        fusion = config["profiles"]["maximum_intelligence"]["fusion"]
+        fusion["engine"] = "openrouter_native"
+        fusion["native_fusion_seat"] = "openrouter_native_fusion_seat"
+        fusion["native_openrouter_fusion"]["enabled"] = True
+        fusion["native_openrouter_fusion"]["fallback_to_client_orchestrated"] = True
+        registry = FakeProviderRegistry()
+        orchestrator = FusionOrchestrator(config, registry)
+        task = "Semantic fallback must retain its exact paid raw response."
+        run_id = "semantic-fallback-raw-binding"
+        first = orchestrator.fuse(task, run_id=run_id)
+        run_directory = Path(first.artifacts_dir)
+        ledger = json.loads((run_directory / "ledger.json").read_text(encoding="utf-8"))
+        native_entries = [
+            entry
+            for entry in ledger["entries"]
+            if entry["stage"] == "native_openrouter_fusion"
+        ]
+        marker = {
+            "schema_version": 1,
+            "status": "failed",
+            "error": "fabricated semantic failure",
+            "fallback": "client_orchestrated",
+            "failure_phase": "semantic",
+            "invocation_sha256": native_entries[0]["invocation_sha256"],
+            "attempt_ids": [
+                attempt["attempt_id"]
+                for attempt in ledger["attempt_entries"]
+                if attempt["stage"] == "native_openrouter_fusion"
+            ],
+            "response_entry_ids": [entry["entry_id"] for entry in native_entries],
+        }
+        (run_directory / "native-openrouter-failure.json").write_text(
+            json.dumps(marker), encoding="utf-8"
+        )
+        (run_directory / "synthesis.json").unlink()
+        for entry in native_entries:
+            (run_directory / entry["response_artifact"]).unlink()
+        call_count = len(registry.calls)
+
+        with self.assertRaisesRegex(ConfigError, "no matching raw-response evidence"):
+            orchestrator.fuse(task, run_id=run_id)
+
+        self.assertEqual(len(registry.calls), call_count)
 
     def test_disabled_rescue_blocks_native_fusion_client_fallback(self) -> None:
         config = orchestration_config()
@@ -1390,7 +1831,18 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(mechanical["gate"]["mechanical_blocked"])
         self.assertEqual(mechanical["gate"]["pass_count"], 2)
 
-        blind_spot_registry = FakeProviderRegistry(verdict_blind_spots={"Live deployment behavior was not checked."})
+        blind_spot_override = {
+            "verdict": "NEEDS_WORK",
+            "blind_spots": ["Live deployment behavior was not checked."],
+            "blocking_findings": ["Live deployment behavior remains unverified."],
+            "required_actions": ["Run the targeted deployment review."],
+        }
+        blind_spot_registry = VerdictOverrideRegistry(
+            {
+                "grok45_verifier": blind_spot_override,
+                "grok45_constraint_auditor": blind_spot_override,
+            }
+        )
         blind_spot = FusionOrchestrator(config, blind_spot_registry).adversarial_gate(
             "Release only after targeted review.",
             "Candidate artifact",
@@ -1400,6 +1852,23 @@ class OrchestrationTests(unittest.TestCase):
         self.assertFalse(blind_spot["gate"]["passed"])
         self.assertTrue(blind_spot["gate"]["blind_spot_blocked"])
         self.assertFalse(blind_spot["gate"]["mechanical_blocked"])
+
+    def test_pass_verdict_rejects_nonempty_blind_spots(self) -> None:
+        artifact_hash = text_hash("Candidate artifact")
+        verdict = {
+            "verdict": "PASS",
+            "artifact_sha256": artifact_hash,
+            "summary": "The response incorrectly claims a pass despite an unresolved gap.",
+            "criteria_reviewed": ["Schema semantics"],
+            "blind_spots": ["Deployment evidence is missing."],
+            "blocking_findings": [],
+            "non_blocking_findings": [],
+            "evidence": ["Only local evidence was reviewed."],
+            "required_actions": [],
+        }
+
+        with self.assertRaisesRegex(ProviderError, "PASS verdict cannot include blind_spots"):
+            validate_verdict(verdict, artifact_hash)
 
     def test_mechanical_evidence_parses_exit_codes_without_zero_failure_false_positives(self) -> None:
         passing_evidence = (
@@ -1418,6 +1887,8 @@ class OrchestrationTests(unittest.TestCase):
             '{"status": "success", "exception": "N/A"}',
             '{"passed": true, "errors": "0 errors", "failures": "no failures"}',
             '{"status": "completed", "conclusion": "success", "errorCount": 0}',
+            "$ if legacy_text; then printf 'unexpected'; exit 1; fi\n"
+            "no legacy text (expected)\n\n[exit 0]\n",
         )
         failing_evidence = (
             "pytest exited with code 1",
@@ -1445,6 +1916,7 @@ class OrchestrationTests(unittest.TestCase):
             "Bail out! child process crashed",
             "##[error]Process completed with exit code 1.",
             "command returned exit code 2",
+            "$ guarded-command\n[exit 1]\n",
             "1 test failed",
             '{"passed": "false", "exit_code": "1"}',
             '{"failed": true}',

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
+from .config import canonical_json
 from .errors import ConfigError
 
 
@@ -50,7 +51,7 @@ _EXECUTION_CONTRACT_FIELDS = (
 def _json_copy(value: Any) -> Any:
     """Return a detached, JSON-safe value suitable for a persisted contract."""
 
-    return json.loads(json.dumps(value, sort_keys=True, ensure_ascii=False))
+    return json.loads(canonical_json(value))
 
 
 def _execution_contract(
@@ -67,8 +68,7 @@ def _execution_contract(
 
 
 def _contract_hash(contract: Mapping[str, Any]) -> str:
-    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return sha256(canonical_json(contract).encode("utf-8")).hexdigest()
 
 
 def _handoff_contract_hash(profile_name: Optional[str], contract: Mapping[str, Any]) -> str:
@@ -362,7 +362,12 @@ def build_handoff(
 def persisted_execution_contract(handoff: Mapping[str, Any]) -> Dict[str, Any]:
     """Read and verify the hash-bound execution settings frozen into a handoff."""
 
-    if handoff.get("schema_version") != HANDOFF_SCHEMA_VERSION:
+    schema_version = handoff.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != HANDOFF_SCHEMA_VERSION
+    ):
         raise ConfigError(
             f"Unsupported execution handoff schema_version: {handoff.get('schema_version')!r}"
         )

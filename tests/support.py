@@ -26,9 +26,9 @@ from relentless_inception.types import ModelResponse, Usage  # noqa: E402
 DEFAULT_PANEL = [
     "grok45_researcher",
     "grok45_adversary",
-    "grok43_constraint_auditor",
+    "grok45_constraint_auditor",
 ]
-DEFAULT_REVIEWERS = ["grok45_verifier", "grok43_constraint_auditor"]
+DEFAULT_REVIEWERS = ["grok45_verifier", "grok45_constraint_auditor"]
 
 
 def orchestration_config(
@@ -100,7 +100,7 @@ class FakeProviderRegistry:
             "empty-file kill switches, and assertions that failed calls remain visible in accounting. "
             "A release should be blocked whenever exact artifact identity is not proven by reviewers."
         ),
-        "grok43_constraint_auditor": (
+        "grok45_constraint_auditor": (
             "GAMMA_REPORT traces the requested behavior to independent panel calls, structured judging, "
             "fresh synthesis, two exact-hash verdicts, and a resumable ledger. It identifies no safe basis "
             "for network access in unit tests and requires all state to live under a temporary data root. "

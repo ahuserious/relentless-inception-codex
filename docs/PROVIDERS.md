@@ -52,6 +52,8 @@ The current xAI values are:
 - credential environment variable: `XAI_API_KEY`
 - reasoning effort: `low`, `medium`, or `high`; default/highest is `high`
 
+Use the exact API id `grok-4.5` for direct xAI seats. `grok-4.5-latest` is the native Grok Build alias used by the companion plugin's subagents; the Codex MCP runtime deliberately pins the exact API id. Shipped defaults never fall back to an older Grok model.
+
 Grok 4.5 has a 500,000-token context window and accepts text and image input with text output. It supports reasoning, structured outputs, and function calling. Its reasoning cannot be disabled. The plugin's external panel path uses non-streaming HTTP and does not grant Grok local tools, even though the underlying xAI API supports tools and streaming. See xAI's [Grok 4.5 model page](https://docs.x.ai/developers/models/grok-4.5), [reasoning guide](https://docs.x.ai/developers/model-capabilities/text/reasoning), and [function-calling guide](https://docs.x.ai/developers/tools/function-calling).
 
 The old Grok-specific Relentless Inception plugin used `xhigh` in some examples. Do not copy that value here: the current official Grok 4.5 Responses contract accepts only `low`, `medium`, and `high`.
