@@ -72,6 +72,16 @@ For a shell-level diagnostic without installation:
 
 See [configuration](docs/CONFIGURATION.md), [architecture](docs/ARCHITECTURE.md), [providers](docs/PROVIDERS.md), [security](docs/SECURITY.md), and [design evidence](docs/DESIGN_EVIDENCE.md).
 
+## Evidence and scope of claims
+
+The immutable [limited-cost fusion artifact](https://github.com/ahuserious/codex-fusion-artifact/tree/limited-cost-2026-07-20) publishes curated jigs, exact safe response receipts, harness verifier outputs, SHA-256 manifests, and the failures that bounded this release campaign.
+
+The strongest current live proof is `codex-0144-frontier-smoke-001`: ten direct-xAI calls, every requested and returned as exact `grok-4.5`; an initial 1/2 gate forced one amendment; the amended artifact passed 2/2; the ledger reports $0.268100 and zero unknown-cost calls. The campaign was deliberately limited by API cost and is not a statistically powered benchmark.
+
+One historical Terminal-Bench `fix-git` trace earned reward 1.0, but it predates the final all-Grok-4.5 defaults and its recorded contract drifts from the current validator. One DeepSWE/Pier trace earned reward 0 and stopped before fusion. These outcomes remain visible rather than being converted into release passes. OpenRouter was not called live because no funded credential was available; mocked adapter coverage is not a live-provider claim.
+
+See [release evidence](docs/RELEASE_EVIDENCE.md) for the exact matrix and [benchmark protocol](docs/BENCHMARK_PROTOCOL.md) for the separation between task reward, fusion gates, and evidence-contract acceptance.
+
 ## Verification
 
 ```bash

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Published a separate, checksummed limited-cost evidence repository with direct-xAI receipts, selected Terminal-Bench and DeepSWE outcomes, opt-in reproduction jigs, and explicit claim boundaries.
+- Added a release-evidence matrix and benchmark protocol that keep task reward, fusion-gate verdicts, and current evidence-contract validation separate.
+- Documented that the live campaign exercised direct xAI but not OpenRouter, and that one role-diverse Grok 4.5 panel is multi-agent deliberation rather than cross-model diversity.
+
 ## 0.1.4 - 2026-07-19
 
 - Made the shipped maximum-intelligence topology frontier-only: Codex host and native handoff settings use GPT-5.6 Sol, while every direct xAI panel, judge, synthesizer, fallback, and adversarial-review seat uses Grok 4.5 at high effort.
