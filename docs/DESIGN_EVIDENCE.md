@@ -4,7 +4,7 @@
 
 The canonical client pipeline is independent reports → mechanical checks → anonymous comparative diagnosis → fresh synthesis → independent exact-hash verification. It intentionally does not use majority voting or open-ended debate.
 
-The TrustedRouter artifact showed that synthesis capability can move the result by roughly eighteen points with an otherwise fixed panel, while a controlled 23-task role-isolation experiment found about `+8.02` to `+9.24` fusion gain with a Sonnet synthesizer and about `+2.22` to `+4.36` with a Haiku synthesizer. This motivates spending capability on the synthesizer, using a cheaper independent judge by default, and leaving every role configurable.
+The TrustedRouter artifact showed that synthesis capability can move the result by roughly eighteen points with an otherwise fixed panel, while a controlled 23-task role-isolation experiment found about `+8.02` to `+9.24` fusion gain with a Sonnet synthesizer and about `+2.22` to `+4.36` with a Haiku synthesizer. This motivates spending capability on the synthesizer and leaving every role configurable. The shipped maximum-intelligence profile intentionally keeps the independent judge on Grok 4.5 too; it does not convert the smaller observed judge effect into an automatic quality downgrade.
 
 Other adopted findings:
 
